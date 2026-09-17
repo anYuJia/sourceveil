@@ -23,7 +23,7 @@ use super::analysis::RustAnalysis;
 use super::candidates::{self, Candidate, FileContext, Visibility};
 use crate::edits::{EditPlan, SourceRef};
 use crate::mapping::Mapping;
-use crate::names::NameGenerator;
+use crate::names::{NameDeriver, SeedDomain};
 use crate::plan::Plan;
 use crate::report::{RenameStats, SkipReason, SkippedSymbol};
 use crate::scanner::{CrateGraph, CrateInfo};
@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 /// and collide. `claimed` carries the definition sites another pass has already
 /// renamed, so this pass does not rename them a second time.
 pub struct Shared<'a> {
-    pub names: &'a mut NameGenerator,
+    pub names: &'a mut NameDeriver,
     /// The one plan every pass stages into. Applied once, by the pipeline.
     pub plan: &'a mut EditPlan,
     pub claimed: &'a HashSet<(PathBuf, TextRange)>,
@@ -154,7 +154,11 @@ pub fn run(
             continue;
         }
 
-        let new_name = names.generate(candidate.kind.name_case())?;
+        let new_name = names.derive(
+            SeedDomain::RustSymbol,
+            &candidate.path,
+            candidate.kind.name_case(),
+        )?;
 
         let change = match propose_rename(analysis, *file_id, candidate.name_range, &new_name) {
             Ok(change) => change,

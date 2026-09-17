@@ -33,7 +33,7 @@ pub mod handler;
 pub mod literals;
 
 use crate::frontend::{self, IpcAnalysis, Span};
-use crate::names::{NameCase, NameGenerator};
+use crate::names::{NameCase, NameDeriver, SeedDomain};
 use crate::plan::Plan;
 use crate::rust::analysis::RustAnalysis;
 use crate::rust::candidates::attribute_names;
@@ -177,7 +177,7 @@ struct HandlerRef {
 pub fn run(
     analysis: &RustAnalysis,
     req: &CommandRequest<'_>,
-    names: &mut NameGenerator,
+    names: &mut NameDeriver,
     plan: &mut crate::edits::EditPlan,
 ) -> Result<CommandOutcome> {
     let mut out = CommandOutcome::default();
@@ -426,11 +426,11 @@ fn rename_command(
     handler_by_path: &BTreeMap<PathBuf, Vec<&HandlerRef>>,
     rust_literals: &literals::LiteralScan,
     texts: &BTreeMap<PathBuf, String>,
-    names: &mut NameGenerator,
+    names: &mut NameDeriver,
     plan: &mut crate::edits::EditPlan,
 ) -> std::result::Result<String, (CommandKeepReason, Option<String>)> {
     let new_name = names
-        .generate(NameCase::Snake)
+        .derive(SeedDomain::TauriCommand, &command.name, NameCase::Snake)
         .map_err(|e| (CommandKeepReason::Unresolvable, Some(e.to_string())))?;
 
     let change = rename::propose_rename(analysis, command.file_id, command.name_range, &new_name)

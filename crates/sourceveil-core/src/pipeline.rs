@@ -19,7 +19,7 @@ use crate::config::{AnalyzeSource, Config, VerifyStage};
 use crate::copier;
 use crate::edits::EditPlan;
 use crate::mapping::Mapping;
-use crate::names::NameGenerator;
+use crate::names::NameDeriver;
 use crate::plan::Plan;
 use crate::report::{CommandStats, Report};
 use crate::rust::analysis::{LoadOptions, RustAnalysis};
@@ -127,7 +127,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
         let files = analysis.rust_files();
         let facts = rename::collect_syntax_facts(&analysis, &files, &layout.crates);
         let (len_min, len_max) = plan.rename.name_len;
-        let mut names = NameGenerator::new(seed.seed, len_min, len_max, facts.identifiers);
+        let mut names = NameDeriver::new(seed.seed, len_min, len_max, facts.identifiers);
 
         // One plan for every pass, applied once.
         let mut edits = EditPlan::new();

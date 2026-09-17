@@ -854,3 +854,124 @@ fn the_command_mapping_is_reproducible_and_seeded() {
         "different seed, different mapping"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Mapping stability
+// ---------------------------------------------------------------------------
+//
+// A mapping is the answer key for crash reports, and a release has to be
+// rebuildable from its own tag. Both properties die if a name depends on
+// anything except its own identity — and the failure is quiet: the build
+// succeeds, the output is correct, and the mapping has silently churned.
+
+/// Transform an arbitrary directory without the verification pipeline.
+///
+/// These tests are about names, and a `cargo check` of the Tauri tree costs
+/// more than the assertion is worth.
+fn transform_quietly(input: &Path, output: &Path, seed: &str) {
+    let result = Command::new(binary())
+        .arg("transform")
+        .arg("--input")
+        .arg(input)
+        .arg("--output")
+        .arg(output)
+        .args(["--seed", seed])
+        .arg("--no-verify")
+        .output()
+        .expect("spawning cargo-obfuscator");
+    assert_succeeded(&result);
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in walk(from) {
+        let rel = entry.strip_prefix(from).expect("path under root");
+        if rel.to_string_lossy().starts_with("target")
+            || rel.to_string_lossy().starts_with("node_modules")
+        {
+            continue;
+        }
+        let target = to.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::copy(&entry, &target).expect("copy");
+    }
+}
+
+/// One new function, at the top of the first file the walker reaches.
+///
+/// Position matters: candidates are enumerated in file order, so this lands in
+/// the middle of the sequence rather than at the end. Under a shared name
+/// stream that is exactly what renames everything after it.
+fn add_unrelated_function(root: &Path) {
+    let path = root.join("src-tauri/src/commands.rs");
+    let mut text = std::fs::read_to_string(&path).expect("read commands.rs");
+    text.insert_str(0, "pub fn aaa_added_later() -> u32 {\n    7\n}\n\n");
+    std::fs::write(&path, text).expect("write commands.rs");
+}
+
+#[test]
+fn adding_an_unrelated_item_moves_no_other_name() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    copy_tree(&tauri_fixture("tauri-ipc-static"), &project);
+
+    let before_root = tmp.path().join("before");
+    transform_quietly(&project, &before_root, "777");
+    let before = mapping(&before_root);
+
+    add_unrelated_function(&project);
+
+    let after_root = tmp.path().join("after");
+    transform_quietly(&project, &after_root, "777");
+    let after = mapping(&after_root);
+
+    for section in ["symbols", "commands", "events"] {
+        let (Some(a), Some(b)) = (
+            before.get(section).and_then(|v| v.as_object()),
+            after.get(section).and_then(|v| v.as_object()),
+        ) else {
+            continue;
+        };
+        for (key, name) in a {
+            if let Some(other) = b.get(key) {
+                assert_eq!(
+                    other, name,
+                    "`{key}` in `{section}` was renamed differently because an unrelated \
+                     function was added elsewhere in the project"
+                );
+            }
+        }
+    }
+}
+
+/// The same property across domains: nothing in the symbol pass can move a
+/// command name, because the two never consulted the same stream.
+#[test]
+fn domains_do_not_disturb_each_other() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    copy_tree(&tauri_fixture("tauri-ipc-static"), &project);
+
+    let before_root = tmp.path().join("before");
+    transform_quietly(&project, &before_root, "31337");
+    let before = mapping(&before_root)["commands"].clone();
+
+    // A pile of new symbols, well before every command in candidate order.
+    let path = project.join("src-tauri/src/commands.rs");
+    let mut text = std::fs::read_to_string(&path).expect("read");
+    text.insert_str(
+        0,
+        "pub fn aaa_one() -> u32 { 1 }\npub fn aab_two() -> u32 { 2 }\npub fn aac_three() -> u32 { 3 }\n\n",
+    );
+    std::fs::write(&path, text).expect("write");
+
+    let after_root = tmp.path().join("after");
+    transform_quietly(&project, &after_root, "31337");
+    let after = mapping(&after_root)["commands"].clone();
+
+    assert_eq!(
+        before, after,
+        "command names moved because unrelated symbols were added"
+    );
+}
