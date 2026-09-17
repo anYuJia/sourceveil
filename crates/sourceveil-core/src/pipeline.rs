@@ -128,6 +128,19 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
 
         let outcome = rename::run(&analysis, &request).context("running the rename pass")?;
 
+        // Edits are applied by the pipeline, not by the pass: every pass
+        // contributes to one plan and the plan is written once, so that no pass
+        // ever sees a file another pass has already changed the length of.
+        let applied = outcome
+            .plan
+            .apply(&layout.root, &output_root)
+            .context("applying the rename edits")?;
+        tracing::info!(
+            files = applied.files_edited,
+            edits = applied.edits_applied,
+            "applied edits"
+        );
+
         report.files.rust_scanned = outcome.rust_files_scanned;
         report.rename = outcome.stats;
         for skipped in outcome.skipped {

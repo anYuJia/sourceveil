@@ -38,6 +38,7 @@
 
 pub mod config;
 pub mod copier;
+pub mod edits;
 pub mod mapping;
 pub mod names;
 pub mod pipeline;

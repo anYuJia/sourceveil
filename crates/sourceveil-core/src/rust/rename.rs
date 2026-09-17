@@ -21,12 +21,13 @@
 
 use super::analysis::RustAnalysis;
 use super::candidates::{self, Candidate, FileContext, Visibility};
+use crate::edits::{EditPlan, SourceRef};
 use crate::mapping::Mapping;
 use crate::names::NameGenerator;
 use crate::plan::Plan;
 use crate::report::{RenameStats, SkipReason, SkippedSymbol};
 use crate::scanner::{CrateGraph, CrateInfo};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ra_ap_ide::{FileId, FilePosition, Indel, RenameConfig, SourceChange, TextSize};
 use ra_ap_syntax::ast::AstNode;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -49,31 +50,12 @@ pub struct RenameOutcome {
     pub mapping: Mapping,
     pub skipped: Vec<SkippedSymbol>,
     pub warnings: Vec<String>,
-    /// Files rewritten, workspace-relative.
-    pub files_edited: BTreeSet<PathBuf>,
+    /// Edits this pass wants, expressed against the original text. The pipeline
+    /// applies them once every pass has contributed.
+    pub plan: EditPlan,
     /// Symbols considered before any filtering.
     pub candidates_considered: usize,
     pub rust_files_scanned: usize,
-}
-
-/// Edits accumulated for one file, expressed as spans in the *original* text.
-#[derive(Debug, Default)]
-struct FileEdits {
-    indels: Vec<Indel>,
-}
-
-impl FileEdits {
-    /// Would adding this indel overlap something already scheduled?
-    fn conflicts_with(&self, indel: &Indel) -> bool {
-        self.indels.iter().any(|existing| {
-            existing.delete.start() < indel.delete.end()
-                && indel.delete.start() < existing.delete.end()
-        })
-    }
-
-    fn push(&mut self, indel: Indel) {
-        self.indels.push(indel);
-    }
 }
 
 pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOutcome> {
@@ -142,7 +124,7 @@ pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOut
     let (len_min, len_max) = req.plan.rename.name_len;
     let mut names = NameGenerator::new(req.seed, len_min, len_max, facts.identifiers);
 
-    let mut edits: BTreeMap<PathBuf, FileEdits> = BTreeMap::new();
+    let mut edits = EditPlan::new();
     let mut skipped: Vec<SkippedSymbol> = Vec::new();
 
     let keep = KeepRules::new(req.plan, facts.macro_referenced);
@@ -163,7 +145,7 @@ pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOut
             }
         };
 
-        match stage_change(analysis, change, candidate, req, &mut edits) {
+        match stage_change(analysis, change, candidate, req, &analyzed_text, &mut edits) {
             Ok(applied) => {
                 outcome.stats.bump(candidate.kind);
                 outcome.stats.edits_applied += applied;
@@ -175,46 +157,11 @@ pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOut
         }
     }
 
-    // Write the edited files into the output tree.
-    for (abs_path, file_edits) in &edits {
-        let rel = abs_path
-            .strip_prefix(req.input_root)
-            .with_context(|| format!("{} is not under the input root", abs_path.display()))?;
-        let target = req.output_root.join(rel);
-
-        let disk = std::fs::read_to_string(&target)
-            .with_context(|| format!("reading generated file {}", target.display()))?;
-
-        // Every offset in `file_edits` indexes into the text rust-analyzer was
-        // given. The copy is supposed to be byte-identical, and if it is not
-        // the edits would be applied at the wrong places — silently producing
-        // a tree that does not compile, or worse, one that does and means
-        // something different. So divergence is a hard failure, not a warning:
-        // continuing would also make `mapping.json` a lie.
-        if let Some(analyzed) = analyzed_text.get(abs_path) {
-            if &disk != analyzed {
-                anyhow::bail!(
-                    "{} changed between analysis and rewrite; refusing to apply {} edit(s) \
-                     against text that no longer matches",
-                    target.display(),
-                    file_edits.indels.len()
-                );
-            }
-        }
-
-        let rewritten = apply_indels(&disk, &file_edits.indels).with_context(|| {
-            format!(
-                "applying {} edits to {}",
-                file_edits.indels.len(),
-                target.display()
-            )
-        })?;
-        std::fs::write(&target, rewritten)
-            .with_context(|| format!("writing {}", target.display()))?;
-        outcome.files_edited.insert(rel.to_path_buf());
-    }
-
-    outcome.stats.files_edited = outcome.files_edited.len();
+    // Nothing is written here. The pipeline applies the whole plan once, after
+    // every pass has contributed to it, so that no pass sees a file another
+    // pass has already changed the length of.
+    outcome.stats.files_edited = edits.edited_files().count();
+    outcome.plan = edits;
     outcome.skipped = skipped;
     Ok(outcome)
 }
@@ -262,7 +209,8 @@ fn stage_change(
     change: SourceChange,
     candidate: &Candidate,
     req: &RenameRequest<'_>,
-    edits: &mut BTreeMap<PathBuf, FileEdits>,
+    analyzed_text: &BTreeMap<PathBuf, String>,
+    plan: &mut EditPlan,
 ) -> std::result::Result<usize, Skip> {
     if !change.file_system_edits.is_empty() {
         return Err((
@@ -271,10 +219,9 @@ fn stage_change(
         ));
     }
 
-    // Resolve every target file and validate before touching anything, so a
-    // rename is never half-applied.
-    let mut planned: Vec<(PathBuf, Indel)> = Vec::new();
-
+    // Group the edit set by file first, so validation can cover all of them
+    // before any of them is scheduled.
+    let mut by_file: BTreeMap<PathBuf, Vec<Indel>> = BTreeMap::new();
     for (file_id, (text_edit, _snippet)) in change.source_file_edits.iter() {
         let Some(abs) = resolve_edit_target(analysis, req, *file_id) else {
             return Err((
@@ -284,12 +231,13 @@ fn stage_change(
                 )),
             ));
         };
-        for indel in text_edit.iter() {
-            planned.push((abs.clone(), indel.clone()));
-        }
+        by_file
+            .entry(abs)
+            .or_default()
+            .extend(text_edit.iter().cloned());
     }
 
-    if planned.is_empty() {
+    if by_file.is_empty() {
         return Err((
             SkipReason::Unresolvable,
             Some("rust-analyzer produced no edits".into()),
@@ -299,9 +247,14 @@ fn stage_change(
     // Verify the definition site is among the edits. If rust-analyzer resolved
     // the position to something other than the item we think we are renaming,
     // this is where that shows up.
-    let definition_present = planned.iter().any(|(path, indel)| {
-        *path == candidate.file && indel.delete.contains_range(candidate.name_range)
-    });
+    let definition_present = by_file
+        .get(&candidate.file)
+        .map(|indels| {
+            indels
+                .iter()
+                .any(|i| i.delete.contains_range(candidate.name_range))
+        })
+        .unwrap_or(false);
     if !definition_present {
         return Err((
             SkipReason::Unresolvable,
@@ -313,35 +266,42 @@ fn stage_change(
         ));
     }
 
-    // Check for span collisions, then commit.
-    for (path, indel) in &planned {
-        if edits
-            .get(path)
-            .map(|e| e.conflicts_with(indel))
-            .unwrap_or(false)
-        {
+    // All-or-nothing across every file the rename touches, not just within one.
+    for (path, indels) in &by_file {
+        for indel in indels {
+            if let Some(clash) = plan.would_conflict(path, indel) {
+                return Err((SkipReason::EditConflict, Some(clash.to_string())));
+            }
+        }
+    }
+
+    let staged = by_file.values().map(Vec::len).sum();
+    for (path, indels) in by_file {
+        for indel in &indels {
+            tracing::debug!(
+                symbol = %candidate.name,
+                file = %path.display(),
+                start = u32::from(indel.delete.start()),
+                end = u32::from(indel.delete.end()),
+                insert = %indel.insert,
+                "staged edit"
+            );
+        }
+        let Some(text) = analyzed_text.get(&path) else {
             return Err((
-                SkipReason::EditConflict,
+                SkipReason::EditOutsideOutput,
                 Some(format!(
-                    "another rename already scheduled an overlapping edit at {}",
+                    "no analysed text for {}; refusing to edit a file we did not read",
                     path.display()
                 )),
             ));
+        };
+        if let Err(clash) = plan.stage(SourceRef { path: &path, text }, indels) {
+            // Unreachable: the same spans were checked above. Reported rather
+            // than unwrapped, because a panic here would be a bug in this
+            // function and not in the project being transformed.
+            return Err((SkipReason::EditConflict, Some(clash.to_string())));
         }
-    }
-    let staged = planned.len();
-    for (path, indel) in &planned {
-        tracing::debug!(
-            symbol = %candidate.name,
-            file = %path.display(),
-            start = u32::from(indel.delete.start()),
-            end = u32::from(indel.delete.end()),
-            insert = %indel.insert,
-            "staged edit"
-        );
-    }
-    for (path, indel) in planned {
-        edits.entry(path).or_default().push(indel);
     }
 
     Ok(staged)
@@ -376,19 +336,43 @@ fn skipped_for(candidate: &Candidate, reason: SkipReason, detail: Option<String>
 }
 
 /// Which workspace crate owns a file.
+///
+/// Two guards matter here, and both were added after pointing the tool at a
+/// real Tauri project:
+///
+/// - Anything under cargo's target directory is a build artifact, not source.
+///   Build scripts emit `.rs` files into `OUT_DIR` (serde, thiserror, selectors
+///   and `web_atoms` all do), and rust-analyzer loads them. They are not ours to
+///   rewrite, and on a real project they contributed over a thousand candidates
+///   — every one of them a skip — burying the handful that came from the
+///   project's own source.
+/// - The crate-wrapper fallback matches direct children of the crate directory
+///   only. That is what admits `build.rs`, which lives outside `src/`; matching
+///   at any depth is what swept in `target/` in the first place.
 fn crate_for_file<'a>(graph: &'a CrateGraph, path: &Path) -> Option<&'a CrateInfo> {
+    if let Some(target) = &graph.target_directory {
+        if path.starts_with(target) {
+            return None;
+        }
+    }
+
     let mut best: Option<(&CrateInfo, usize)> = None;
+    let mut consider = |krate: &'a CrateInfo, dir: &Path| {
+        if !path.starts_with(dir) {
+            return;
+        }
+        let depth = dir.components().count();
+        if best.map(|(_, d)| depth > d).unwrap_or(true) {
+            best = Some((krate, depth));
+        }
+    };
+
     for krate in graph.workspace.values() {
-        for dir in [krate.src_dir.as_deref(), Some(krate.manifest_dir.as_path())]
-            .into_iter()
-            .flatten()
-        {
-            if path.starts_with(dir) {
-                let depth = dir.components().count();
-                if best.map(|(_, d)| depth > d).unwrap_or(true) {
-                    best = Some((krate, depth));
-                }
-            }
+        if let Some(src_dir) = &krate.src_dir {
+            consider(krate, src_dir);
+        }
+        if path.parent() == Some(krate.manifest_dir.as_path()) {
+            consider(krate, &krate.manifest_dir);
         }
     }
     best.map(|(k, _)| k)
@@ -494,27 +478,6 @@ fn is_inside_macro_token_tree(token: &ra_ap_syntax::SyntaxToken) -> bool {
         node = current.parent();
     }
     false
-}
-
-/// Apply indels, which are expressed against the original text, in descending
-/// order so earlier offsets stay valid.
-fn apply_indels(text: &str, indels: &[Indel]) -> Result<String> {
-    let mut ordered: Vec<&Indel> = indels.iter().collect();
-    ordered.sort_by_key(|i| std::cmp::Reverse(i.delete.start()));
-
-    let mut out = text.to_string();
-    for indel in ordered {
-        let start = usize::from(indel.delete.start());
-        let end = usize::from(indel.delete.end());
-        if end > out.len() {
-            anyhow::bail!("edit at {start}..{end} is past the end of the file");
-        }
-        if !out.is_char_boundary(start) || !out.is_char_boundary(end) {
-            anyhow::bail!("edit at {start}..{end} is not on a character boundary");
-        }
-        out.replace_range(start..end, &indel.insert);
-    }
-    Ok(out)
 }
 
 /// Attribute paths that bind a Rust name to a linker symbol.
@@ -666,62 +629,6 @@ impl KeepRules {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ra_ap_ide::TextRange;
-
-    fn indel(start: u32, end: u32, insert: &str) -> Indel {
-        Indel {
-            insert: insert.to_string(),
-            delete: TextRange::new(TextSize::from(start), TextSize::from(end)),
-        }
-    }
-
-    #[test]
-    fn indels_apply_backwards_so_offsets_stay_valid() {
-        // Two renames in one line: `aa` at 0..2 and `bb` at 5..7.
-        let text = "aa = bb";
-        let edits = vec![indel(0, 2, "X"), indel(5, 7, "Y")];
-        assert_eq!(apply_indels(text, &edits).unwrap(), "X = Y");
-    }
-
-    #[test]
-    fn indels_can_grow_and_shrink_text() {
-        let text = "fn foo() {}";
-        let edits = vec![indel(3, 6, "qq8kap")];
-        assert_eq!(apply_indels(text, &edits).unwrap(), "fn qq8kap() {}");
-
-        let text = "fn qq8kap() {}";
-        let edits = vec![indel(3, 9, "a")];
-        assert_eq!(apply_indels(text, &edits).unwrap(), "fn a() {}");
-    }
-
-    #[test]
-    fn out_of_range_edits_are_rejected_rather_than_panicking() {
-        let err = apply_indels("short", &[indel(100, 105, "x")]).unwrap_err();
-        assert!(format!("{err}").contains("past the end"));
-    }
-
-    #[test]
-    fn mid_character_edits_are_rejected() {
-        // "é" is two bytes; offset 1 is inside it.
-        let err = apply_indels("é", &[indel(1, 2, "x")]).unwrap_err();
-        assert!(format!("{err}").contains("character boundary"));
-    }
-
-    #[test]
-    fn overlapping_indels_are_detected() {
-        let mut fe = FileEdits::default();
-        fe.push(indel(0, 10, "a"));
-        assert!(
-            fe.conflicts_with(&indel(5, 15, "b")),
-            "overlap must be caught"
-        );
-        assert!(
-            fe.conflicts_with(&indel(9, 11, "b")),
-            "touching at the end overlaps"
-        );
-        assert!(!fe.conflicts_with(&indel(10, 20, "b")), "adjacent is fine");
-        assert!(!fe.conflicts_with(&indel(20, 30, "b")), "disjoint is fine");
-    }
 
     #[test]
     fn module_prefix_reflects_file_location() {
@@ -833,5 +740,61 @@ mod tests {
             !found.contains(&"a"),
             "fn names are not macro contents: {found:?}"
         );
+    }
+
+    fn probe_graph() -> CrateGraph {
+        let mut graph = CrateGraph {
+            target_directory: Some(PathBuf::from("/p/src-tauri/target")),
+            ..Default::default()
+        };
+        graph.workspace.insert(
+            "app".into(),
+            CrateInfo {
+                name: "app".into(),
+                manifest_dir: PathBuf::from("/p/src-tauri"),
+                src_dir: Some(PathBuf::from("/p/src-tauri/src")),
+                crate_types: Default::default(),
+                is_proc_macro: false,
+                is_library: false,
+            },
+        );
+        graph
+    }
+
+    #[test]
+    fn source_files_are_attributed_to_their_crate() {
+        let graph = probe_graph();
+        let found = crate_for_file(&graph, Path::new("/p/src-tauri/src/commands.rs"));
+        assert_eq!(found.map(|k| k.name.as_str()), Some("app"));
+    }
+
+    /// Build scripts emit `.rs` files into `OUT_DIR` and rust-analyzer loads
+    /// them. On a real Tauri project these accounted for over a thousand of the
+    /// reported candidates, every one a skip, burying the handful that came
+    /// from the project's own source.
+    #[test]
+    fn build_artifacts_are_not_candidates() {
+        let graph = probe_graph();
+        assert!(crate_for_file(
+            &graph,
+            Path::new("/p/src-tauri/target/debug/build/web_atoms-1234/out/generated.rs")
+        )
+        .is_none());
+    }
+
+    /// `build.rs` lives outside `src/`, so the crate-root fallback has to keep
+    /// admitting it — but only at depth one, which is what stopped `target/`
+    /// being swept in.
+    #[test]
+    fn build_rs_is_still_attributed_to_its_crate() {
+        let graph = probe_graph();
+        let found = crate_for_file(&graph, Path::new("/p/src-tauri/build.rs"));
+        assert_eq!(found.map(|k| k.name.as_str()), Some("app"));
+    }
+
+    #[test]
+    fn only_direct_children_of_a_crate_root_are_attributed() {
+        let graph = probe_graph();
+        assert!(crate_for_file(&graph, Path::new("/p/src-tauri/vendor/dep/src/lib.rs")).is_none());
     }
 }
