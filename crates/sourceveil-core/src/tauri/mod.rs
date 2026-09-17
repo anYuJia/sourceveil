@@ -32,7 +32,8 @@
 pub mod handler;
 pub mod literals;
 
-use crate::frontend::{self, IpcAnalysis, Span};
+use crate::frontend::commands::{self, IpcAnalysis};
+use crate::frontend::Span;
 use crate::names::{NameCase, NameDeriver, SeedDomain};
 use crate::plan::Plan;
 use crate::rust::analysis::RustAnalysis;
@@ -218,7 +219,7 @@ pub fn run(
         return Ok(out);
     };
 
-    let ipc = frontend::analyze(frontend_root, req.invoke_names)?;
+    let ipc = commands::analyze(frontend_root, req.invoke_names)?;
     out.refs.frontend_static = ipc.static_refs.len();
     out.refs.frontend_dynamic = ipc.dynamic_refs.len();
     out.warnings.extend(ipc.warnings.iter().cloned());
@@ -784,7 +785,10 @@ fn line_of(text: &str, range: TextRange) -> u32 {
 }
 
 /// The 1-based line a frontend literal sits on.
-fn line_in_texts(reference: &frontend::StringLiteral, texts: &BTreeMap<PathBuf, String>) -> u32 {
+fn line_in_texts(
+    reference: &crate::frontend::StringLiteral,
+    texts: &BTreeMap<PathBuf, String>,
+) -> u32 {
     texts
         .get(&reference.file)
         .map(|text| {
