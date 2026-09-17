@@ -30,8 +30,25 @@ use crate::scanner::{CrateGraph, CrateInfo};
 use anyhow::Result;
 use ra_ap_ide::{FileId, FilePosition, Indel, RenameConfig, SourceChange, TextSize};
 use ra_ap_syntax::ast::AstNode;
+use ra_ap_syntax::TextRange;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+
+/// State shared with the other passes.
+///
+/// The name generator is shared because the Tauri command pass draws from the
+/// same stream: two generators seeded alike would produce the same first name
+/// and collide. `claimed` carries the definition sites another pass has already
+/// renamed, so this pass does not rename them a second time.
+pub struct Shared<'a> {
+    pub names: &'a mut NameGenerator,
+    /// The one plan every pass stages into. Applied once, by the pipeline.
+    pub plan: &'a mut EditPlan,
+    pub claimed: &'a HashSet<(PathBuf, TextRange)>,
+    /// Identifiers occurring inside a macro token tree, collected once by the
+    /// pipeline because both passes need them.
+    pub macro_referenced: HashSet<String>,
+}
 
 pub struct RenameRequest<'a> {
     pub input_root: &'a Path,
@@ -50,15 +67,24 @@ pub struct RenameOutcome {
     pub mapping: Mapping,
     pub skipped: Vec<SkippedSymbol>,
     pub warnings: Vec<String>,
-    /// Edits this pass wants, expressed against the original text. The pipeline
-    /// applies them once every pass has contributed.
-    pub plan: EditPlan,
+    /// Files this pass staged edits into, workspace-relative.
+    pub files_edited: BTreeSet<PathBuf>,
     /// Symbols considered before any filtering.
     pub candidates_considered: usize,
     pub rust_files_scanned: usize,
 }
 
-pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOutcome> {
+pub fn run(
+    analysis: &RustAnalysis,
+    req: &RenameRequest<'_>,
+    shared: Shared<'_>,
+) -> Result<RenameOutcome> {
+    let Shared {
+        names,
+        plan,
+        claimed,
+        macro_referenced,
+    } = shared;
     let mut outcome = RenameOutcome {
         mapping: Mapping::new(req.seed),
         ..Default::default()
@@ -111,25 +137,18 @@ pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOut
             .then(a.1.name_range.start().cmp(&b.1.name_range.start()))
     });
 
-    // Reserve every identifier already present anywhere in the workspace, so a
-    // generated name can never collide with, or shadow, an existing one. This
-    // is what removes the need for scope analysis during name selection.
-    let facts = collect_syntax_facts(analysis, &files, req.graph);
-    tracing::debug!(
-        identifiers = facts.identifiers.len(),
-        macro_referenced = facts.macro_referenced.len(),
-        "collected identifiers from source"
-    );
-
-    let (len_min, len_max) = req.plan.rename.name_len;
-    let mut names = NameGenerator::new(req.seed, len_min, len_max, facts.identifiers);
-
-    let mut edits = EditPlan::new();
     let mut skipped: Vec<SkippedSymbol> = Vec::new();
 
-    let keep = KeepRules::new(req.plan, facts.macro_referenced);
+    let keep = KeepRules::new(req.plan, macro_referenced);
 
     for (file_id, candidate) in &all_candidates {
+        // Another pass owns this one. It has already been renamed, from the
+        // same snapshot, and renaming it again here would produce a second
+        // name for the same symbol.
+        if claimed.contains(&(candidate.file.clone(), candidate.name_range)) {
+            continue;
+        }
+
         if let Some(reason) = keep.reject(candidate, req.graph) {
             skipped.push(skipped_for(candidate, reason, None));
             continue;
@@ -137,7 +156,7 @@ pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOut
 
         let new_name = names.generate(candidate.kind.name_case())?;
 
-        let change = match propose_rename(analysis, *file_id, candidate, &new_name) {
+        let change = match propose_rename(analysis, *file_id, candidate.name_range, &new_name) {
             Ok(change) => change,
             Err(reason) => {
                 skipped.push(skipped_for(candidate, reason.0, reason.1));
@@ -145,10 +164,11 @@ pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOut
             }
         };
 
-        match stage_change(analysis, change, candidate, req, &analyzed_text, &mut edits) {
-            Ok(applied) => {
+        match stage_change(analysis, change, candidate, req, &analyzed_text, plan) {
+            Ok((applied, files)) => {
                 outcome.stats.bump(candidate.kind);
                 outcome.stats.edits_applied += applied;
+                outcome.files_edited.extend(files);
                 outcome
                     .mapping
                     .record_symbol(candidate.path.clone(), new_name.clone());
@@ -160,24 +180,23 @@ pub fn run(analysis: &RustAnalysis, req: &RenameRequest<'_>) -> Result<RenameOut
     // Nothing is written here. The pipeline applies the whole plan once, after
     // every pass has contributed to it, so that no pass sees a file another
     // pass has already changed the length of.
-    outcome.stats.files_edited = edits.edited_files().count();
-    outcome.plan = edits;
+    outcome.stats.files_edited = outcome.files_edited.len();
     outcome.skipped = skipped;
     Ok(outcome)
 }
 
-type Skip = (SkipReason, Option<String>);
+pub(crate) type Skip = (SkipReason, Option<String>);
 
 /// Ask rust-analyzer for the edit set of renaming this candidate.
-fn propose_rename(
+pub(crate) fn propose_rename(
     analysis: &RustAnalysis,
     file_id: FileId,
-    candidate: &Candidate,
+    name_range: TextRange,
     new_name: &str,
 ) -> std::result::Result<SourceChange, Skip> {
     let position = FilePosition {
         file_id,
-        offset: TextSize::from(u32::from(candidate.name_range.start())),
+        offset: TextSize::from(u32::from(name_range.start())),
     };
 
     let config = RenameConfig {
@@ -204,14 +223,17 @@ fn propose_rename(
 
 /// Check a proposed rename against the three correctness rules and, if it
 /// passes, schedule its edits.
-fn stage_change(
+/// Resolve a rust-analyzer edit set onto the files we are allowed to write.
+///
+/// Shared with the Tauri command pass, which needs the same treatment of the
+/// same kind of edit set — a rename rust-analyzer produced, bounded by what we
+/// actually copied.
+pub(crate) fn resolve_change_edits(
     analysis: &RustAnalysis,
-    change: SourceChange,
-    candidate: &Candidate,
-    req: &RenameRequest<'_>,
-    analyzed_text: &BTreeMap<PathBuf, String>,
-    plan: &mut EditPlan,
-) -> std::result::Result<usize, Skip> {
+    input_root: &Path,
+    copied: &BTreeSet<PathBuf>,
+    change: &SourceChange,
+) -> std::result::Result<BTreeMap<PathBuf, Vec<Indel>>, Skip> {
     if !change.file_system_edits.is_empty() {
         return Err((
             SkipReason::RequiresFileRename,
@@ -219,11 +241,9 @@ fn stage_change(
         ));
     }
 
-    // Group the edit set by file first, so validation can cover all of them
-    // before any of them is scheduled.
     let mut by_file: BTreeMap<PathBuf, Vec<Indel>> = BTreeMap::new();
     for (file_id, (text_edit, _snippet)) in change.source_file_edits.iter() {
-        let Some(abs) = resolve_edit_target(analysis, req, *file_id) else {
+        let Some(abs) = resolve_edit_target(analysis, input_root, copied, *file_id) else {
             return Err((
                 SkipReason::EditOutsideOutput,
                 Some(format!(
@@ -243,6 +263,19 @@ fn stage_change(
             Some("rust-analyzer produced no edits".into()),
         ));
     }
+
+    Ok(by_file)
+}
+
+fn stage_change(
+    analysis: &RustAnalysis,
+    change: SourceChange,
+    candidate: &Candidate,
+    req: &RenameRequest<'_>,
+    analyzed_text: &BTreeMap<PathBuf, String>,
+    plan: &mut EditPlan,
+) -> std::result::Result<(usize, Vec<PathBuf>), Skip> {
+    let by_file = resolve_change_edits(analysis, req.input_root, req.copied, &change)?;
 
     // Verify the definition site is among the edits. If rust-analyzer resolved
     // the position to something other than the item we think we are renaming,
@@ -276,6 +309,7 @@ fn stage_change(
     }
 
     let staged = by_file.values().map(Vec::len).sum();
+    let touched: Vec<PathBuf> = by_file.keys().cloned().collect();
     for (path, indels) in by_file {
         for indel in &indels {
             tracing::debug!(
@@ -304,7 +338,7 @@ fn stage_change(
         }
     }
 
-    Ok(staged)
+    Ok((staged, touched))
 }
 
 /// Map a rust-analyzer `FileId` onto the output tree, refusing anything we did
@@ -314,14 +348,15 @@ fn stage_change(
 /// happily propose renaming a symbol defined in a registry crate, or rewriting
 /// a file under `target/` — neither of which exists in the generated tree in a
 /// form we may edit.
-fn resolve_edit_target(
+pub(crate) fn resolve_edit_target(
     analysis: &RustAnalysis,
-    req: &RenameRequest<'_>,
+    input_root: &Path,
+    copied: &BTreeSet<PathBuf>,
     file_id: FileId,
 ) -> Option<PathBuf> {
     let abs = analysis.file_path(file_id)?;
-    let rel = abs.strip_prefix(req.input_root).ok()?;
-    req.copied.contains(rel).then_some(abs)
+    let rel = abs.strip_prefix(input_root).ok()?;
+    copied.contains(rel).then_some(abs)
 }
 
 fn skipped_for(candidate: &Candidate, reason: SkipReason, detail: Option<String>) -> SkippedSymbol {
@@ -349,7 +384,7 @@ fn skipped_for(candidate: &Candidate, reason: SkipReason, detail: Option<String>
 /// - The crate-wrapper fallback matches direct children of the crate directory
 ///   only. That is what admits `build.rs`, which lives outside `src/`; matching
 ///   at any depth is what swept in `target/` in the first place.
-fn crate_for_file<'a>(graph: &'a CrateGraph, path: &Path) -> Option<&'a CrateInfo> {
+pub(crate) fn crate_for_file<'a>(graph: &'a CrateGraph, path: &Path) -> Option<&'a CrateInfo> {
     if let Some(target) = &graph.target_directory {
         if path.starts_with(target) {
             return None;
@@ -405,16 +440,16 @@ fn module_prefix_for(krate: &CrateInfo, path: &Path) -> Vec<String> {
 
 /// What one pass over the workspace's syntax trees yields.
 #[derive(Debug, Default)]
-struct SyntaxFacts {
+pub struct SyntaxFacts {
     /// Every identifier in workspace source, used to keep generated names from
     /// colliding with, or shadowing, one that already exists.
-    identifiers: HashSet<String>,
+    pub identifiers: HashSet<String>,
     /// Identifiers appearing inside a macro token tree.
-    macro_referenced: HashSet<String>,
+    pub macro_referenced: HashSet<String>,
 }
 
 /// Collect both identifier sets in a single walk.
-fn collect_syntax_facts(
+pub fn collect_syntax_facts(
     analysis: &RustAnalysis,
     files: &[(FileId, PathBuf)],
     graph: &CrateGraph,

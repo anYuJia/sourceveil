@@ -39,6 +39,14 @@ sha2 = "0.10"
 hmac = "0.12"
 getrandom = "0.2"
 
+# --- frontend analysis ---
+oxc_allocator = "0.150"
+oxc_ast = "0.150"
+oxc_ast_visit = "0.150"
+oxc_parser = "0.150"
+oxc_span = "0.150"
+oxc_syntax = "0.150"
+
 # --- rust semantic analysis (rust-analyzer as a library) ---
 ra_ap_ide = "0.0.352"
 ra_ap_ide_db = "0.0.352"

@@ -17,13 +17,16 @@
 
 use crate::config::{AnalyzeSource, Config, VerifyStage};
 use crate::copier;
+use crate::edits::EditPlan;
 use crate::mapping::Mapping;
+use crate::names::NameGenerator;
 use crate::plan::Plan;
-use crate::report::Report;
+use crate::report::{CommandStats, Report};
 use crate::rust::analysis::{LoadOptions, RustAnalysis};
-use crate::rust::rename::{self, RenameRequest};
+use crate::rust::rename::{self, RenameRequest, Shared};
 use crate::scanner::ProjectLayout;
 use crate::seed::{self, SeedInfo};
+use crate::tauri::{self, CommandRequest};
 use crate::verify::{self, VerifyContext};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -101,10 +104,11 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
         .canonicalize()
         .unwrap_or_else(|_| req.output.clone());
 
-    // --- 2. analyze and rename -------------------------------------------
+    // --- 2. analyze, then run the passes ----------------------------------
     let mut mapping = Mapping::new(seed.seed);
+    let mut command_stats = CommandStats::default();
 
-    if !plan.rename.is_noop() {
+    if !plan.rename.is_noop() || plan.tauri.commands {
         let analysis_root = match plan.build.analyze {
             AnalyzeSource::Input => layout.rust_root.clone(),
             AnalyzeSource::Output => output_root.join(layout.rust_relative()),
@@ -117,45 +121,96 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
         let analysis = RustAnalysis::load(&analysis_root, &opts)
             .with_context(|| format!("loading {} into rust-analyzer", analysis_root.display()))?;
 
-        let request = RenameRequest {
-            input_root: &layout.root,
-            output_root: &output_root,
-            copied: &copy.copied,
-            plan: &plan,
-            graph: &layout.crates,
-            seed: seed.seed,
+        // One name stream for every pass. Two generators seeded alike would
+        // produce the same first name and collide, so the passes draw from the
+        // same one, in a fixed order.
+        let files = analysis.rust_files();
+        let facts = rename::collect_syntax_facts(&analysis, &files, &layout.crates);
+        let (len_min, len_max) = plan.rename.name_len;
+        let mut names = NameGenerator::new(seed.seed, len_min, len_max, facts.identifiers);
+
+        // One plan for every pass, applied once.
+        let mut edits = EditPlan::new();
+
+        // Tauri commands first: this pass consumes names and claims the
+        // definition sites it renames, so the symbol pass must see them as
+        // taken rather than rename them a second time.
+        let claimed = if plan.tauri.commands {
+            let request = CommandRequest {
+                input_root: &layout.root,
+                copied: &copy.copied,
+                plan: &plan,
+                graph: &layout.crates,
+                frontend_root: layout.frontend_root.as_deref(),
+                invoke_names: &plan.tauri.invoke_names,
+            };
+            let outcome = tauri::run(&analysis, &request, &mut names, &mut edits)
+                .context("running the tauri command pass")?;
+
+            command_stats = CommandStats::from_outcome(&outcome);
+            mapping.commands = outcome.mapping;
+            report.warnings.extend(outcome.warnings);
+            report.files.frontend_scanned =
+                outcome.refs.frontend_static + outcome.refs.frontend_dynamic;
+            outcome.claimed
+        } else {
+            Default::default()
         };
 
-        let outcome = rename::run(&analysis, &request).context("running the rename pass")?;
+        if !plan.rename.is_noop() {
+            let request = RenameRequest {
+                input_root: &layout.root,
+                output_root: &output_root,
+                copied: &copy.copied,
+                plan: &plan,
+                graph: &layout.crates,
+                seed: seed.seed,
+            };
 
-        // Edits are applied by the pipeline, not by the pass: every pass
-        // contributes to one plan and the plan is written once, so that no pass
-        // ever sees a file another pass has already changed the length of.
-        let applied = outcome
-            .plan
+            let outcome = rename::run(
+                &analysis,
+                &request,
+                Shared {
+                    names: &mut names,
+                    plan: &mut edits,
+                    claimed: &claimed,
+                    macro_referenced: facts.macro_referenced,
+                },
+            )
+            .context("running the rename pass")?;
+
+            report.files.rust_scanned = outcome.rust_files_scanned;
+            report.rename = outcome.stats;
+            for skipped in outcome.skipped {
+                report.skip(skipped);
+            }
+            report.warnings.extend(outcome.warnings);
+            // Symbol renames and command renames both land in the one mapping;
+            // they are separate sections because a command name is a protocol
+            // value rather than a Rust identifier.
+            mapping.symbols.extend(outcome.mapping.symbols);
+
+            tracing::info!(
+                renamed = report.rename.total(),
+                kept = report.skipped_by_reason.values().sum::<usize>(),
+                files = report.rename.files_edited,
+                "rename pass complete"
+            );
+        }
+
+        // Every pass has contributed; nothing has been written yet. This is the
+        // only place the output tree is modified.
+        let applied = edits
             .apply(&layout.root, &output_root)
-            .context("applying the rename edits")?;
+            .context("applying the collected edits")?;
         tracing::info!(
             files = applied.files_edited,
             edits = applied.edits_applied,
             "applied edits"
         );
-
-        report.files.rust_scanned = outcome.rust_files_scanned;
-        report.rename = outcome.stats;
-        for skipped in outcome.skipped {
-            report.skip(skipped);
-        }
-        report.warnings.extend(outcome.warnings);
-        mapping = outcome.mapping;
-
-        tracing::info!(
-            renamed = report.rename.total(),
-            kept = report.skipped_by_reason.values().sum::<usize>(),
-            files = report.rename.files_edited,
-            "rename pass complete"
-        );
     }
+
+    report.commands = command_stats;
 
     // --- 3. mapping ------------------------------------------------------
     let mut mapping_path = None;

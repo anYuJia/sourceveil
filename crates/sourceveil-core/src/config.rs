@@ -141,6 +141,11 @@ pub struct Tauri {
     /// Rewrite command-name string literals found in Rust match arms and
     /// allow-lists, not just `invoke()` calls.
     pub scan_command_literals: Option<bool>,
+    /// Extra callee names to treat as `invoke`. `invoke` and `tauriInvoke` are
+    /// always recognised, as are local functions that forward their first
+    /// parameter to one of them.
+    #[serde(default)]
+    pub invoke_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

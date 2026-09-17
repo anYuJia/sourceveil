@@ -39,6 +39,7 @@
 pub mod config;
 pub mod copier;
 pub mod edits;
+pub mod frontend;
 pub mod mapping;
 pub mod names;
 pub mod pipeline;
@@ -47,6 +48,7 @@ pub mod report;
 pub mod rng;
 pub mod scanner;
 pub mod seed;
+pub mod tauri;
 pub mod verify;
 
 pub mod rust;

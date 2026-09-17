@@ -73,11 +73,22 @@ ui = false
 endpoints = false
 
 [tauri]
-# The cross-language IPC pass is not implemented in this build. While it is
-# absent, `#[tauri::command]` handlers are pinned by an automatic keep rule, so
-# the frontend `invoke("...")` strings stay valid.
+# Rename `#[tauri::command]` handlers together with every frontend
+# `invoke("...")` that calls them, the `generate_handler!` entry, and any Rust
+# allow-list or dispatch arm that names them — as one transaction.
+#
+# Any doubt keeps the command and reports why. In particular a single dynamic
+# `invoke(expr)` keeps the whole namespace, because a runtime-computed name
+# could refer to any command.
 commands = true
+
+# The event pass is not implemented in this build.
 events = true
+
+# Extra callee names to treat as `invoke`. `invoke` and `tauriInvoke` are always
+# recognised, as are local functions that forward their first parameter to one
+# of them.
+invoke_names = []
 
 # Window labels are a framework-level identifier. Kept regardless.
 window_labels = false
@@ -114,9 +125,12 @@ seed = "auto"
 verify = true
 
 # Run in this order; the pipeline stops at the first failure.
+# `npm-ci` has to come before the scripts that need `node_modules`, because the
+# copier deliberately does not copy `node_modules` into the generated tree.
 verify_stages = [
     "cargo-metadata",
     "cargo-check",
+    "npm-ci",
     "npm-typecheck",
     "npm-build",
     "leak-scan",

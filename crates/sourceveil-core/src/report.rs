@@ -156,6 +156,59 @@ pub struct StageResult {
     pub detail: Option<String>,
 }
 
+/// What the Tauri command pass found and did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommandStats {
+    pub discovered: usize,
+    pub renamed: usize,
+    /// Kept commands grouped by reason.
+    pub kept_by_reason: BTreeMap<String, usize>,
+    pub kept: Vec<KeptCommandInfo>,
+    pub frontend_static_refs: usize,
+    pub frontend_dynamic_refs: usize,
+    pub handler_refs: usize,
+    pub rust_literal_refs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeptCommandInfo {
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl CommandStats {
+    pub fn from_outcome(outcome: &crate::tauri::CommandOutcome) -> Self {
+        let mut kept_by_reason: BTreeMap<String, usize> = BTreeMap::new();
+        let mut kept = Vec::new();
+        for command in &outcome.kept {
+            *kept_by_reason
+                .entry(command.reason.as_str().to_string())
+                .or_insert(0) += 1;
+            kept.push(KeptCommandInfo {
+                name: command.name.clone(),
+                file: command.file.clone(),
+                line: command.line,
+                reason: command.reason.as_str().to_string(),
+                detail: command.detail.clone(),
+            });
+        }
+        Self {
+            discovered: outcome.discovered,
+            renamed: outcome.renamed,
+            kept_by_reason,
+            kept,
+            frontend_static_refs: outcome.refs.frontend_static,
+            frontend_dynamic_refs: outcome.refs.frontend_dynamic,
+            handler_refs: outcome.refs.handler,
+            rust_literal_refs: outcome.refs.rust_literals,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub report_version: u32,
@@ -163,6 +216,7 @@ pub struct Report {
     pub seed: SeedInfo,
     pub files: FileCounts,
     pub rename: RenameStats,
+    pub commands: CommandStats,
     /// Count of skipped symbols grouped by reason.
     pub skipped_by_reason: BTreeMap<String, usize>,
     pub skipped: Vec<SkippedSymbol>,
@@ -178,6 +232,7 @@ impl Report {
             seed,
             files: FileCounts::default(),
             rename: RenameStats::default(),
+            commands: CommandStats::default(),
             skipped_by_reason: BTreeMap::new(),
             skipped: Vec::new(),
             verification: Vec::new(),
@@ -253,6 +308,29 @@ impl Report {
         );
         for (reason, count) in &self.skipped_by_reason {
             let _ = writeln!(w, "  {reason:<24} {count}");
+        }
+
+        if self.commands.discovered > 0 {
+            let _ = writeln!(w);
+            let c = &self.commands;
+            let _ = writeln!(w, "Tauri commands discovered:  {}", c.discovered);
+            let _ = writeln!(w, "Tauri commands renamed:     {}", c.renamed);
+            let _ = writeln!(w, "Tauri commands kept:        {}", c.kept.len());
+            for (reason, count) in &c.kept_by_reason {
+                let _ = writeln!(w, "  {reason:<36} {count}");
+            }
+            let _ = writeln!(
+                w,
+                "  frontend invoke refs:       {}",
+                c.frontend_static_refs
+            );
+            let _ = writeln!(
+                w,
+                "  dynamic invoke refs:        {}",
+                c.frontend_dynamic_refs
+            );
+            let _ = writeln!(w, "  generate_handler refs:      {}", c.handler_refs);
+            let _ = writeln!(w, "  Rust command literals:      {}", c.rust_literal_refs);
         }
 
         if !self.verification.is_empty() {

@@ -81,6 +81,8 @@ pub struct TauriPlan {
     pub events: bool,
     pub window_labels: bool,
     pub scan_command_literals: bool,
+    /// Extra callee names understood to be `invoke`.
+    pub invoke_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -257,11 +259,11 @@ impl Plan {
             events: t.events.unwrap_or(true),
             window_labels: t.window_labels.unwrap_or(false),
             scan_command_literals: t.scan_command_literals.unwrap_or(true),
+            invoke_names: t.invoke_names.clone(),
         };
-        if tauri.commands || tauri.events {
+        if tauri.events {
             unsupported.push(
-                "tauri.commands/events: cross-language IPC pass is not implemented in this build; \
-                 `#[tauri::command]` handlers are pinned by an automatic keep rule"
+                "tauri.events: the cross-language event pass is not implemented in this build"
                     .to_string(),
             );
         }
@@ -354,6 +356,11 @@ fn default_stages() -> Vec<VerifyStage> {
     vec![
         VerifyStage::CargoMetadata,
         VerifyStage::CargoCheck,
+        // `node_modules` is deliberately not copied, so the generated tree
+        // needs its dependencies installed before any script can run. Without
+        // this, `npm run typecheck` fails with `tsc: command not found` — a
+        // failure that says nothing about the transform.
+        VerifyStage::NpmCi,
         VerifyStage::NpmTypecheck,
         VerifyStage::NpmBuild,
         VerifyStage::LeakScan,

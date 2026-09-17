@@ -11,7 +11,7 @@
 //! read-only assertions therefore share one transform between them rather than
 //! paying for it seven times.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -575,5 +575,282 @@ fn serde_fixture_still_renames_its_non_serde_types() {
     assert!(
         !model.contains("RuntimeState"),
         "a non-serde type must still be renamed, or this fixture proves nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tauri IPC
+// ---------------------------------------------------------------------------
+//
+// A command's name lives in four places at once — the Rust definition, the
+// `generate_handler!` list, the frontend `invoke("...")` call, and any Rust
+// allow-list or match arm. These tests run the real binary over a real Tauri 2
+// project and check that all four agree afterwards.
+
+fn tauri_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name)
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+}
+
+fn transform_tauri(name: &str, seed: &str, verify: bool) -> (TempDir, PathBuf, Output) {
+    let tmp = TempDir::new().expect("temp dir");
+    let out = tmp.path().join("generated");
+
+    let mut cmd = Command::new(binary());
+    cmd.arg("transform")
+        .arg("--input")
+        .arg(tauri_fixture(name))
+        .arg("--output")
+        .arg(&out)
+        .args(["--seed", seed]);
+    if !verify {
+        cmd.arg("--no-verify");
+    }
+
+    let result = cmd.output().expect("spawning cargo-obfuscator");
+    (tmp, out, result)
+}
+
+static TAURI_STATIC: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+static TAURI_DYNAMIC: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+
+fn static_tauri() -> &'static Path {
+    &TAURI_STATIC
+        .get_or_init(|| {
+            let (tmp, out, result) = transform_tauri("tauri-ipc-static", "20240917", true);
+            assert_succeeded(&result);
+            (tmp, out)
+        })
+        .1
+}
+
+fn dynamic_tauri() -> &'static Path {
+    &TAURI_DYNAMIC
+        .get_or_init(|| {
+            let (tmp, out, result) = transform_tauri("tauri-ipc-dynamic", "20240917", true);
+            assert_succeeded(&result);
+            (tmp, out)
+        })
+        .1
+}
+
+/// Command names appearing in `generate_handler![...]`.
+fn handler_list(root: &Path) -> BTreeSet<String> {
+    let lib = read(root, "src-tauri/src/lib.rs");
+    let mut out = BTreeSet::new();
+    let mut rest = lib.as_str();
+    while let Some(start) = rest.find("generate_handler![") {
+        rest = &rest[start + "generate_handler![".len()..];
+        let Some(end) = rest.find(']') else { break };
+        for entry in rest[..end].split(',') {
+            if let Some(name) = entry.trim().rsplit("::").next() {
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Which of `candidates` the *shipped* frontend names.
+///
+/// Read from `dist`, not from `src`, because built output is what actually
+/// runs — and because it is the one place a missed rewrite becomes a runtime
+/// failure rather than a compile error. Intersected with the mapping's own
+/// names rather than collecting every string literal, because a bundle is full
+/// of strings that are not commands.
+fn shipped_frontend_commands(root: &Path, candidates: &BTreeSet<String>) -> BTreeSet<String> {
+    let dist = root.join("frontend/dist");
+    let mut out = BTreeSet::new();
+    for path in walk(&dist) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for quote in ['"', '\'', '`'] {
+            for part in text.split(quote).skip(1).step_by(2) {
+                let name = part.trim();
+                if candidates.contains(name) {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn tauri_commands_move_together_across_both_languages() {
+    let out = static_tauri();
+    let commands = report(out)["commands"].clone();
+
+    assert_eq!(commands["discovered"].as_u64(), Some(4));
+    assert_eq!(commands["renamed"].as_u64(), Some(4));
+    assert_eq!(
+        commands["kept"].as_array().map(|k| k.len()),
+        Some(0),
+        "nothing should have been kept: {commands}"
+    );
+
+    let mapping = mapping(out);
+    let renamed: BTreeMap<String, String> = mapping["commands"]
+        .as_object()
+        .expect("commands mapping")
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+        .collect();
+    assert_eq!(renamed.len(), 4, "{renamed:?}");
+    assert!(renamed.contains_key("get_user_info"));
+    assert!(
+        renamed.contains_key("ping"),
+        "the short-form attribute must be found"
+    );
+
+    // The handler list, the shipped frontend, and the mapping have to name the
+    // same set. Any disagreement is a command that fails at runtime.
+    let new_names: BTreeSet<String> = renamed.values().cloned().collect();
+    let candidates: BTreeSet<String> = renamed
+        .keys()
+        .cloned()
+        .chain(new_names.iter().cloned())
+        .collect();
+
+    assert_eq!(
+        handler_list(out),
+        new_names,
+        "the Rust handler list does not name exactly the new commands"
+    );
+    assert_eq!(
+        shipped_frontend_commands(out, &candidates),
+        new_names,
+        "the shipped frontend does not name exactly the new commands — an old \
+         name still ships, or a new one never reached the bundle"
+    );
+
+    // The original names must be gone from both sides.
+    let rust = read(out, "src-tauri/src/lib.rs") + &read(out, "src-tauri/src/commands.rs");
+    for original in renamed.keys() {
+        assert!(
+            !rust.contains(&format!("fn {original}")),
+            "`{original}` is still defined in the generated Rust"
+        );
+    }
+}
+
+/// The Rust allow-list and the match arm are part of the same protocol.
+#[test]
+fn tauri_rust_command_literals_are_rewritten() {
+    let out = static_tauri();
+    let allow = read(out, "src-tauri/src/allow.rs");
+    // The three the fixture actually lists. `ping` is reached through the
+    // handler list and the frontend wrapper, not through the allow-list.
+    let renamed: BTreeMap<String, String> = mapping(out)["commands"]
+        .as_object()
+        .expect("commands mapping")
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+        .collect();
+
+    for original in ["get_user_info", "activate_license", "sync_state"] {
+        assert!(
+            !allow.contains(&format!("\"{original}\"")),
+            "`{original}` survived in the Rust allow-list"
+        );
+        let new = &renamed[original];
+        assert!(
+            allow.contains(&format!("\"{new}\"")),
+            "the allow-list should name `{new}`"
+        );
+    }
+    assert!(
+        allow.contains("invoke.message.command()"),
+        "the dispatch shape must be left alone"
+    );
+}
+
+#[test]
+fn tauri_dynamic_invoke_keeps_the_whole_namespace() {
+    let out = dynamic_tauri();
+    let commands = report(out)["commands"].clone();
+
+    assert_eq!(commands["discovered"].as_u64(), Some(4));
+    assert_eq!(
+        commands["renamed"].as_u64(),
+        Some(0),
+        "one dynamic call must keep every command: {commands}"
+    );
+    assert_eq!(
+        commands["kept_by_reason"]["dynamic-frontend-command-reference"].as_u64(),
+        Some(4)
+    );
+
+    // The mapping must record nothing, or a stack trace would be misread.
+    assert!(
+        mapping(out)["commands"]
+            .as_object()
+            .map(|m| m.is_empty())
+            .unwrap_or(true),
+        "no command was renamed, so the mapping must be empty"
+    );
+
+    // And the reason has to be findable: a developer needs the file and line.
+    let report = report(out);
+    let kept = serde_json::to_string(&report["commands"]["kept"]).unwrap();
+    assert!(kept.contains("dynamic.ts"), "{kept}");
+    assert!(
+        report["warnings"]
+            .as_array()
+            .map(|w| w.iter().any(|w| w
+                .as_str()
+                .is_some_and(|s| s.contains("dynamic.ts:") && s.contains("obfuscation disabled"))))
+            .unwrap_or(false),
+        "the warning must point at the dynamic call: {}",
+        report["warnings"]
+    );
+}
+
+/// The generic symbol rename must not rename a command a second time.
+#[test]
+fn tauri_commands_are_owned_by_the_command_pass() {
+    let out = static_tauri();
+    let symbols = mapping(out)["symbols"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for key in symbols.keys() {
+        for command in ["get_user_info", "activate_license", "sync_state", "ping"] {
+            assert!(
+                !key.ends_with(&format!("::{command}")),
+                "`{command}` was also renamed by the symbol pass as `{key}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_command_mapping_is_reproducible_and_seeded() {
+    // No verification: this is about the names, and a cargo check of the Tauri
+    // tree costs more than the assertion is worth.
+    let (_t1, first, r1) = transform_tauri("tauri-ipc-static", "5150", false);
+    let (_t2, second, r2) = transform_tauri("tauri-ipc-static", "5150", false);
+    let (_t3, other, r3) = transform_tauri("tauri-ipc-static", "5151", false);
+    for r in [&r1, &r2, &r3] {
+        assert_succeeded(r);
+    }
+
+    let commands = |root: &Path| mapping(root)["commands"].clone();
+    assert_eq!(
+        commands(&first),
+        commands(&second),
+        "same seed, same mapping"
+    );
+    assert_ne!(
+        commands(&first),
+        commands(&other),
+        "different seed, different mapping"
     );
 }

@@ -41,7 +41,8 @@ V1, at the prototype stage the design calls for. What is implemented:
 | deterministic and keyed build seeds | done |
 | `mapping.json` / `report.json` | done |
 | verification pipeline | done |
-| Tauri IPC / event rename | not implemented — see below |
+| Tauri command rename (Rust + TypeScript + allow-lists) | done |
+| Tauri event rename | not implemented — see below |
 | serde-safe field rename | not implemented — serde members are pinned, see below |
 | string protection | not implemented |
 | TypeScript analyzer | not implemented |
@@ -51,8 +52,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 Unimplemented features are reported in the run output rather than ignored, and
 where their absence would break something, the affected symbols are pinned:
 
-- `#[tauri::command]` handlers are **kept**, so existing `invoke("...")` calls
-  keep working.
+- Tauri events are **kept**; the cross-language event pass is a later phase.
 - Every field and variant of a type deriving `Serialize`/`Deserialize` is
   **kept**. The pass that renames the identifier while pinning the wire format
   with `#[serde(rename = "...")]` does not exist yet, so there is no safe amount
@@ -105,6 +105,47 @@ fixture before and after the transform, under both `safe` and `balanced`, and
 compares the serialized output byte for byte — and separately checks that the
 non-serde struct's fields *do* get renamed, so the fixture cannot pass by
 pinning everything.
+
+### Tauri commands are one protocol across four places
+
+A command's name is not just a Rust identifier. It is simultaneously:
+
+```text
+Rust definition          #[tauri::command] async fn get_user_info()
+registration             tauri::generate_handler![commands::get_user_info]
+frontend call            invoke("get_user_info")
+Rust dispatch            match invoke.message.command() { "get_user_info" => .. }
+Rust allow-list          const ALLOWED: &[&str] = &["get_user_info"];
+```
+
+Renaming three of the four leaves a project that either does not compile or —
+worse — compiles, starts, and silently refuses every call to that command. So
+they are changed as one transaction, and any doubt keeps the command whole:
+
+| situation | what happens |
+| --- | --- |
+| `invoke("get_user_info")` | renamed, both sides |
+| `invoke<Response>("activate_license")` | renamed |
+| `const CMD = "sync_state"; invoke(CMD)` | renamed, if every use of `CMD` is an `invoke` argument |
+| `call("ping")` where `call` is a project wrapper | renamed |
+| `invoke(commandName)` | **every command is kept**, with the file and line reported |
+| `#[command]` that resolves to clap | kept |
+| a name that also appears as a Rust string outside a recognised context | kept |
+
+The `generate_handler!` list is parsed by hand, because rust-analyzer's
+reference search does not reach inside a macro token tree. Only the spans of the
+names it recognises are rewritten; nothing else in the token tree is touched.
+
+The short form `#[command]` is accepted only when name resolution lands in the
+`tauri-macros` crate, so a clap `#[command]` is never mistaken for one.
+
+`tests/fixtures/tauri-ipc-static` and `tests/fixtures/tauri-ipc-dynamic` are
+real Tauri 2 projects — the real crate, the real macros, the real invoke
+protocol — built with `default-features = false, features = ["test"]` so they
+compile on Linux without webkit2gtk. The static one renames four commands and
+checks that the Rust handler list and the *shipped* frontend bundle name exactly
+the same set. The dynamic one contains a single `invoke(\`${prefix}_${action}\`)`
+and checks that nothing is renamed.
 
 ## Quick start
 
