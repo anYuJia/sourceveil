@@ -29,6 +29,7 @@
 //!
 //! Every one of those is reported with a file, a line and a reason.
 
+pub mod event;
 pub mod handler;
 pub mod literals;
 
@@ -694,6 +695,24 @@ fn attribute_names_from_attr(attr: &ast::Attr) -> Vec<String> {
         }
     }
     out
+}
+
+/// Is this path inside a Tauri crate?
+///
+/// Used for method resolution: `app.emit(..)` is only a Tauri call once name
+/// resolution places `emit` in the `tauri` crate, because event buses are not
+/// rare and `emit` is not a distinctive name.
+pub(crate) fn is_tauri_api_path(path: &Path, input_root: &Path) -> bool {
+    if path.starts_with(input_root) {
+        return false;
+    }
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name == "tauri"
+            || name
+                .split_once('-')
+                .is_some_and(|(head, tail)| head == "tauri" && tail.starts_with(char::is_numeric))
+    })
 }
 
 /// Does this path name the Tauri crate or its macro crate?

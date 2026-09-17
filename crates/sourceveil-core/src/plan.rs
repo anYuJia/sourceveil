@@ -261,12 +261,6 @@ impl Plan {
             scan_command_literals: t.scan_command_literals.unwrap_or(true),
             invoke_names: t.invoke_names.clone(),
         };
-        if tauri.events {
-            unsupported.push(
-                "tauri.events: the cross-language event pass is not implemented in this build"
-                    .to_string(),
-            );
-        }
         if tauri.window_labels {
             unsupported.push(
                 "tauri.window_labels: window labels are a framework-level identifier and are \

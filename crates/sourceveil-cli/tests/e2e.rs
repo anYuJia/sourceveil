@@ -975,3 +975,311 @@ fn domains_do_not_disturb_each_other() {
         "command names moved because unrelated symbols were added"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tauri events
+// ---------------------------------------------------------------------------
+//
+// An event has no registry: nothing lists every event the way
+// `generate_handler!` lists every command. A rename is only safe when the graph
+// is closed — at least one producer and one consumer, both inside the generated
+// workspace — so most of what these tests check is what was *refused*.
+
+static EVENTS_STATIC: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+static EVENTS_DYNAMIC: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+
+fn events_static() -> &'static Path {
+    &EVENTS_STATIC
+        .get_or_init(|| {
+            let (tmp, out, result) = transform_tauri("tauri-events-static", "20240917", true);
+            assert_succeeded(&result);
+            (tmp, out)
+        })
+        .1
+}
+
+fn events_dynamic() -> &'static Path {
+    &EVENTS_DYNAMIC
+        .get_or_init(|| {
+            let (tmp, out, result) = transform_tauri("tauri-events-dynamic", "20240917", true);
+            assert_succeeded(&result);
+            (tmp, out)
+        })
+        .1
+}
+
+fn event_map(root: &Path) -> BTreeMap<String, String> {
+    mapping(root)["events"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every event name mentioned to the Tauri event API in a Rust file.
+fn rust_event_literals(root: &Path) -> BTreeSet<String> {
+    let text = read(root, "src-tauri/src/events.rs");
+    let mut out = BTreeSet::new();
+    for call in [
+        ".emit(",
+        ".emit_to(",
+        ".emit_filter(",
+        ".listen(",
+        ".listen_any(",
+        ".once(",
+    ] {
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(call) {
+            rest = &rest[at + call.len()..];
+            // Skip the window label on `emit_to`.
+            let rest_after_label = if call == ".emit_to(" {
+                match rest.find(',') {
+                    Some(comma) => &rest[comma + 1..],
+                    None => rest,
+                }
+            } else {
+                rest
+            };
+            let trimmed = rest_after_label.trim_start();
+            if let Some(stripped) = trimmed.strip_prefix('"') {
+                if let Some(end) = stripped.find('"') {
+                    out.insert(stripped[..end].to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The string a `const NAME = "..."` holds.
+fn const_value(source: &str, name: &str) -> String {
+    let needle = format!("const {name} = \"");
+    source
+        .find(&needle)
+        .and_then(|at| {
+            let rest = &source[at + needle.len()..];
+            rest.find('"').map(|end| rest[..end].to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// Quoted strings on a line, in order.
+fn quoted_strings(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find('"') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('"') else { break };
+        out.push(rest[..end].to_string());
+        rest = &rest[end + 1..];
+    }
+    out
+}
+
+/// Every event name passed to the Tauri event API in the frontend source.
+///
+/// The decoys — `socket.emit`, `emitter.once` — are excluded by name, because
+/// leaving them out is exactly what this test is about.
+fn frontend_event_literals(root: &Path) -> BTreeSet<String> {
+    let text = read(root, "frontend/src/events.ts");
+    let mut out = BTreeSet::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("//") || line.starts_with("interface") || line.starts_with("declare") {
+            continue;
+        }
+        if line.contains("socket.") || line.contains("emitter.") {
+            continue;
+        }
+        let is_tauri_call = ["emit(", "emitTo(", "listen", "once("]
+            .iter()
+            .any(|call| line.contains(call));
+        if !is_tauri_call {
+            continue;
+        }
+
+        let strings = quoted_strings(line);
+        // `emitTo("main", "name", ...)` — the label comes first.
+        let name = if line.contains("emitTo(") {
+            strings.get(1)
+        } else {
+            strings.first()
+        };
+        if let Some(name) = name {
+            out.insert(name.clone());
+        }
+        if line.contains("listen(EVENT") {
+            out.insert(const_value(&text, "EVENT"));
+        }
+    }
+    out
+}
+
+#[test]
+fn tauri_events_move_together_across_both_languages() {
+    let out = events_static();
+    let report = report(out)["events"].clone();
+
+    assert_eq!(report["discovered"].as_u64(), Some(11));
+    assert_eq!(report["renamed"].as_u64(), Some(9));
+    assert_eq!(
+        report["kept"].as_array().map(|k| k.len()),
+        Some(2),
+        "only the two events that reach outside the workspace should be kept: {report}"
+    );
+
+    let renamed = event_map(out);
+    assert_eq!(renamed.len(), 9, "{renamed:?}");
+
+    // The cross-language events have to be named identically on both sides.
+    // Anything else is an event that fires into the void. Events that only one
+    // language participates in are checked on that side alone.
+    let rust = rust_event_literals(out);
+    let frontend = frontend_event_literals(out);
+
+    let cross_language = [
+        "download-progress",
+        "session-updated",
+        "open-file",
+        "frontend-ready",
+        "sync-state",
+        "startup-complete",
+    ];
+    for original in cross_language {
+        let new_name = &renamed[original];
+        assert!(
+            rust.contains(new_name),
+            "`{original}` was renamed to `{new_name}` but the Rust side does not use it"
+        );
+        assert!(
+            frontend.contains(new_name),
+            "`{original}` was renamed to `{new_name}` but the frontend does not use it"
+        );
+    }
+
+    // Rust to Rust, and frontend to frontend: one side each.
+    assert!(rust.contains(&renamed["rust-internal-tick"]));
+    assert!(frontend.contains(&renamed["fe-internal-refresh"]));
+
+    // Neither side may still name a renamed event by its old name.
+    for original in renamed.keys() {
+        assert!(
+            !rust.iter().any(|n| n == original),
+            "`{original}` still appears on the Rust side"
+        );
+    }
+}
+
+/// The two events that reach outside the workspace, and why.
+#[test]
+fn events_with_only_one_end_inside_the_workspace_are_kept() {
+    let out = events_static();
+    let report = report(out);
+    let kept = &report["events"]["kept_by_reason"];
+
+    assert_eq!(kept["external-event-source"].as_u64(), Some(1));
+    assert_eq!(kept["external-event-consumer"].as_u64(), Some(1));
+
+    let events = event_map(out);
+    assert!(
+        !events.contains_key("plugin-status"),
+        "a listener with no producer may be fed by a plugin"
+    );
+    assert!(
+        !events.contains_key("telemetry-ping"),
+        "a producer with no listener may be consumed elsewhere"
+    );
+}
+
+/// `emit` and `listen` are ordinary method names.
+#[test]
+fn calls_that_are_not_the_tauri_event_api_are_untouched() {
+    let out = events_static();
+    let frontend = read(out, "frontend/src/events.ts");
+    let rust = read(out, "src-tauri/src/events.rs");
+
+    assert!(
+        frontend.contains(r#"socket.emit("plugin-status")"#),
+        "a socket bus is not the Tauri event API"
+    );
+    assert!(
+        frontend.contains(r#"emitter.once("telemetry-ping")"#),
+        "an emitter is not the Tauri event API"
+    );
+    assert!(
+        rust.contains(r#""plugin-status""#) && rust.contains(r#""telemetry-ping""#),
+        "a local bus is not the Tauri event API"
+    );
+
+    // `emitTo`'s first argument is a window label, and this phase does not
+    // rename window labels.
+    assert!(
+        frontend.contains(r#"emitTo("main", "#),
+        "the target label was modified"
+    );
+    assert!(
+        rust.contains(r#"emit_to("main", "#),
+        "the target label was modified"
+    );
+}
+
+#[test]
+fn tauri_dynamic_event_keeps_the_whole_namespace() {
+    let out = events_dynamic();
+    let report = report(out);
+
+    assert_eq!(report["events"]["discovered"].as_u64(), Some(11));
+    assert_eq!(
+        report["events"]["renamed"].as_u64(),
+        Some(0),
+        "a runtime-computed name could be any event"
+    );
+    assert_eq!(
+        report["events"]["kept_by_reason"]["dynamic-event-reference"].as_u64(),
+        Some(11)
+    );
+    assert!(
+        event_map(out).is_empty(),
+        "nothing was renamed, so nothing is mapped"
+    );
+
+    // Both directions have to be named, with a line, or the report is not
+    // actionable.
+    let warnings = serde_json::to_string(&report["warnings"]).unwrap();
+    assert!(warnings.contains("events.ts:"), "{warnings}");
+    assert!(warnings.contains("events.rs:"), "{warnings}");
+    assert!(
+        warnings.contains("event obfuscation disabled"),
+        "{warnings}"
+    );
+}
+
+#[test]
+fn the_event_mapping_is_reproducible_and_seeded() {
+    let (_t1, first, r1) = transform_tauri("tauri-events-static", "8181", false);
+    let (_t2, second, r2) = transform_tauri("tauri-events-static", "8181", false);
+    let (_t3, other, r3) = transform_tauri("tauri-events-static", "8182", false);
+    for r in [&r1, &r2, &r3] {
+        assert_succeeded(r);
+    }
+
+    assert_eq!(
+        event_map(&first),
+        event_map(&second),
+        "same seed, same mapping"
+    );
+    assert_ne!(
+        event_map(&first),
+        event_map(&other),
+        "different seed, different mapping"
+    );
+
+    // The whole point of the domain separator: the two namespaces are
+    // independent, so neither can move because the other changed.
+    let commands = |root: &Path| mapping(root)["commands"].clone();
+    assert_eq!(commands(&first), commands(&second));
+}

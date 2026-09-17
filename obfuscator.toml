@@ -82,7 +82,14 @@ endpoints = false
 # could refer to any command.
 commands = true
 
-# The event pass is not implemented in this build.
+# Rename Tauri event channels on both sides — Rust `emit`/`listen` and the
+# frontend `emit`/`listen`/`once`.
+#
+# An event has no registry the way `generate_handler!` is one, so a rename only
+# happens when the graph is closed: at least one producer and at least one
+# consumer, both inside the generated workspace. An event that is only listened
+# for may be produced by a plugin; one that is only emitted may be consumed by a
+# page this tool cannot see. Either way it stays.
 events = true
 
 # Extra callee names to treat as `invoke`. `invoke` and `tauriInvoke` are always

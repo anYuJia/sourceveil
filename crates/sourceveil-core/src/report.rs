@@ -209,6 +209,62 @@ impl CommandStats {
     }
 }
 
+/// What the Tauri event pass found and did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EventStats {
+    pub discovered: usize,
+    pub renamed: usize,
+    pub kept_by_reason: BTreeMap<String, usize>,
+    pub kept: Vec<KeptEventInfo>,
+    pub rust_emit_refs: usize,
+    pub rust_listen_refs: usize,
+    pub frontend_emit_refs: usize,
+    pub frontend_listen_refs: usize,
+    pub dynamic_refs: usize,
+    /// Events with no producer inside the workspace.
+    pub external_source: usize,
+    /// Events with no consumer inside the workspace.
+    pub external_consumer: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeptEventInfo {
+    pub name: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl EventStats {
+    pub fn from_outcome(outcome: &crate::tauri::event::EventOutcome) -> Self {
+        let mut kept_by_reason: BTreeMap<String, usize> = BTreeMap::new();
+        let mut kept = Vec::new();
+        for event in &outcome.kept {
+            *kept_by_reason
+                .entry(event.reason.as_str().to_string())
+                .or_insert(0) += 1;
+            kept.push(KeptEventInfo {
+                name: event.name.clone(),
+                reason: event.reason.as_str().to_string(),
+                detail: event.detail.clone(),
+            });
+        }
+        Self {
+            discovered: outcome.discovered,
+            renamed: outcome.renamed,
+            kept_by_reason,
+            kept,
+            rust_emit_refs: outcome.refs.rust_emit,
+            rust_listen_refs: outcome.refs.rust_listen,
+            frontend_emit_refs: outcome.refs.frontend_emit,
+            frontend_listen_refs: outcome.refs.frontend_listen,
+            dynamic_refs: outcome.refs.dynamic,
+            external_source: outcome.refs.external_source,
+            external_consumer: outcome.refs.external_consumer,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub report_version: u32,
@@ -217,6 +273,7 @@ pub struct Report {
     pub files: FileCounts,
     pub rename: RenameStats,
     pub commands: CommandStats,
+    pub events: EventStats,
     /// Count of skipped symbols grouped by reason.
     pub skipped_by_reason: BTreeMap<String, usize>,
     pub skipped: Vec<SkippedSymbol>,
@@ -233,6 +290,7 @@ impl Report {
             files: FileCounts::default(),
             rename: RenameStats::default(),
             commands: CommandStats::default(),
+            events: EventStats::default(),
             skipped_by_reason: BTreeMap::new(),
             skipped: Vec::new(),
             verification: Vec::new(),
@@ -331,6 +389,26 @@ impl Report {
             );
             let _ = writeln!(w, "  generate_handler refs:      {}", c.handler_refs);
             let _ = writeln!(w, "  Rust command literals:      {}", c.rust_literal_refs);
+        }
+
+        if self.events.discovered > 0 {
+            let _ = writeln!(w);
+            let e = &self.events;
+            let _ = writeln!(w, "Tauri events discovered:    {}", e.discovered);
+            let _ = writeln!(w, "Tauri events renamed:       {}", e.renamed);
+            let _ = writeln!(w, "Tauri events kept:          {}", e.kept.len());
+            for (reason, count) in &e.kept_by_reason {
+                let _ = writeln!(w, "  {reason:<36} {count}");
+            }
+            let _ = writeln!(w, "  Rust emit refs:             {}", e.rust_emit_refs);
+            let _ = writeln!(w, "  Rust listen refs:           {}", e.rust_listen_refs);
+            let _ = writeln!(w, "  frontend emit refs:         {}", e.frontend_emit_refs);
+            let _ = writeln!(
+                w,
+                "  frontend listen refs:       {}",
+                e.frontend_listen_refs
+            );
+            let _ = writeln!(w, "  dynamic event refs:         {}", e.dynamic_refs);
         }
 
         if !self.verification.is_empty() {

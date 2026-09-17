@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "tauri-events-static",
+  "version": "0.1.0",
+  "identifier": "dev.sourceveil.tauri-events-static",
+  "build": { "frontendDist": "../frontend/dist" },
+  "app": { "windows": [{ "title": "fixture" }] }
+}

@@ -1,0 +1,26 @@
+# `[workspace]` keeps this a standalone workspace root inside the
+# obfuscator's own repository.
+[workspace]
+
+[package]
+name = "tauri-events-dynamic"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tauri_events_dynamic_lib"
+crate-type = ["lib"]
+
+[build-dependencies]
+
+[dependencies]
+# The real Tauri crate, with the `test` feature instead of `wry`.
+#
+# `default-features = false` drops the wry runtime, which is what pulls in
+# webkit2gtk — so this fixture compiles on Linux without system libraries.
+# `test` provides Tauri's own mock runtime, so `#[tauri::command]`,
+# `generate_handler!` and the invoke protocol are all genuinely exercised
+# rather than mocked by hand.
+tauri = { version = "2", default-features = false, features = ["test"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

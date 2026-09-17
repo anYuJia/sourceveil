@@ -21,11 +21,12 @@ use crate::edits::EditPlan;
 use crate::mapping::Mapping;
 use crate::names::NameDeriver;
 use crate::plan::Plan;
-use crate::report::{CommandStats, Report};
+use crate::report::{CommandStats, EventStats, Report};
 use crate::rust::analysis::{LoadOptions, RustAnalysis};
 use crate::rust::rename::{self, RenameRequest, Shared};
 use crate::scanner::ProjectLayout;
 use crate::seed::{self, SeedInfo};
+use crate::tauri::event::{self as tauri_event, EventRequest};
 use crate::tauri::{self, CommandRequest};
 use crate::verify::{self, VerifyContext};
 use anyhow::{Context, Result};
@@ -107,8 +108,9 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     // --- 2. analyze, then run the passes ----------------------------------
     let mut mapping = Mapping::new(seed.seed);
     let mut command_stats = CommandStats::default();
+    let mut event_stats = EventStats::default();
 
-    if !plan.rename.is_noop() || plan.tauri.commands {
+    if !plan.rename.is_noop() || plan.tauri.commands || plan.tauri.events {
         let analysis_root = match plan.build.analyze {
             AnalyzeSource::Input => layout.rust_root.clone(),
             AnalyzeSource::Output => output_root.join(layout.rust_relative()),
@@ -156,6 +158,24 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
         } else {
             Default::default()
         };
+
+        // Events next: they draw from their own domain, so they cannot move a
+        // command name, but they do edit some of the same files.
+        if plan.tauri.events {
+            let request = EventRequest {
+                input_root: &layout.root,
+                copied: &copy.copied,
+                plan: &plan,
+                graph: &layout.crates,
+                frontend_root: layout.frontend_root.as_deref(),
+            };
+            let outcome = tauri_event::run(&analysis, &request, &mut names, &mut edits)
+                .context("running the tauri event pass")?;
+
+            event_stats = EventStats::from_outcome(&outcome);
+            mapping.events = outcome.mapping;
+            report.warnings.extend(outcome.warnings);
+        }
 
         if !plan.rename.is_noop() {
             let request = RenameRequest {
@@ -211,6 +231,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     }
 
     report.commands = command_stats;
+    report.events = event_stats;
 
     // --- 3. mapping ------------------------------------------------------
     let mut mapping_path = None;

@@ -42,7 +42,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 | `mapping.json` / `report.json` | done |
 | verification pipeline | done |
 | Tauri command rename (Rust + TypeScript + allow-lists) | done |
-| Tauri event rename | not implemented — see below |
+| Tauri event rename (Rust + TypeScript) | done |
 | serde-safe field rename | not implemented — serde members are pinned, see below |
 | string protection | not implemented |
 | TypeScript analyzer | not implemented |
@@ -52,7 +52,8 @@ V1, at the prototype stage the design calls for. What is implemented:
 Unimplemented features are reported in the run output rather than ignored, and
 where their absence would break something, the affected symbols are pinned:
 
-- Tauri events are **kept**; the cross-language event pass is a later phase.
+- An event that reaches outside the workspace in either direction is
+  **kept** — see below.
 - Every field and variant of a type deriving `Serialize`/`Deserialize` is
   **kept**. The pass that renames the identifier while pinning the wire format
   with `#[serde(rename = "...")]` does not exist yet, so there is no safe amount
@@ -146,6 +147,57 @@ compile on Linux without webkit2gtk. The static one renames four commands and
 checks that the Rust handler list and the *shipped* frontend bundle name exactly
 the same set. The dynamic one contains a single `invoke(\`${prefix}_${action}\`)`
 and checks that nothing is renamed.
+
+### Events are only renamed when the graph is closed
+
+A command has a registry: `generate_handler!` lists every one, so the set is
+knowable. An event has nothing like that. A name can be emitted in Rust,
+listened for in TypeScript, relayed back to another window, or produced by a
+plugin this tool never sees:
+
+```text
+Rust      -> Frontend        app.emit("download-progress", ..)
+Frontend  -> Rust            listen("download-progress", ..)
+Frontend  -> Frontend        emit(..) / listen(..)
+Rust      -> Rust            emit(..) / listen(..)
+```
+
+So a rename happens only when at least one producer *and* at least one consumer
+are inside the generated workspace. An event with only a listener may be fed by
+a plugin; one with only a producer may be consumed by a page this tool cannot
+see. Both stay, and the report says which and why.
+
+| situation | what happens |
+| --- | --- |
+| Rust `emit` and frontend `listen` | renamed, both sides |
+| frontend `emit` and Rust `listen` | renamed, both sides |
+| Rust `emit` and Rust `listen` | renamed |
+| frontend `emit` and frontend `listen` | renamed |
+| `win.emit(..)` from `getCurrentWebviewWindow()` | renamed |
+| `emitTo("main", "x", ..)` | renamed; the label is left alone |
+| a listener with no producer | **kept** — `external-event-source` |
+| a producer with no listener | **kept** — `external-event-consumer` |
+| `tauri://window-created` | **kept** — `framework-event` |
+| `invoke(name)` / `listen(name, ..)` | **every event is kept**, with file and line |
+
+Two things make this safe to run on a real project.
+
+**Provenance is not optional.** `emit`, `listen` and `once` are ordinary names —
+socket.io, Node's `EventEmitter` and half the DOM use them. A call is considered
+only when its callee traces back to `@tauri-apps/api/event` through an import in
+the same file, including aliased and namespace imports and a receiver bound from
+`getCurrentWebviewWindow()`. The Rust side resolves the method through the
+compiler and requires it to come from the `tauri` crate. Both fixtures contain a
+`socket.emit(..)`, an `emitter.once(..)` and a Rust local bus with its own
+`emit`, and none of them is touched.
+
+**A runtime-computed name keeps everything.** `listen(eventName, ..)` could be
+any event, so one of them keeps the whole namespace, and the report names the
+file and line in both languages.
+
+`tests/fixtures/tauri-events-static` covers every call shape on both sides plus
+the decoys; `tauri-events-dynamic` adds one dynamic name per language and checks
+that nothing is renamed.
 
 ## Quick start
 
