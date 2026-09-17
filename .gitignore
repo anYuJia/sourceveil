@@ -1,0 +1,16 @@
+/target
+**/target
+
+# Generated workspaces. The tool refuses to write into a populated directory,
+# but a half-finished run can still leave one behind.
+/.obfuscated
+.obfuscator/
+
+# The mapping is the answer key: it maps every original name to its
+# replacement. Committing it inverts the entire point of the obfuscation.
+/mapping.json
+/seed-info.json
+
+node_modules/
+dist/
+.DS_Store

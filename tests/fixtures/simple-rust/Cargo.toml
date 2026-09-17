@@ -1,0 +1,10 @@
+# `[workspace]` makes this a standalone workspace root, so it can live inside
+# the obfuscator's own repository without being treated as a member of it.
+[workspace]
+
+[package]
+name = "simple-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

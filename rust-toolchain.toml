@@ -1,0 +1,6 @@
+[toolchain]
+# rust-analyzer's published crates (ra_ap_*) track the rustc release cycle and
+# 0.0.35x requires 1.98. The obfuscator is a build tool, so it is free to pin a
+# newer toolchain than the projects it transforms.
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

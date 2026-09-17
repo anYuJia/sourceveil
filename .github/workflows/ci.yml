@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The tool is a build tool, and every one of these is a machine someone
+        # will run it on.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain is pinned by rust-toolchain.toml: rust-analyzer's
+      # published crates track the rustc release cycle, and the pinned version
+      # is the one whose `ra_ap_*` API this code is written against.
+      - name: Install Rust
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Unit tests and end-to-end tests. The end-to-end tests transform
+      # `tests/fixtures/simple-rust` with the real binary and finish with a
+      # real `cargo check` of the result, which is the only thing that can
+      # establish the transform works.
+      - name: Test
+        run: cargo test --all
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build obfuscator
+        run: cargo build --release --bin cargo-obfuscator
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-obfuscator-linux-x64
+          path: target/release/cargo-obfuscator
+          if-no-files-found: error

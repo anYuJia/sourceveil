@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sourceveil-core",
+    "crates/sourceveil-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/anYuJia/sourceveil"
+
+[workspace.dependencies]
+sourceveil-core = { path = "crates/sourceveil-core" }
+
+# --- error handling / logging ---
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- cli ---
+clap = { version = "4", features = ["derive"] }
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# --- project analysis ---
+cargo_metadata = "0.23"
+walkdir = "2"
+globset = "0.4"
+
+# --- hashing / entropy ---
+sha2 = "0.10"
+hmac = "0.12"
+getrandom = "0.2"
+
+# --- rust semantic analysis (rust-analyzer as a library) ---
+ra_ap_ide = "0.0.352"
+ra_ap_ide_db = "0.0.352"
+ra_ap_load-cargo = "0.0.352"
+ra_ap_proc_macro_api = "0.0.352"
+ra_ap_project_model = "0.0.352"
+ra_ap_syntax = "0.0.352"
+ra_ap_vfs = "0.0.352"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
