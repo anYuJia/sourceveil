@@ -175,16 +175,50 @@ fn is_in_command_set(token: &SyntaxToken, commands: &BTreeSet<String>) -> bool {
     let Some(container) = enclosing_list(token) else {
         return false;
     };
-    let Some(name) = binding_name(&container) else {
-        return false;
-    };
-    let lower = name.to_ascii_lowercase();
-    if !COMMAND_SET_MARKERS.iter().any(|m| lower.contains(m)) {
+    if !context_reads_like_commands(&container) {
         return false;
     }
 
     let elements = string_elements(&container);
     !elements.is_empty() && elements.iter().all(|e| commands.contains(e))
+}
+
+/// Does the name this list belongs to read like a set of commands?
+///
+/// Both the binding and the enclosing function count. `HashSet::from([...])`
+/// built inside `fn allowed_commands()` has no binding at all — it is a return
+/// value — and that is a shape the syntax alone cannot distinguish from any
+/// other array of strings, so the name is the evidence.
+fn context_reads_like_commands(list: &SyntaxNode) -> bool {
+    for ancestor in list.ancestors() {
+        match ancestor.kind() {
+            SyntaxKind::CONST | SyntaxKind::STATIC | SyntaxKind::LET_STMT | SyntaxKind::FN => {
+                if let Some(name) = declared_name(&ancestor) {
+                    let lower = name.to_ascii_lowercase();
+                    if COMMAND_SET_MARKERS.iter().any(|m| lower.contains(m)) {
+                        return true;
+                    }
+                }
+                // The nearest declaration owns this list; a further-out name
+                // describes something else.
+                return false;
+            }
+            SyntaxKind::MODULE => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The name a declaration introduces.
+fn declared_name(node: &SyntaxNode) -> Option<String> {
+    let kind = match node.kind() {
+        SyntaxKind::LET_STMT => SyntaxKind::IDENT_PAT,
+        _ => SyntaxKind::NAME,
+    };
+    node.children()
+        .find(|c| c.kind() == kind)
+        .map(|n| n.text().to_string())
 }
 
 /// The `[..]` or `vec![..]` the literal sits in.
@@ -206,29 +240,6 @@ fn is_vec_macro(call: &SyntaxNode) -> bool {
         .find(|c| c.kind() == SyntaxKind::PATH)
         .map(|path| path.text().to_string().trim() == "vec")
         .unwrap_or(false)
-}
-
-/// The name the list is bound to, whether `const`, `static` or `let`.
-fn binding_name(list: &SyntaxNode) -> Option<String> {
-    for ancestor in list.ancestors() {
-        match ancestor.kind() {
-            SyntaxKind::CONST | SyntaxKind::STATIC => {
-                return ancestor
-                    .children()
-                    .find(|c| c.kind() == SyntaxKind::NAME)
-                    .map(|n| n.text().to_string());
-            }
-            SyntaxKind::LET_STMT => {
-                return ancestor
-                    .children()
-                    .find(|c| c.kind() == SyntaxKind::IDENT_PAT)
-                    .map(|p| p.text().to_string());
-            }
-            SyntaxKind::FN | SyntaxKind::MODULE => return None,
-            _ => {}
-        }
-    }
-    None
 }
 
 /// All string tokens directly inside a list node.
@@ -361,19 +372,35 @@ mod tests {
         assert!(scan.unclassified.is_empty());
     }
 
+    /// Returning the set rather than binding it: there is no variable name to
+    /// read, so the enclosing function's name is the evidence.
     #[test]
-    fn a_vec_command_set_is_recognised() {
+    fn a_vec_command_set_returned_from_a_named_function_is_recognised() {
         let scan = scan(
             r#"
-            pub fn allowed() -> Vec<&'static str> {
+            pub fn allowed_commands() -> Vec<&'static str> {
                 vec!["get_user_info", "activate_license"]
             }
             "#,
             &["get_user_info", "activate_license"],
         );
-        // Bound to a function rather than a named command set, so this is not
-        // recognised — and being conservative is the point.
-        assert!(scan.recognized.is_empty());
+        assert_eq!(scan.recognized.len(), 2, "{:?}", scan.unclassified);
+    }
+
+    /// Nothing in the context says these are commands, so the same array is
+    /// left alone even though every element happens to be one.
+    #[test]
+    fn an_unmarked_list_is_not_recognised() {
+        let scan = scan(
+            r#"
+            pub fn labels() -> Vec<&'static str> {
+                vec!["get_user_info", "activate_license"]
+            }
+            "#,
+            &["get_user_info", "activate_license"],
+        );
+        assert!(scan.recognized.is_empty(), "{:?}", scan.recognized);
+        assert_eq!(scan.unclassified.len(), 2);
     }
 
     #[test]
@@ -393,6 +420,33 @@ mod tests {
         let scan = scan(r#"fn f() { log("not_a_command"); }"#, &["get_user_info"]);
         assert!(scan.recognized.is_empty());
         assert!(scan.unclassified.is_empty());
+    }
+
+    #[test]
+    fn a_hashset_command_set_is_recognised() {
+        let scan = scan(
+            r#"
+            fn allowed() -> HashSet<&'static str> {
+                ALLOWED_COMMANDS.iter().copied().collect()
+            }
+            const ALLOWED_COMMANDS: [&str; 2] = ["get_user_info", "activate_license"];
+            "#,
+            &["get_user_info", "activate_license"],
+        );
+        assert_eq!(scan.recognized.len(), 2, "{:?}", scan.unclassified);
+    }
+
+    #[test]
+    fn hashset_from_is_recognised() {
+        let scan = scan(
+            r#"
+            pub fn allowed() -> HashSet<&'static str> {
+                HashSet::from(["get_user_info", "activate_license"])
+            }
+            "#,
+            &["get_user_info", "activate_license"],
+        );
+        assert_eq!(scan.recognized.len(), 2, "{:?}", scan.unclassified);
     }
 
     #[test]
