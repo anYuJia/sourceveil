@@ -10,6 +10,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# A superseded push should not keep burning minutes. Actions on a private
+# repository are billed, so cancelling stale runs is not just tidiness.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -18,18 +24,27 @@ jobs:
       fail-fast: false
       matrix:
         # The tool is a build tool, and every one of these is a machine someone
-        # will run it on.
+        # will run it on. Windows and macOS matter here specifically because the
+        # copier and the verifier both touch paths and the filesystem.
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
 
-      # The toolchain is pinned by rust-toolchain.toml: rust-analyzer's
-      # published crates track the rustc release cycle, and the pinned version
-      # is the one whose `ra_ap_*` API this code is written against.
-      - name: Install Rust
-        run: rustup show active-toolchain
+      # rust-toolchain.toml pins the version: rust-analyzer's published crates
+      # track the rustc release cycle, and the pinned one is what this code is
+      # written against. Installing it explicitly means a failure here is
+      # reported as a toolchain problem rather than as a mysterious build error.
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
 
+      - name: Show versions
+        run: |
+          rustc --version
+          cargo --version
+
+      # Keyed on the toolchain and Cargo.lock. Must come after the toolchain is
+      # installed, or it caches under the wrong key.
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
@@ -51,7 +66,7 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show active-toolchain
+      - run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Build obfuscator

@@ -406,3 +406,174 @@ fn refuses_to_write_into_a_populated_output_directory() {
         "the pre-existing file was destroyed anyway"
     );
 }
+
+// ---------------------------------------------------------------------------
+// serde wire format
+// ---------------------------------------------------------------------------
+//
+// The rename pass must not change what the program writes to the network or to
+// disk. Compiling is not evidence of that — the two builds compile either way.
+// The only proof is to run the original and the transformed program and compare
+// their output, which is what these tests do.
+
+fn serde_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/serde-safety")
+        .canonicalize()
+        .expect("serde fixture directory")
+}
+
+/// Run a crate in `root` and return its stdout.
+fn run_crate(root: &Path) -> String {
+    let result = Command::new("cargo")
+        .arg("run")
+        .arg("--quiet")
+        .current_dir(root)
+        .output()
+        .expect("spawning cargo run");
+    assert!(
+        result.status.success(),
+        "{} failed to run\n--- stderr ---\n{}",
+        root.display(),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    String::from_utf8_lossy(&result.stdout).to_string()
+}
+
+/// The wire format of the untransformed fixture. Everything below is compared
+/// against this.
+static WIRE_FORMAT: OnceLock<String> = OnceLock::new();
+
+fn original_wire_format() -> &'static str {
+    WIRE_FORMAT.get_or_init(|| run_crate(&serde_fixture()))
+}
+
+/// Transform the serde fixture, optionally under a named profile.
+fn transform_serde(profile: Option<&str>, seed: &str) -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().expect("temp dir");
+    let out = tmp.path().join("generated");
+
+    let mut cmd = Command::new(binary());
+    cmd.arg("transform")
+        .arg("--input")
+        .arg(serde_fixture())
+        .arg("--output")
+        .arg(&out)
+        .args(["--seed", seed]);
+
+    if let Some(profile) = profile {
+        let config = tmp.path().join("obfuscator.toml");
+        std::fs::write(&config, format!("version = 1\nprofile = {profile:?}\n"))
+            .expect("writing config");
+        cmd.arg("--config").arg(&config);
+    }
+
+    let result = cmd.output().expect("spawning cargo-obfuscator");
+    assert_succeeded(&result);
+    (tmp, out)
+}
+
+/// Every name in the fixture that is a wire-format key.
+const SERDE_KEYS: &[&str] = &[
+    // plain model
+    "user_name",
+    "device_id",
+    "internal_scratch",
+    // rename_all = "camelCase"
+    "session_token",
+    "expires_at",
+    // externally tagged enum
+    "Connected",
+    "Disconnected",
+    "reason_code",
+    // internally tagged enum
+    "Started",
+    "Stopped",
+    "started_at",
+    // explicit per-field rename
+    "modern_name",
+    "legacy_name",
+];
+
+/// The one entry in [`SERDE_KEYS`] that is not an identifier.
+///
+/// `legacy_name` is the string *value* of `#[serde(rename = "legacy_name")]`.
+/// It is a wire key that has to survive, but it is never a rename candidate, so
+/// it can never appear among the `serde-model` skips.
+const SERDE_KEY_STRING_VALUES: &[&str] = &["legacy_name"];
+
+/// Names that are ordinary Rust identifiers and must keep moving.
+const NON_SERDE_FIELDS: &[&str] = &["scratch_buffer", "retry_count"];
+
+#[test]
+fn serde_wire_format_survives_the_default_profile() {
+    let (_tmp, out) = transform_serde(None, "20240917");
+    assert_eq!(
+        run_crate(&out),
+        original_wire_format(),
+        "the generated program serialises differently from the original"
+    );
+}
+
+#[test]
+fn serde_wire_format_survives_the_balanced_profile() {
+    // `balanced` is the profile that actually turns field rename on, so this is
+    // the case where a missing serde rule would do real damage.
+    let (_tmp, out) = transform_serde(Some("balanced"), "20240917");
+
+    assert_eq!(
+        run_crate(&out),
+        original_wire_format(),
+        "the generated program serialises differently from the original"
+    );
+
+    let model = read(&out, "src/model.rs");
+    for key in SERDE_KEYS {
+        assert!(
+            model.contains(key),
+            "`{key}` is a serde wire-format key but was renamed"
+        );
+    }
+    for field in NON_SERDE_FIELDS {
+        assert!(
+            !model.contains(field),
+            "`{field}` is not part of any serde model, so `balanced` should have renamed it"
+        );
+    }
+
+    // And the report must say why the difference exists, not just that it does.
+    let identifier_keys = SERDE_KEYS.len() - SERDE_KEY_STRING_VALUES.len();
+    assert!(
+        skipped_count(&out, "serde-model") >= identifier_keys as u64,
+        "every wire-format identifier should be accounted for as a serde-model skip"
+    );
+}
+
+/// Serde members are pinned even under `safe`, where fields are off but enum
+/// variants are renamed by default — a variant name is a JSON key too.
+#[test]
+fn serde_enum_variants_are_pinned_under_the_safe_profile() {
+    let (_tmp, out) = transform_serde(None, "20240917");
+    let model = read(&out, "src/model.rs");
+    for variant in ["Connected", "Disconnected", "Started", "Stopped"] {
+        assert!(
+            model.contains(variant),
+            "variant `{variant}` is an externally-tagged key and was renamed"
+        );
+    }
+    assert!(
+        skipped_count(&out, "serde-model") >= 4,
+        "the four serde variants should be reported as serde-model skips"
+    );
+}
+
+/// The fixture is only meaningful if it still demonstrates obfuscation.
+#[test]
+fn serde_fixture_still_renames_its_non_serde_types() {
+    let (_tmp, out) = transform_serde(Some("balanced"), "20240917");
+    let model = read(&out, "src/model.rs");
+    assert!(
+        !model.contains("RuntimeState"),
+        "a non-serde type must still be renamed, or this fixture proves nothing"
+    );
+}

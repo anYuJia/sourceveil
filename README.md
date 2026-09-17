@@ -42,7 +42,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 | `mapping.json` / `report.json` | done |
 | verification pipeline | done |
 | Tauri IPC / event rename | not implemented — see below |
-| serde-safe field rename | not implemented — see below |
+| serde-safe field rename | not implemented — serde members are pinned, see below |
 | string protection | not implemented |
 | TypeScript analyzer | not implemented |
 | module file rename | not implemented |
@@ -53,10 +53,58 @@ where their absence would break something, the affected symbols are pinned:
 
 - `#[tauri::command]` handlers are **kept**, so existing `invoke("...")` calls
   keep working.
-- `#[serde(...)]`-attributed items are **kept**, so the wire format cannot drift.
+- Every field and variant of a type deriving `Serialize`/`Deserialize` is
+  **kept**. The pass that renames the identifier while pinning the wire format
+  with `#[serde(rename = "...")]` does not exist yet, so there is no safe amount
+  of field rename inside a serde model to allow. Details below.
 - Module *identifiers* are renamed; module *files* are not, because
   rust-analyzer implements module rename as a file move and that is a separate
   pass with its own verification.
+
+### Why serde members are pinned
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct User {
+    user_name: String,
+}
+```
+
+`user_name` is not really a Rust identifier — it is a JSON key that happens to
+be spelled like one. Rename it and the code still compiles, the tests that do
+not round-trip still pass, and the breakage appears against a real peer that
+sends `{"user_name": ...}`.
+
+Nothing the compiler can see distinguishes a safe field rename from an unsafe
+one, so until the dedicated pass exists the only correct answer is to keep them:
+
+```rust
+// what happens today                // what the serde pass will do
+#[derive(Serialize, Deserialize)]    #[derive(Serialize, Deserialize)]
+struct X7Qp {                        struct X7Qp {
+    user_name: String,                   #[serde(rename = "user_name")]
+}                                        m9_k: String,
+                                     }
+```
+
+This applies to enum variants as well, and therefore holds under the `safe`
+profile too — a variant name is the key of an externally-tagged representation,
+and variants are renamed by default.
+
+The detection covers every spelling (`#[derive(Serialize)]`,
+`#[derive(Deserialize)]`, `#[derive(serde::Serialize)]`, several derives in one
+list, several `#[derive]` attributes) and propagates from the type to its
+fields, its variants, and the fields inside those variants. The type's own name
+is *not* pinned, because serde does not serialize it — so `User` becomes `X7Qp`
+while `user_name` stays put.
+
+`tests/fixtures/serde-safety` is the proof. It covers a plain model, a
+`rename_all` container, an externally tagged enum, an internally tagged enum, a
+per-field `rename`, and one non-serde struct. The end-to-end test runs the
+fixture before and after the transform, under both `safe` and `balanced`, and
+compares the serialized output byte for byte — and separately checks that the
+non-serde struct's fields *do* get renamed, so the fixture cannot pass by
+pinning everything.
 
 ## Quick start
 
@@ -263,6 +311,11 @@ Two defences:
 1. Any symbol whose name occurs inside a macro token tree is **kept**, and
    reported as `macro-call-reference`. This over-keeps — `apply_ident!(target_fn)`
    would in fact have been renamed correctly — and that is the intended trade.
+   Detection walks outwards through *nested* token trees, because a macro's
+   arguments are themselves token trees: in `println!("{}", Foo::Bar { baz: 1 })`
+   the `{ baz: 1 }` opens a second one, and a check that stopped at the first
+   would classify `baz` as ordinary code. That case is pinned by
+   `macro_token_tree_detection`.
 2. The verification pipeline compiles the generated tree, so anything the above
    misses is caught before you ship it.
 
@@ -299,9 +352,11 @@ cargo clippy --all-targets
 ```
 
 The end-to-end tests in `crates/sourceveil-cli/tests/e2e.rs` run the real binary
-over `tests/fixtures/simple-rust` and finish with a real `cargo check`. They are
-the only tests that can tell you the transform works; the unit tests only cover
-the decisions leading up to it.
+over the fixtures in `tests/fixtures/` and finish with a real `cargo check`. They
+are the only tests that can tell you the transform works; the unit tests only
+cover the decisions leading up to it. `simple-rust` covers the rename surface —
+cross-file references, FFI, keep rules, determinism. `serde-safety` runs the
+fixture before and after the transform and compares serialized output.
 
 `sourceveil-core/Cargo.toml` carries one direct dependency it never calls:
 `unicode-ident`, pinned to `=1.0.22`. `ra-ap-rustc_lexer` asserts at compile time

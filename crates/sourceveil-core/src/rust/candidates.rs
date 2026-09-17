@@ -54,6 +54,14 @@ pub struct Candidate {
     pub inline_keep: bool,
     /// Declared with a non-Rust ABI, e.g. `extern "C" fn`.
     pub is_extern_abi: bool,
+    /// The item is a member of a serde data model — a field of a type deriving
+    /// `Serialize`/`Deserialize`, or a variant of such an enum.
+    ///
+    /// Its name is a wire-format key, not just a Rust identifier. Renaming it
+    /// leaves the code compiling and changes every JSON document the program
+    /// reads or writes, which is precisely the class of failure this tool
+    /// exists to avoid.
+    pub serde_model: bool,
 }
 
 /// Everything the walker needs that is constant for one file.
@@ -80,15 +88,18 @@ pub fn collect(file: &ast::SourceFile, ctx: &FileContext<'_>) -> Vec<Candidate> 
     stack.push(ctx.crate_name.to_string());
     stack.extend(ctx.module_prefix.iter().cloned());
 
-    walk(file.syntax(), &mut stack, ctx, &lines, &mut out);
+    walk(file.syntax(), &mut stack, ctx, &lines, false, &mut out);
     out
 }
 
+/// `serde_model` is true when the node being walked sits inside a type that
+/// derives `Serialize`/`Deserialize`.
 fn walk(
     node: &SyntaxNode,
     stack: &mut Vec<String>,
     ctx: &FileContext<'_>,
     lines: &LineIndex,
+    serde_model: bool,
     out: &mut Vec<Candidate>,
 ) {
     for child in node.children() {
@@ -111,22 +122,83 @@ fn walk(
                             attributes: attribute_names(&child),
                             inline_keep: has_inline_keep(&child, ctx.text),
                             is_extern_abi: has_extern_abi(&child),
+                            serde_model,
                         });
                     }
                 }
             }
         }
 
-        // Descend, extending the path for constructs that introduce a scope.
+        // Descend. A type that derives a serde trait makes everything below it
+        // part of its data model — its fields, and for an enum its variants and
+        // their fields. Rust does not allow a type to be declared inside
+        // another type's body, so this propagation cannot reach an unrelated
+        // item.
+        let child_serde = serde_model || is_serde_model_type(&child);
+
+        // Extend the path for constructs that introduce a scope.
         match scope_name(&child) {
             Some(segment) => {
                 stack.push(segment);
-                walk(&child, stack, ctx, lines, out);
+                walk(&child, stack, ctx, lines, child_serde, out);
                 stack.pop();
             }
-            None => walk(&child, stack, ctx, lines, out),
+            None => walk(&child, stack, ctx, lines, child_serde, out),
         }
     }
+}
+
+/// Does this type derive serde's `Serialize` or `Deserialize`?
+///
+/// Both spellings are recognised — `Serialize` and `serde::Serialize` — and a
+/// `#[derive(...)]` list may carry several derives at once. Matching on the
+/// last path segment means a project that defines its own `Serialize` trait
+/// gets its fields kept too. That is the intended direction to err in: keeping
+/// a field costs a little obfuscation, and renaming one costs the wire format.
+fn is_serde_model_type(node: &SyntaxNode) -> bool {
+    if !matches!(
+        node.kind(),
+        SyntaxKind::STRUCT | SyntaxKind::ENUM | SyntaxKind::UNION
+    ) {
+        return false;
+    }
+    derived_traits(node)
+        .iter()
+        .any(|t| matches!(t.rsplit("::").next(), Some("Serialize" | "Deserialize")))
+}
+
+/// Trait paths named in `#[derive(...)]` on this item.
+pub fn derived_traits(node: &SyntaxNode) -> Vec<String> {
+    let mut out = Vec::new();
+    for attr in node.children().filter_map(ast::Attr::cast) {
+        let text = attr.syntax().text().to_string();
+        let inner = strip_attr_wrapper(&text);
+        let Some(rest) = inner.strip_prefix("derive") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(list) = rest.strip_prefix('(') else {
+            continue;
+        };
+        for part in list.trim_end().trim_end_matches(')').split(',') {
+            let path = part.trim();
+            if !path.is_empty() {
+                out.push(path.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `#[derive(Serialize)]` -> `derive(Serialize)`.
+fn strip_attr_wrapper(text: &str) -> &str {
+    text.trim_start_matches("#!")
+        .trim_start_matches('#')
+        .trim_start()
+        .trim_start_matches('[')
+        .trim_end()
+        .trim_end_matches(']')
+        .trim()
 }
 
 /// Byte offset -> 1-based line number, built once per file.
@@ -294,14 +366,7 @@ pub fn attribute_names(node: &SyntaxNode) -> Vec<String> {
     let mut out = Vec::new();
     for attr in node.children().filter_map(ast::Attr::cast) {
         let text = attr.syntax().text().to_string();
-        let inner = text
-            .trim_start_matches("#!")
-            .trim_start_matches('#')
-            .trim_start()
-            .trim_start_matches('[')
-            .trim_end()
-            .trim_end_matches(']')
-            .trim();
+        let inner = strip_attr_wrapper(&text);
 
         let name = if let Some(rest) = inner.strip_prefix("unsafe(") {
             // `unsafe(no_mangle)` / `unsafe(export_name = "...")`
@@ -696,5 +761,115 @@ mod tests {
         );
         let second = cands.iter().find(|c| c.name == "second").unwrap();
         assert!(!second.inline_keep);
+    }
+
+    // -- serde data model ---------------------------------------------------
+
+    fn serde_flags(src: &str) -> Vec<(String, bool)> {
+        collect_src(src)
+            .into_iter()
+            .map(|c| (c.name, c.serde_model))
+            .collect()
+    }
+
+    fn flag_of(src: &str, name: &str) -> bool {
+        serde_flags(src)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .1
+    }
+
+    #[test]
+    fn serde_fields_and_variants_are_flagged() {
+        let src = r#"
+            #[derive(Serialize, Deserialize)]
+            struct User {
+                user_name: String,
+                device_id: u32,
+            }
+
+            #[derive(Serialize)]
+            enum State {
+                Connected,
+                Disconnected { reason_code: u16 },
+            }
+            "#;
+
+        for name in ["user_name", "device_id"] {
+            assert!(flag_of(src, name), "field `{name}` is a wire-format key");
+        }
+        for name in ["Connected", "Disconnected", "reason_code"] {
+            assert!(flag_of(src, name), "`{name}` is part of the wire format");
+        }
+
+        // The type's own name is not serialized by serde, so it stays a plain
+        // Rust identifier and stays renameable.
+        assert!(!flag_of(src, "User"));
+        assert!(!flag_of(src, "State"));
+    }
+
+    #[test]
+    fn every_spelling_of_the_derive_is_recognised() {
+        let cases = [
+            ("#[derive(Serialize)]", true),
+            ("#[derive(Deserialize)]", true),
+            ("#[derive(serde::Serialize)]", true),
+            ("#[derive(serde::Deserialize)]", true),
+            ("#[derive(Serialize, Deserialize)]", true),
+            ("#[derive(Debug, Clone, Serialize)]", true),
+            ("#[derive(Debug, Serialize)]\n#[derive(Clone)]", true),
+            ("#[derive(Clone, Debug, PartialEq)]", false),
+            ("#[derive(Default)]", false),
+            ("", false),
+        ];
+        for (attr, expected) in cases {
+            let src = format!("{attr}\nstruct Probe {{ network_timeout: u32 }}");
+            assert_eq!(
+                flag_of(&src, "network_timeout"),
+                expected,
+                "attribute {attr:?} should{} imply a serde model",
+                if expected { "" } else { " not" }
+            );
+        }
+    }
+
+    #[test]
+    fn types_outside_a_serde_model_stay_renameable() {
+        let src = r#"
+            #[derive(Clone)]
+            struct Plain {
+                scratch_buffer: Vec<u8>,
+            }
+
+            enum AlsoPlain {
+                Idle,
+                Busy { retry_count: u32 },
+            }
+
+            fn helper() {}
+            "#;
+        for name in ["scratch_buffer", "Idle", "Busy", "retry_count", "helper"] {
+            assert!(
+                !flag_of(src, name),
+                "`{name}` is not part of any serde data model"
+            );
+        }
+    }
+
+    /// A serde model reached through a module boundary is still a serde model,
+    /// and an unrelated `Serialize` trait in scope must not silently stop being
+    /// detected.
+    #[test]
+    fn serde_detection_survives_nesting_and_paths() {
+        let src = r#"
+            mod inner {
+                #[derive(serde::Serialize, serde::Deserialize)]
+                pub struct Payload {
+                    pub api_key: String,
+                }
+            }
+            "#;
+        assert!(flag_of(src, "api_key"));
     }
 }

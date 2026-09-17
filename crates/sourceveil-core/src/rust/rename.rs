@@ -463,15 +463,33 @@ fn collect_syntax_facts(
 ///
 /// Both the arguments of a macro invocation and the body of a `macro_rules!`
 /// definition count. See the module docs for why this matters.
+///
+/// Note the loop condition. A macro's arguments are themselves token trees, so
+/// any `(...)`, `{...}` or `[...]` inside them nests another one:
+///
+/// ```text
+/// MACRO_CALL
+///   TOKEN_TREE          <- the macro's argument list; parent is MACRO_CALL
+///     IDENT "format"
+///     TOKEN_TREE        <- the `(target_fn())` call; parent is another TOKEN_TREE
+///       IDENT "target_fn"
+/// ```
+///
+/// Returning at the first `TOKEN_TREE` would therefore see `target_fn`'s parent
+/// token tree, notice its parent is not `MACRO_CALL`, and conclude the token is
+/// ordinary code. The walk has to continue outwards until it either finds a
+/// token tree belonging to a macro or runs out of ancestors.
 fn is_inside_macro_token_tree(token: &ra_ap_syntax::SyntaxToken) -> bool {
     use ra_ap_syntax::SyntaxKind as K;
     let mut node = token.parent();
     while let Some(current) = node {
-        if current.kind() == K::TOKEN_TREE {
-            return matches!(
+        if current.kind() == K::TOKEN_TREE
+            && matches!(
                 current.parent().map(|p| p.kind()),
                 Some(K::MACRO_CALL) | Some(K::MACRO_RULES)
-            );
+            )
+        {
+            return true;
         }
         node = current.parent();
     }
@@ -569,6 +587,29 @@ impl KeepRules {
 
         if self.symbols.contains(&candidate.name) || self.patterns.is_match(&candidate.name) {
             return Some(SkipReason::KeepRule);
+        }
+
+        // The wire-format rule.
+        //
+        // `#[derive(Serialize)]` makes every field name a JSON key. Renaming
+        // the field changes what the program writes and what it accepts, and
+        // the compiler cannot tell you: the code still builds, the tests that
+        // do not round-trip still pass, and the breakage shows up against a
+        // real peer. Until the dedicated serde pass exists — the one that
+        // emits `#[serde(rename = "user_name")]` alongside the new identifier —
+        // the only safe amount of field rename inside a serde model is none.
+        //
+        // This covers enum variants too, and not only fields: a variant name is
+        // an externally-tagged representation's key, which is why this rule has
+        // to hold under the `safe` profile as well, where variants are renamed
+        // by default.
+        if candidate.serde_model
+            && matches!(
+                candidate.kind,
+                crate::rust::ItemKind::Field | crate::rust::ItemKind::Variant
+            )
+        {
+            return Some(SkipReason::SerdeModel);
         }
 
         // A foreign ABI plus a linkage attribute is an exported symbol: the
@@ -732,5 +773,65 @@ mod tests {
 
         let found = crate_for_file(&graph, Path::new("/p/src-tauri/crates/inner/src/lib.rs"));
         assert_eq!(found.map(|k| k.name.as_str()), Some("inner"));
+    }
+
+    #[test]
+    fn macro_token_tree_detection() {
+        let src = r#"
+            fn a() { format!("{}", target_fn()); }
+            fn b() { println!("{}", Foo::Bar { baz: 1 }); }
+            fn c() {
+                println!(
+                    "{}",
+                    Multi::Line(nested_fn(x)),
+                );
+            }
+            fn d() { let plain = target_fn(); }
+            fn e() { vec![target_fn()] }
+        "#;
+        let file = ra_ap_syntax::SourceFile::parse(src, ra_ap_syntax::Edition::Edition2021).tree();
+
+        let mut found = std::collections::BTreeSet::new();
+        for token in file
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|el| el.into_token())
+        {
+            if token.kind() == ra_ap_syntax::SyntaxKind::IDENT && is_inside_macro_token_tree(&token)
+            {
+                found.insert(token.text().to_string());
+            }
+        }
+        let found: Vec<&str> = found.iter().map(String::as_str).collect();
+
+        // Direct arguments.
+        assert!(found.contains(&"target_fn"), "{found:?}");
+        // Inside a nested `{...}` token tree, which is the case that made the
+        // first version of this function wrong.
+        for expected in ["Foo", "Bar", "baz"] {
+            assert!(found.contains(&expected), "missing {expected} in {found:?}");
+        }
+        // Inside a nested `(...)` token tree, two levels down.
+        for expected in ["Multi", "Line", "nested_fn", "x"] {
+            assert!(found.contains(&expected), "missing {expected} in {found:?}");
+        }
+
+        // The macro's own path is not part of its argument list. Nothing is
+        // gained by keeping a symbol named `sum` because some macro is called
+        // `sum!`.
+        for excluded in ["format", "println", "vec"] {
+            assert!(
+                !found.contains(&excluded),
+                "the macro path `{excluded}` is not a token-tree reference: {found:?}"
+            );
+        }
+        assert!(
+            !found.contains(&"plain"),
+            "`plain` is ordinary code: {found:?}"
+        );
+        assert!(
+            !found.contains(&"a"),
+            "fn names are not macro contents: {found:?}"
+        );
     }
 }

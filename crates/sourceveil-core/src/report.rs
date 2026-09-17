@@ -38,6 +38,10 @@ pub enum SkipReason {
     /// rust-analyzer cannot resolve or rewrite references. See
     /// [`crate::rust`] for the measurement behind this rule.
     MacroCallReference,
+    /// The item is part of a serde data model, so its name is a wire-format
+    /// key rather than a Rust identifier. Renaming it would change the JSON
+    /// without changing anything the compiler can see.
+    SerdeModel,
     /// `pub` item in a crate that something outside the workspace depends on.
     ExternallyReachable,
     /// Lives inside a `macro_rules!` body or a macro invocation we cannot
@@ -64,6 +68,7 @@ impl SkipReason {
             SkipReason::InlineKeepComment => "inline-keep-comment",
             SkipReason::IntrinsicAttribute => "intrinsic-attribute",
             SkipReason::MacroCallReference => "macro-call-reference",
+            SkipReason::SerdeModel => "serde-model",
             SkipReason::ExternallyReachable => "externally-reachable",
             SkipReason::MacroGenerated => "macro-generated",
             SkipReason::Unresolvable => "unresolvable",
