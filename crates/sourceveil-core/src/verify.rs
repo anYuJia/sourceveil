@@ -15,6 +15,7 @@ use crate::config::VerifyStage;
 use crate::mapping::Mapping;
 use crate::report::StageResult;
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -241,19 +242,27 @@ const SCAN_SKIP_DIRS: &[&str] = &[
 ];
 
 fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
-    let mut leaks: Vec<String> = Vec::new();
+    let mut fatal: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    // Grouped so a hundred hits of one common name is one line, not a hundred.
+    let mut symbol_hits: BTreeMap<String, (usize, String)> = BTreeMap::new();
 
-    // Names that must no longer be findable. Single-character and very short
-    // names are excluded: they match too much to be evidence of anything.
-    let mut needles: Vec<&str> = ctx
+    // Protocol values are unambiguous: a command name is a value the frontend
+    // sends, so finding one in the output means a call site was missed. Symbol
+    // names are ordinary identifiers and are only reported — see
+    // [`crate::mapping::Mapping::symbol_originals`] for why.
+    let protocol: Vec<&str> = ctx
         .mapping
-        .sensitive_originals()
+        .protocol_originals()
         .into_iter()
         .filter(|n| n.len() >= 3)
         .collect();
-    needles.sort_unstable();
-    needles.dedup();
+    let symbols: Vec<&str> = ctx
+        .mapping
+        .symbol_originals()
+        .into_iter()
+        .filter(|n| n.len() >= 3)
+        .collect();
 
     let mapping_abs = ctx.mapping_dir.map(|p| p.to_path_buf());
 
@@ -262,7 +271,7 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
         .filter_entry(|e| {
             if e.file_type().is_dir() {
                 let name = e.file_name().to_string_lossy();
-                if crate::verify::SCAN_SKIP_DIRS.contains(&name.as_ref()) {
+                if SCAN_SKIP_DIRS.contains(&name.as_ref()) {
                     return false;
                 }
             }
@@ -292,7 +301,7 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
 
         // Source maps must not ship at all, whatever they contain.
         if ext == "map" {
-            leaks.push(format!("source map present: {rel}"));
+            fatal.push(format!("source map present: {rel}"));
             continue;
         }
 
@@ -307,39 +316,78 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
         if matches!(ext.as_str(), "js" | "mjs" | "cjs" | "ts" | "tsx")
             && text.contains("sourceMappingURL=")
         {
-            leaks.push(format!("sourceMappingURL directive: {rel}"));
+            fatal.push(format!("sourceMappingURL directive: {rel}"));
         }
 
-        if needles.is_empty() {
-            continue;
+        for needle in &protocol {
+            if contains_quoted(&text, needle) {
+                fatal.push(format!("{needle:?} found in {rel}"));
+            }
         }
-        for needle in &needles {
+        for needle in &symbols {
             if contains_word(&text, needle) {
-                leaks.push(format!("{needle:?} found in {rel}"));
+                let entry = symbol_hits
+                    .entry((*needle).to_string())
+                    .or_insert((0, rel.clone()));
+                entry.0 += 1;
             }
         }
     }
 
-    if !ctx.mapping.is_empty() && needles.is_empty() {
-        notes.push("mapping contained no names long enough to scan for".to_string());
+    if !fatal.is_empty() {
+        fatal.sort();
+        fatal.dedup();
+        let shown = fatal.len().min(MAX_REPORTED_LEAKS);
+        let mut message = format!("{} leak(s) in the generated tree:\n", fatal.len());
+        for leak in &fatal[..shown] {
+            message.push_str(&format!("  {leak}\n"));
+        }
+        if fatal.len() > shown {
+            message.push_str(&format!("  ... and {} more\n", fatal.len() - shown));
+        }
+        anyhow::bail!(message.trim_end().to_string());
     }
 
-    if leaks.is_empty() {
-        notes.push(format!("scanned for {} original name(s)", needles.len()));
-        return Ok(Some(notes.join("; ")));
+    notes.push(format!(
+        "scanned for {} protocol value(s) and {} symbol name(s)",
+        protocol.len(),
+        symbols.len()
+    ));
+    if !symbol_hits.is_empty() {
+        // Not a failure: the same text survives legitimately in comments, in
+        // the other language, and as unrelated API names.
+        let mut names: Vec<(&String, &(usize, String))> = symbol_hits.iter().collect();
+        names.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        notes.push(format!(
+            "{} renamed symbol name(s) still appear as text, which is expected for common \
+             words and cross-language names: {}",
+            names.len(),
+            names
+                .iter()
+                .take(8)
+                .map(|(name, (count, file))| format!("{name} x{count} (e.g. {file})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
-    leaks.sort();
-    leaks.dedup();
-    let shown = leaks.len().min(MAX_REPORTED_LEAKS);
-    let mut message = format!("{} leak(s) in the generated tree:\n", leaks.len());
-    for leak in &leaks[..shown] {
-        message.push_str(&format!("  {leak}\n"));
+    Ok(Some(notes.join("; ")))
+}
+
+/// Does the text contain this value as a quoted literal?
+///
+/// A protocol value leaks by surviving as a *string* — an `invoke("...")` that
+/// was not rewritten, a command name left in an allow-list. Matching the bare
+/// word instead would also fire on an unrelated identifier that happens to
+/// share the name, which is common: a frontend helper named `ping` beside a
+/// command named `ping` is not a leak.
+fn contains_quoted(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
     }
-    if leaks.len() > shown {
-        message.push_str(&format!("  ... and {} more\n", leaks.len() - shown));
-    }
-    anyhow::bail!(message.trim_end().to_string())
+    ['"', '\'', '`']
+        .iter()
+        .any(|quote| haystack.contains(&format!("{quote}{needle}{quote}")))
 }
 
 /// Word-boundary containment.
@@ -384,6 +432,19 @@ pub fn resolve_mapping_dir(output_root: &Path, dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command name beside an unrelated identifier of the same name.
+    #[test]
+    fn a_bare_identifier_sharing_a_protocol_value_is_not_a_leak() {
+        assert!(contains_quoted(r#"invoke("ping")"#, "ping"));
+        assert!(!contains_quoted(
+            "export function ping() { return 1; }",
+            "ping"
+        ));
+        assert!(!contains_quoted("#[tauri::command] fn ping() {}", "ping"));
+        assert!(contains_quoted("const ALLOWED = ['ping'];", "ping"));
+        assert!(contains_quoted("const s = `ping`;", "ping"));
+    }
 
     #[test]
     fn word_boundaries_prevent_false_positives() {

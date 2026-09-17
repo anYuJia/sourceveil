@@ -65,14 +65,34 @@ impl Mapping {
             .collect()
     }
 
-    /// Every original plaintext that must not appear in a shipped artifact.
-    pub fn sensitive_originals(&self) -> Vec<&str> {
+    /// Original values from the cross-language protocols: command names,
+    /// event channels, and protected strings.
+    ///
+    /// These are unambiguous. A command name is a *value* the frontend sends;
+    /// its presence anywhere in the output means a call site was missed, and
+    /// there is no innocent explanation. The leak scan fails the build on one.
+    pub fn protocol_originals(&self) -> Vec<&str> {
+        self.commands
+            .keys()
+            .map(String::as_str)
+            .chain(self.events.keys().map(String::as_str))
+            .chain(self.strings.keys().map(String::as_str))
+            .collect()
+    }
+
+    /// Original names of renamed Rust symbols.
+    ///
+    /// Weaker evidence, and reported rather than enforced. A symbol name is an
+    /// ordinary identifier, and the same text legitimately survives in a doc
+    /// comment, in the other language (`UserInfo` the TypeScript interface
+    /// beside `UserInfo` the Rust struct), and as an unrelated method on some
+    /// external type (`.build()` beside a renamed `build`). Enforcing a text
+    /// match over those produces noise proportional to how common the word is,
+    /// which teaches people to ignore the check.
+    pub fn symbol_originals(&self) -> Vec<&str> {
         self.symbols
             .keys()
             .map(|k| k.rsplit("::").next().unwrap_or(k))
-            .chain(self.commands.keys().map(String::as_str))
-            .chain(self.events.keys().map(String::as_str))
-            .chain(self.strings.keys().map(String::as_str))
             .collect()
     }
 
@@ -169,16 +189,22 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_originals_strip_module_paths() {
+    fn originals_are_split_by_kind() {
         let mut m = Mapping::new(1);
         m.record_symbol("crate::auth::verify", "P81xy");
         m.commands
             .insert("get_secret_status".into(), "K81qm".into());
 
-        let originals = m.sensitive_originals();
-        assert!(originals.contains(&"verify"));
-        assert!(originals.contains(&"get_secret_status"));
-        assert!(!originals.contains(&"crate::auth::verify"));
+        let symbols = m.symbol_originals();
+        assert!(symbols.contains(&"verify"));
+        assert!(!symbols.contains(&"crate::auth::verify"));
+
+        let protocol = m.protocol_originals();
+        assert!(protocol.contains(&"get_secret_status"));
+        assert!(
+            !protocol.contains(&"verify"),
+            "a symbol is not a protocol value"
+        );
     }
 
     #[test]
