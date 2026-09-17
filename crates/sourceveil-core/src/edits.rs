@@ -54,6 +54,75 @@ pub struct SourceRef<'a> {
     pub text: &'a str,
 }
 
+/// One file's share of a [`EditPlan::stage_transaction`] call.
+#[derive(Debug, Clone)]
+pub struct Contribution<'a> {
+    pub source: SourceRef<'a>,
+    pub indels: Vec<Indel>,
+}
+
+impl<'a> Contribution<'a> {
+    pub fn new(path: &'a Path, text: &'a str, indels: Vec<Indel>) -> Self {
+        Self {
+            source: SourceRef { path, text },
+            indels,
+        }
+    }
+}
+
+/// Why a transaction was refused.
+///
+/// Every variant means the same thing operationally — the plan is unchanged —
+/// but they point at different bugs, so they are kept apart.
+#[derive(Debug, Clone)]
+pub enum StagingError {
+    /// Two edits want the same bytes, either within the transaction or against
+    /// something already scheduled.
+    Conflict(Conflict),
+    /// Two passes described the same file's original text differently, so at
+    /// least one of them computed its offsets against source that is not what
+    /// is on disk.
+    SnapshotMismatch { file: PathBuf },
+}
+
+impl std::fmt::Display for StagingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StagingError::Conflict(c) => write!(f, "{c}"),
+            StagingError::SnapshotMismatch { file } => write!(
+                f,
+                "{}: two passes supplied different source text for the same file",
+                file.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StagingError {}
+
+#[derive(Debug)]
+struct GroupedEdits {
+    text: String,
+    indels: Vec<Indel>,
+}
+
+/// The first pair of edits in `indels` that overlap, as two `(start, end)`.
+///
+/// Sorted by start so the check is a walk rather than a quadratic scan; these
+/// sets are small but they are built per file per transaction.
+fn first_overlap(indels: &[Indel]) -> Option<((u32, u32), (u32, u32))> {
+    let mut sorted: Vec<&Indel> = indels.iter().collect();
+    sorted.sort_by_key(|i| i.delete.start());
+    sorted.windows(2).find_map(|pair| {
+        overlaps(pair[0], pair[1]).then(|| {
+            (
+                (existing_start(pair[0]), existing_end(pair[0])),
+                (existing_start(pair[1]), existing_end(pair[1])),
+            )
+        })
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct EditPlan {
     /// The contents each edited file had when its edits were computed. Kept so
@@ -142,6 +211,88 @@ impl EditPlan {
         Ok(count)
     }
 
+    /// Stage edits for many files at once, or stage none of them.
+    ///
+    /// [`EditPlan::stage`] is atomic per file, which is enough for a rename
+    /// that owns one symbol. A Tauri command is not like that: its name lives
+    /// in a Rust definition, in a `generate_handler!` token tree, in a frontend
+    /// `invoke("...")` call and possibly in a Rust allow-list, and those are
+    /// four different files. Committing three of the four would leave a project
+    /// that does not compile or, worse, one that compiles and dispatches the
+    /// wrong command.
+    ///
+    /// So the whole set is validated first and written second, and any problem
+    /// anywhere means the plan is untouched.
+    pub fn stage_transaction<'a>(
+        &mut self,
+        contributions: impl IntoIterator<Item = Contribution<'a>>,
+    ) -> std::result::Result<usize, StagingError> {
+        // Group by file first: two passes contributing to the same file is
+        // normal (the command pass and the rename pass both touch `lib.rs`),
+        // and the checks below are per file.
+        let mut grouped: BTreeMap<PathBuf, GroupedEdits> = BTreeMap::new();
+        for contribution in contributions {
+            let path = contribution.source.path.to_path_buf();
+            let entry = grouped.entry(path.clone()).or_insert_with(|| GroupedEdits {
+                text: contribution.source.text.to_string(),
+                indels: Vec::new(),
+            });
+            if entry.text != contribution.source.text {
+                return Err(StagingError::SnapshotMismatch { file: path });
+            }
+            entry.indels.extend(contribution.indels);
+        }
+
+        // ---- validate the whole transaction before recording any of it ----
+
+        for (path, group) in &grouped {
+            if group.indels.is_empty() {
+                continue;
+            }
+
+            // The snapshot this transaction works from must be the one the
+            // plan already holds for that file. Two different texts for the
+            // same path means one pass is working from a stale or wrong source,
+            // and every offset it computed is suspect.
+            if let Some(known) = self.sources.get(path) {
+                if known != &group.text {
+                    return Err(StagingError::SnapshotMismatch { file: path.clone() });
+                }
+            }
+
+            // Edits inside this transaction must not overlap each other. Two
+            // passes that both want the same span are not a merge problem to be
+            // resolved here; one of them is wrong.
+            if let Some((a, b)) = first_overlap(&group.indels) {
+                return Err(StagingError::Conflict(Conflict {
+                    file: path.clone(),
+                    existing: (a.0, a.1),
+                    incoming: (b.0, b.1),
+                }));
+            }
+
+            // Nor may they overlap anything already scheduled.
+            for indel in &group.indels {
+                if let Some(clash) = self.would_conflict(path, indel) {
+                    return Err(StagingError::Conflict(clash));
+                }
+            }
+        }
+
+        // ---- commit; nothing below can fail ----
+
+        let mut staged = 0;
+        for (path, group) in grouped {
+            if group.indels.is_empty() {
+                continue;
+            }
+            staged += group.indels.len();
+            self.sources.entry(path.clone()).or_insert(group.text);
+            self.edits.entry(path).or_default().extend(group.indels);
+        }
+        Ok(staged)
+    }
+
     /// Write every scheduled edit into the generated tree.
     pub fn apply(&self, input_root: &Path, output_root: &Path) -> Result<ApplyOutcome> {
         let mut outcome = ApplyOutcome::default();
@@ -190,6 +341,14 @@ impl EditPlan {
 }
 
 fn overlaps(a: &Indel, b: &Indel) -> bool {
+    let a_empty = a.delete.is_empty();
+    let b_empty = b.delete.is_empty();
+    // Two pure insertions at the same offset do not overlap by the range test
+    // — an empty range contains nothing — but the order they are applied in
+    // decides the result, and nothing here is entitled to pick that order.
+    if a_empty && b_empty {
+        return a.delete.start() == b.delete.start();
+    }
     a.delete.start() < b.delete.end() && b.delete.start() < a.delete.end()
 }
 
@@ -404,5 +563,226 @@ mod tests {
             std::fs::read_to_string(output.join("src/b.rs")).unwrap(),
             "fn two() {}"
         );
+    }
+
+    // -- transactions ------------------------------------------------------
+
+    /// Two files, one call, both written.
+    #[test]
+    fn a_transaction_spanning_files_commits_together() {
+        let mut plan = EditPlan::new();
+        let staged = plan
+            .stage_transaction([
+                Contribution::new(
+                    Path::new("src/a.rs"),
+                    "fn alpha() {}",
+                    vec![indel(3, 8, "one")],
+                ),
+                Contribution::new(
+                    Path::new("src/b.rs"),
+                    "invoke(\"beta\")",
+                    vec![indel(8, 12, "two")],
+                ),
+            ])
+            .expect("clean transaction");
+
+        assert_eq!(staged, 2);
+        assert_eq!(plan.edit_count(), 2);
+        assert_eq!(plan.edited_files().count(), 2);
+    }
+
+    /// Two edits inside one transaction that want the same bytes: nothing is
+    /// recorded, including the edits that were fine.
+    #[test]
+    fn overlap_inside_the_batch_rolls_the_whole_transaction_back() {
+        let mut plan = EditPlan::new();
+        let before = plan.edit_count();
+
+        let err = plan
+            .stage_transaction([
+                Contribution::new(
+                    Path::new("src/a.rs"),
+                    "fn alpha() {}",
+                    vec![indel(3, 8, "one")],
+                ),
+                // A different file, which is perfectly fine on its own.
+                Contribution::new(
+                    Path::new("src/b.rs"),
+                    "invoke(\"beta\")",
+                    vec![indel(8, 12, "two")],
+                ),
+                // And this one collides with the first.
+                Contribution::new(
+                    Path::new("src/a.rs"),
+                    "fn alpha() {}",
+                    vec![indel(6, 10, "clash")],
+                ),
+            ])
+            .expect_err("overlapping batch");
+
+        match err {
+            StagingError::Conflict(c) => {
+                assert_eq!(c.file, PathBuf::from("src/a.rs"));
+                assert_eq!(c.incoming, (6, 10), "the later edit is the incoming one");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert_eq!(
+            plan.edit_count(),
+            before,
+            "a failed transaction writes nothing"
+        );
+        assert_eq!(plan.edited_files().count(), 0);
+    }
+
+    /// A transaction that collides with something already scheduled is refused
+    /// whole, and the earlier edits survive untouched.
+    #[test]
+    fn existing_conflict_rolls_the_whole_transaction_back() {
+        let path = Path::new("src/a.rs");
+        let text = "fn alpha() { beta(); }";
+
+        let mut plan = EditPlan::new();
+        plan.stage(SourceRef { path, text }, [indel(13, 17, "one")])
+            .expect("first staging");
+        let before = plan.edit_count();
+
+        let err = plan
+            .stage_transaction([
+                Contribution::new(
+                    Path::new("src/b.rs"),
+                    "invoke(\"beta\")",
+                    vec![indel(8, 12, "two")],
+                ),
+                Contribution::new(path, text, vec![indel(15, 19, "clash")]),
+            ])
+            .expect_err("conflicts with existing");
+
+        assert!(matches!(err, StagingError::Conflict(_)), "{err:?}");
+        assert_eq!(plan.edit_count(), before);
+        assert_eq!(
+            plan.edited_files().count(),
+            1,
+            "the earlier edit, and only it, is still scheduled"
+        );
+    }
+
+    /// The same file described two different ways: one pass is working from a
+    /// snapshot that is not what the other saw.
+    #[test]
+    fn snapshot_mismatch_rolls_the_whole_transaction_back() {
+        let mut plan = EditPlan::new();
+        plan.stage(
+            SourceRef {
+                path: Path::new("src/a.rs"),
+                text: "fn alpha() {}",
+            },
+            [indel(3, 8, "one")],
+        )
+        .expect("first staging");
+        let before = plan.edit_count();
+
+        let err = plan
+            .stage_transaction([
+                Contribution::new(
+                    Path::new("src/b.rs"),
+                    "invoke(\"beta\")",
+                    vec![indel(8, 12, "two")],
+                ),
+                // Same path, different text.
+                Contribution::new(
+                    Path::new("src/a.rs"),
+                    "fn ALPHA() {}",
+                    vec![indel(3, 8, "two")],
+                ),
+            ])
+            .expect_err("snapshot mismatch");
+
+        match err {
+            StagingError::SnapshotMismatch { file } => {
+                assert_eq!(file, PathBuf::from("src/a.rs"));
+            }
+            other => panic!("expected a snapshot mismatch, got {other:?}"),
+        }
+        assert_eq!(plan.edit_count(), before);
+    }
+
+    /// Two passes may contribute to the same file, as long as they agree about
+    /// its text and their spans are disjoint. The command pass and the rename
+    /// pass both need this.
+    #[test]
+    fn contributions_to_one_file_merge_when_they_agree() {
+        let path = Path::new("src/lib.rs");
+        let text = "fn alpha() { invoke(\"beta\"); }";
+
+        let mut plan = EditPlan::new();
+        let staged = plan
+            .stage_transaction([
+                Contribution::new(path, text, vec![indel(3, 8, "one")]),
+                Contribution::new(path, text, vec![indel(20, 24, "two")]),
+            ])
+            .expect("disjoint contributions to one file");
+
+        assert_eq!(staged, 2);
+        assert_eq!(plan.edit_count(), 2);
+    }
+
+    /// A transaction may not describe one file two different ways even when it
+    /// is the only thing staging: that is a bug in the caller, not a merge.
+    #[test]
+    fn a_transaction_may_not_disagree_with_itself() {
+        let path = Path::new("src/lib.rs");
+        let mut plan = EditPlan::new();
+
+        let err = plan
+            .stage_transaction([
+                Contribution::new(path, "fn alpha() {}", vec![indel(3, 8, "one")]),
+                Contribution::new(path, "fn beta() {}", vec![indel(3, 7, "two")]),
+            ])
+            .expect_err("self-contradictory transaction");
+
+        assert!(
+            matches!(err, StagingError::SnapshotMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(plan.edit_count(), 0);
+    }
+
+    /// Insertions at one offset have no defined order, so they are a conflict
+    /// rather than a coin flip.
+    #[test]
+    fn two_insertions_at_one_offset_conflict() {
+        let mut plan = EditPlan::new();
+        let path = Path::new("src/lib.rs");
+
+        let err = plan
+            .stage_transaction([Contribution::new(
+                path,
+                "x",
+                vec![indel(0, 0, "a"), indel(0, 0, "b")],
+            )])
+            .expect_err("ambiguous ordering");
+
+        assert!(matches!(err, StagingError::Conflict(_)), "{err:?}");
+        assert_eq!(plan.edit_count(), 0);
+    }
+
+    /// An empty contribution is not a failure and does not record a file.
+    #[test]
+    fn empty_contributions_are_ignored() {
+        let mut plan = EditPlan::new();
+        let staged = plan
+            .stage_transaction([
+                Contribution::new(Path::new("src/a.rs"), "fn alpha() {}", vec![]),
+                Contribution::new(
+                    Path::new("src/b.rs"),
+                    "fn beta() {}",
+                    vec![indel(3, 7, "x")],
+                ),
+            ])
+            .expect("one real contribution");
+
+        assert_eq!(staged, 1);
+        assert_eq!(plan.edited_files().count(), 1);
     }
 }
