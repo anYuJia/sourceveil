@@ -1283,3 +1283,150 @@ fn the_event_mapping_is_reproducible_and_seeded() {
     let commands = |root: &Path| mapping(root)["commands"].clone();
     assert_eq!(commands(&first), commands(&second));
 }
+
+// ---------------------------------------------------------------------------
+// serde wire names
+// ---------------------------------------------------------------------------
+//
+// `sourceveil_core::serde::case` reimplements serde's `rename_all` rules,
+// because `serde_derive` is a proc-macro crate whose internals are not API. A
+// second reading of serde's source is not evidence that the port is right, so
+// the rules are checked against serde itself: the fixture in
+// `tests/fixtures/serde-wire` serialises one struct and one enum per rule, and
+// every key it actually produced is compared with the one SourceVeil computes.
+
+/// The keys of a JSON object, in the order they appear.
+fn object_keys_in_order(json: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = json;
+    while let Some(start) = rest.find('"') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('"') else { break };
+        let key = rest[..end].to_string();
+        rest = &rest[end + 1..];
+        if rest.trim_start().starts_with(':') {
+            out.push(key);
+        }
+    }
+    out
+}
+
+/// One `field`/`variant` case from the oracle's output.
+struct OracleCase {
+    kind: String,
+    rule: String,
+    wire_names: Vec<String>,
+}
+
+fn run_wire_oracle() -> Vec<OracleCase> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/serde-wire")
+        .canonicalize()
+        .expect("serde-wire fixture");
+
+    let output = Command::new("cargo")
+        .arg("run")
+        .arg("--quiet")
+        .current_dir(&root)
+        .output()
+        .expect("spawning cargo run");
+    assert!(
+        output.status.success(),
+        "the oracle fixture failed to run:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut cases: Vec<OracleCase> = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(rest) = line
+            .strip_prefix("field ")
+            .or_else(|| line.strip_prefix("variant "))
+        else {
+            continue;
+        };
+        let kind = if line.starts_with("field ") {
+            "field"
+        } else {
+            "variant"
+        };
+        let Some(json) = lines.next() else { break };
+        let json = json.trim();
+
+        // A field case prints an object; a variant case prints one string.
+        //
+        // The keys are read in order from the raw text rather than through
+        // `serde_json::Value`, whose object is a map and would hand them back
+        // sorted — which is not what serde wrote and not what a peer sees.
+        let wire_names = if kind == "field" {
+            object_keys_in_order(json)
+        } else {
+            serde_json::from_str::<Vec<String>>(json).expect("an array of wire names")
+        };
+
+        // `Rest WaitingForLogin` on a variant line is a value, not a rule.
+        let rule = rest.split(' ').next_back().unwrap_or_default().to_string();
+        cases.push(OracleCase {
+            kind: kind.to_string(),
+            rule,
+            wire_names,
+        });
+    }
+    cases
+}
+
+#[test]
+fn the_ported_rename_rules_match_serde_itself() {
+    use sourceveil_core::serde::case::RenameRule;
+
+    let cases = run_wire_oracle();
+    // One per rule per kind: eight `rename_all` spellings, on a field and on a
+    // variant. A variant case carries every variant of that enum.
+    assert_eq!(
+        cases.len(),
+        16,
+        "expected a case per rule per kind, got {}",
+        cases.len()
+    );
+
+    // The names the fixture declares, in declaration order.
+    const FIELDS: &[&str] = &["user_name", "http_port"];
+    const VARIANTS: &[&str] = &["WaitingForLogin", "HTTPServer", "Idle"];
+
+    let mut checked = 0;
+    for case in &cases {
+        let rule = RenameRule::parse(&case.rule)
+            .unwrap_or_else(|e| panic!("the oracle used a rule we do not know: {e}"));
+
+        let expected: Vec<String> = if case.kind == "field" {
+            FIELDS.iter().map(|f| rule.apply_to_field(f)).collect()
+        } else {
+            VARIANTS.iter().map(|v| rule.apply_to_variant(v)).collect()
+        };
+
+        assert_eq!(
+            case.wire_names, expected,
+            "{} under `{}`: serde produced {:?}, SourceVeil computes {:?}",
+            case.kind, case.rule, case.wire_names, expected
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, cases.len());
+
+    // And the trap this whole module exists for, stated as a test: on a field
+    // `lowercase` is the identity and on a variant it is not, so a single
+    // shared implementation would disagree with serde here.
+    assert_eq!(
+        RenameRule::parse("lowercase")
+            .unwrap()
+            .apply_to_field("user_name"),
+        "user_name"
+    );
+    assert_eq!(
+        RenameRule::parse("lowercase")
+            .unwrap()
+            .apply_to_variant("WaitingForLogin"),
+        "waitingforlogin"
+    );
+}

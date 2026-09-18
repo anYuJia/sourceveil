@@ -48,6 +48,7 @@ pub mod report;
 pub mod rng;
 pub mod scanner;
 pub mod seed;
+pub mod serde;
 pub mod tauri;
 pub mod verify;
 
