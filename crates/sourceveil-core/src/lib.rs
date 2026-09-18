@@ -36,6 +36,7 @@
 //! - [`mapping`] / [`report`] — run artifacts.
 //! - [`verify`] — the post-generation verification pipeline.
 
+pub mod binary_scan;
 pub mod config;
 pub mod copier;
 pub mod edits;
