@@ -408,6 +408,99 @@ fn refuses_to_write_into_a_populated_output_directory() {
 }
 
 // ---------------------------------------------------------------------------
+// runtime string protection
+// ---------------------------------------------------------------------------
+
+fn string_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/string-protection")
+        .canonicalize()
+        .expect("string fixture directory")
+}
+
+fn transform_strings(seed: &str) -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().expect("temp dir");
+    let out = tmp.path().join("generated");
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(&config, "version = 1\nprofile = \"balanced\"\n")
+        .expect("writing balanced config");
+
+    let result = Command::new(binary())
+        .arg("transform")
+        .arg("--input")
+        .arg(string_fixture())
+        .arg("--output")
+        .arg(&out)
+        .arg("--config")
+        .arg(&config)
+        .args(["--seed", seed])
+        .output()
+        .expect("spawning cargo-obfuscator");
+    assert_succeeded(&result);
+    (tmp, out)
+}
+
+#[test]
+fn balanced_protects_runtime_strings_without_changing_behaviour() {
+    let original = run_crate(&string_fixture());
+    let (_tmp, out) = transform_strings("20240917");
+
+    assert_eq!(
+        run_crate(&out),
+        original,
+        "runtime string protection changed program behaviour"
+    );
+
+    let source = all_source(&out);
+    for protected in ["license-check", "device-validation"] {
+        assert!(
+            !source.contains(&format!("\"{protected}\"")),
+            "protected plaintext {protected:?} remains as a Rust literal"
+        );
+        assert!(
+            mapping(&out)["strings"].get(protected).is_some(),
+            "{protected:?} is missing from mapping.strings"
+        );
+    }
+
+    // These are deliberately outside the safe runtime subset.
+    for kept in ["compile-time-protocol", "macro-protocol-name"] {
+        assert!(
+            source.contains(kept),
+            "{kept:?} lives in a compile-time/macro context and must be kept"
+        );
+        assert!(
+            mapping(&out)["strings"].get(kept).is_none(),
+            "a kept plaintext must not be advertised as protected"
+        );
+    }
+
+    let string_report = &report(&out)["strings"];
+    assert!(
+        string_report["values_protected"].as_u64().unwrap_or(0) >= 2,
+        "report did not count protected values: {string_report}"
+    );
+    assert!(
+        string_report["kept_unsafe_context"].as_u64().unwrap_or(0) >= 2,
+        "report did not expose compile-time/macro keeps: {string_report}"
+    );
+}
+
+#[test]
+fn string_protection_is_deterministic_per_seed() {
+    let (_a_tmp, a) = transform_strings("77");
+    let (_b_tmp, b) = transform_strings("77");
+    assert_eq!(source_tree(&a), source_tree(&b));
+
+    let (_c_tmp, c) = transform_strings("78");
+    assert_ne!(
+        read(&a, "src/main.rs"),
+        read(&c, "src/main.rs"),
+        "different release seeds should diversify encoded string bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // serde wire format
 // ---------------------------------------------------------------------------
 //
