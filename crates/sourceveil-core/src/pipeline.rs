@@ -112,11 +112,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     let mut command_stats = CommandStats::default();
     let mut event_stats = EventStats::default();
 
-    if !plan.rename.is_noop()
-        || plan.tauri.commands
-        || plan.tauri.events
-        || plan.strings.enabled
-    {
+    if !plan.rename.is_noop() || plan.tauri.commands || plan.tauri.events || plan.strings.enabled {
         let analysis_root = match plan.build.analyze {
             AnalyzeSource::Input => layout.rust_root.clone(),
             AnalyzeSource::Output => output_root.join(layout.rust_relative()),

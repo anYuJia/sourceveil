@@ -436,7 +436,11 @@ impl Report {
             let s = &self.strings;
             let _ = writeln!(w, "String values discovered:    {}", s.values_discovered);
             let _ = writeln!(w, "String values protected:     {}", s.values_protected);
-            let _ = writeln!(w, "String occurrences protected: {}", s.occurrences_protected);
+            let _ = writeln!(
+                w,
+                "String occurrences protected: {}",
+                s.occurrences_protected
+            );
             let _ = writeln!(w, "  kept unsafe context:        {}", s.kept_unsafe_context);
             let _ = writeln!(w, "  kept edit conflict:         {}", s.kept_conflict);
         }
