@@ -411,10 +411,9 @@ fn refuses_to_write_into_a_populated_output_directory() {
 // serde wire format
 // ---------------------------------------------------------------------------
 //
-// The rename pass must not change what the program writes to the network or to
-// disk. Compiling is not evidence of that — the two builds compile either way.
-// The only proof is to run the original and the transformed program and compare
-// their output, which is what these tests do.
+// Compiling is not evidence that a source transform preserved serde. These
+// tests execute both programs and compare the protocol bytes they actually
+// produce, including payloads deserialised under the old contract.
 
 fn serde_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -423,7 +422,6 @@ fn serde_fixture() -> PathBuf {
         .expect("serde fixture directory")
 }
 
-/// Run a crate in `root` and return its stdout.
 fn run_crate(root: &Path) -> String {
     let result = Command::new("cargo")
         .arg("run")
@@ -440,15 +438,12 @@ fn run_crate(root: &Path) -> String {
     String::from_utf8_lossy(&result.stdout).to_string()
 }
 
-/// The wire format of the untransformed fixture. Everything below is compared
-/// against this.
 static WIRE_FORMAT: OnceLock<String> = OnceLock::new();
 
 fn original_wire_format() -> &'static str {
     WIRE_FORMAT.get_or_init(|| run_crate(&serde_fixture()))
 }
 
-/// Transform the serde fixture, optionally under a named profile.
 fn transform_serde(profile: Option<&str>, seed: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("temp dir");
     let out = tmp.path().join("generated");
@@ -473,37 +468,13 @@ fn transform_serde(profile: Option<&str>, seed: &str) -> (TempDir, PathBuf) {
     (tmp, out)
 }
 
-/// Every name in the fixture that is a wire-format key.
-const SERDE_KEYS: &[&str] = &[
-    // plain model
-    "user_name",
-    "device_id",
-    "internal_scratch",
-    // rename_all = "camelCase"
-    "session_token",
-    "expires_at",
-    // externally tagged enum
-    "Connected",
-    "Disconnected",
-    "reason_code",
-    // internally tagged enum
-    "Started",
-    "Stopped",
-    "started_at",
-    // explicit per-field rename
-    "modern_name",
-    "legacy_name",
-];
-
-/// The one entry in [`SERDE_KEYS`] that is not an identifier.
-///
-/// `legacy_name` is the string *value* of `#[serde(rename = "legacy_name")]`.
-/// It is a wire key that has to survive, but it is never a rename candidate, so
-/// it can never appear among the `serde-model` skips.
-const SERDE_KEY_STRING_VALUES: &[&str] = &["legacy_name"];
-
-/// Names that are ordinary Rust identifiers and must keep moving.
-const NON_SERDE_FIELDS: &[&str] = &["scratch_buffer", "retry_count"];
+fn symbol_mapping_contains(root: &Path, leaf: &str) -> bool {
+    mapping(root)["symbols"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .any(|path| path.rsplit("::").next() == Some(leaf))
+}
 
 #[test]
 fn serde_wire_format_survives_the_default_profile() {
@@ -511,71 +482,93 @@ fn serde_wire_format_survives_the_default_profile() {
     assert_eq!(
         run_crate(&out),
         original_wire_format(),
-        "the generated program serialises differently from the original"
+        "the generated safe-profile program changed the serde protocol"
     );
+
+    // Safe owns serde members but deliberately leaves them alone.
+    for member in ["user_name", "Connected", "Started", "value_field"] {
+        assert!(
+            !symbol_mapping_contains(&out, member),
+            "safe unexpectedly renamed serde member {member}"
+        );
+    }
 }
 
 #[test]
-fn serde_wire_format_survives_the_balanced_profile() {
-    // `balanced` is the profile that actually turns field rename on, so this is
-    // the case where a missing serde rule would do real damage.
+fn balanced_renames_supported_serde_members_without_changing_wire_bytes() {
     let (_tmp, out) = transform_serde(Some("balanced"), "20240917");
 
     assert_eq!(
         run_crate(&out),
         original_wire_format(),
-        "the generated program serialises differently from the original"
+        "balanced changed serialize/deserialize behaviour"
     );
 
-    let model = read(&out, "src/model.rs");
-    for key in SERDE_KEYS {
+    for member in [
+        "user_name",
+        "device_id",
+        "session_token",
+        "Connected",
+        "Disconnected",
+        "reason_code",
+        "Started",
+        "Stopped",
+        "AdjacentEvent",
+        "value_field",
+        "modern_name",
+    ] {
+        if member == "AdjacentEvent" {
+            // The container type is handled by the ordinary symbol pass, not
+            // the serde member pass.
+            continue;
+        }
         assert!(
-            model.contains(key),
-            "`{key}` is a serde wire-format key but was renamed"
-        );
-    }
-    for field in NON_SERDE_FIELDS {
-        assert!(
-            !model.contains(field),
-            "`{field}` is not part of any serde model, so `balanced` should have renamed it"
+            symbol_mapping_contains(&out, member),
+            "balanced did not rename supported serde member {member}"
         );
     }
 
-    // And the report must say why the difference exists, not just that it does.
-    let identifier_keys = SERDE_KEYS.len() - SERDE_KEY_STRING_VALUES.len();
+    let model = read(&out, "src/model.rs");
+    for wire in [
+        "\"user_name\"",
+        "\"device_id\"",
+        "\"sessionToken\"",
+        "\"Connected\"",
+        "\"Disconnected\"",
+        "\"reason_code\"",
+        "\"Started\"",
+        "\"Stopped\"",
+        "\"outValue\"",
+        "\"in_value\"",
+        "\"current_name\"",
+        "\"old_name\"",
+        "\"userName\"",
+    ] {
+        assert!(
+            model.contains(wire),
+            "wire contract {wire} disappeared from transformed source"
+        );
+    }
+
     assert!(
-        skipped_count(&out, "serde-model") >= identifier_keys as u64,
-        "every wire-format identifier should be accounted for as a serde-model skip"
+        !symbol_mapping_contains(&out, "raw_value"),
+        "transparent serde representation must remain pinned"
+    );
+    assert!(
+        skipped_count(&out, "serde-unsupported") >= 1,
+        "unsupported serde semantics should be visible in the report"
     );
 }
 
-/// Serde members are pinned even under `safe`, where fields are off but enum
-/// variants are renamed by default — a variant name is a JSON key too.
 #[test]
-fn serde_enum_variants_are_pinned_under_the_safe_profile() {
-    let (_tmp, out) = transform_serde(None, "20240917");
-    let model = read(&out, "src/model.rs");
-    for variant in ["Connected", "Disconnected", "Started", "Stopped"] {
-        assert!(
-            model.contains(variant),
-            "variant `{variant}` is an externally-tagged key and was renamed"
-        );
-    }
-    assert!(
-        skipped_count(&out, "serde-model") >= 4,
-        "the four serde variants should be reported as serde-model skips"
-    );
-}
-
-/// The fixture is only meaningful if it still demonstrates obfuscation.
-#[test]
-fn serde_fixture_still_renames_its_non_serde_types() {
+fn serde_fixture_still_obfuscates_non_serde_fields() {
     let (_tmp, out) = transform_serde(Some("balanced"), "20240917");
-    let model = read(&out, "src/model.rs");
-    assert!(
-        !model.contains("RuntimeState"),
-        "a non-serde type must still be renamed, or this fixture proves nothing"
-    );
+    for field in ["scratch_buffer", "retry_count"] {
+        assert!(
+            symbol_mapping_contains(&out, field),
+            "ordinary Rust field {field} should still be renamed"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
