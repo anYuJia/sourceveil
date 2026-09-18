@@ -80,7 +80,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build obfuscator
-        run: cargo build --release --bin cargo-obfuscator
+        run: cargo build --release --locked --bin cargo-obfuscator
 
       - uses: actions/upload-artifact@v4
         with:

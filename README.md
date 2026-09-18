@@ -375,7 +375,7 @@ the tree is generated.
     npm ci --prefix frontend && npm run typecheck --prefix frontend
 
 - name: Build obfuscator
-  run: cargo build --release --manifest-path tools/obfuscator/Cargo.toml
+  run: cargo build --release --locked --bin cargo-obfuscator
 
 - name: Generate protected workspace
   env:
@@ -383,7 +383,7 @@ the tree is generated.
     # build, but no longer reproducible and no longer keyed to your secret.
     OBFUSCATION_SEED_KEY: ${{ secrets.OBFUSCATION_SEED_KEY }}
   run: |
-    ./tools/obfuscator/target/release/cargo-obfuscator transform \
+    ./target/release/cargo-obfuscator transform \
       --input . \
       --output .obfuscated \
       --config obfuscator.toml \
@@ -415,6 +415,22 @@ the tree is generated.
 If the project generates an integrity manifest or resource checksums, run that
 *after* the transform and *before* the Rust build. Generating it earlier means
 hashing sources that are about to change.
+
+### Building the CLI with GitHub Actions
+
+`.github/workflows/ci.yml` runs the full quality gate on Linux, macOS and
+Windows and uploads a Linux CLI artifact. `.github/workflows/release.yml`
+builds platform archives for all three systems when you push a `v*` tag, and
+publishes a GitHub Release automatically. It can also be started manually from
+the Actions tab; a manual run produces downloadable artifacts without creating
+a release.
+
+For example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## Runtime string protection
 
