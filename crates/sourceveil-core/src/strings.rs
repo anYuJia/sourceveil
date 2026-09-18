@@ -23,7 +23,7 @@ use crate::rust::rename::crate_for_file;
 use crate::scanner::CrateGraph;
 use anyhow::Result;
 use hmac::{Hmac, Mac};
-use ra_ap_syntax::ast::{self, AstToken};
+use ra_ap_syntax::ast::{self, AstNode, AstToken, HasAttrs};
 use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -51,7 +51,6 @@ struct Occurrence {
     source: String,
     start: u32,
     end: u32,
-    line: u32,
     safe: bool,
 }
 
@@ -91,7 +90,7 @@ pub fn run(
         let Some((parsed, source)) = analysis.parse(file_id) else {
             continue;
         };
-        if source.contains("#![no_std]") {
+        if has_no_std_attribute(&parsed) {
             if let Some(krate) = crate_for_file(req.graph, &path) {
                 no_std_crates.insert(krate.name.clone());
             }
@@ -131,11 +130,6 @@ pub fn run(
             let range = token.syntax().text_range();
             let start = u32::from(range.start());
             let end = u32::from(range.end());
-            let line = source[..usize::try_from(start).unwrap_or(0).min(source.len())]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count() as u32
-                + 1;
             let safe = !forbidden_context(token.syntax());
 
             by_value.entry(value).or_default().push(Occurrence {
@@ -143,7 +137,6 @@ pub fn run(
                 source: source.clone(),
                 start,
                 end,
-                line,
                 safe,
             });
         }
@@ -152,7 +145,7 @@ pub fn run(
     out.values_discovered = by_value.len();
     out.occurrences_discovered = by_value.values().map(Vec::len).sum();
 
-    for (value, occurrences) in by_value {
+    for (value, mut occurrences) in by_value {
         // One unsafe occurrence keeps this plaintext globally. Otherwise
         // mapping.strings would promise the leak scanner that it disappeared
         // when it did not.
@@ -166,18 +159,26 @@ pub fn run(
             continue;
         }
 
+        // rust-analyzer's file iteration order is an implementation detail.
+        // Sort before assigning ordinals so identical inputs produce the same
+        // per-occurrence identity on every host.
+        occurrences.sort_by(|left, right| {
+            left.file
+                .cmp(&right.file)
+                .then_with(|| left.start.cmp(&right.start))
+        });
+
         let mut contributions_by_file: BTreeMap<PathBuf, (String, Vec<ra_ap_ide::Indel>)> =
             BTreeMap::new();
+        let mut occurrence_ordinals: BTreeMap<String, u64> = BTreeMap::new();
 
         for occ in &occurrences {
-            let identity = format!(
-                "{}:{}:{}:{}",
-                occ.file.display(),
-                occ.line,
-                occ.start,
-                value
-            );
-            let stream_seed = derive_stream_seed(req.seed, &identity);
+            let file_identity = relative_file_identity(req.input_root, &occ.file);
+            let ordinal = occurrence_ordinals
+                .entry(file_identity.clone())
+                .or_default();
+            let stream_seed = derive_stream_seed(req.seed, &file_identity, &value, *ordinal);
+            *ordinal += 1;
             let encoded = encode(value.as_bytes(), stream_seed);
             let replacement = protected_expression(&encoded, stream_seed);
 
@@ -221,6 +222,21 @@ pub fn run(
     }
 
     Ok(out)
+}
+
+fn has_no_std_attribute(parsed: &ast::SourceFile) -> bool {
+    parsed
+        .attrs()
+        .filter(|attr| attr.kind().is_inner())
+        .flat_map(|attr| attr.skip_cfg_attrs().into_iter())
+        .any(|meta| meta.simple_name().is_some_and(|name| name == "no_std"))
+}
+
+fn relative_file_identity(root: &Path, file: &Path) -> String {
+    file.strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Which configured class owns this value.
@@ -272,16 +288,35 @@ fn forbidden_context(token: &ra_ap_syntax::SyntaxToken) -> bool {
 
         if matches!(
             kind.as_str(),
-            "ATTR" | "TOKEN_TREE" | "CONST" | "STATIC" | "ABI" | "EXTERN_CRATE"
+            "ATTR"
+                | "TOKEN_TREE"
+                | "CONST"
+                | "STATIC"
+                | "ABI"
+                | "EXTERN_CRATE"
+                | "CONST_ARG"
+                | "CONST_PARAM"
+                | "ARRAY_TYPE"
         ) || kind.ends_with("_PAT")
         {
             return true;
         }
 
+        if kind.starts_with("ASM_")
+            || kind.starts_with("FORMAT_ARGS_")
+            || kind == "INCLUDE_BYTES_EXPR"
+        {
+            return true;
+        }
+
+        if kind == "BLOCK_EXPR"
+            && ast::BlockExpr::cast(node.clone()).is_some_and(|block| block.const_token().is_some())
+        {
+            return true;
+        }
+
         if kind == "FN" {
-            let head = node.text().to_string();
-            let head = head.trim_start();
-            if head.starts_with("const fn") || head.starts_with("pub const fn") {
+            if ast::Fn::cast(node).is_some_and(|function| function.const_token().is_some()) {
                 return true;
             }
             // Once a normal runtime function owns the literal, outer item
@@ -294,11 +329,15 @@ fn forbidden_context(token: &ra_ap_syntax::SyntaxToken) -> bool {
     false
 }
 
-fn derive_stream_seed(build_seed: u64, identity: &str) -> u64 {
+fn derive_stream_seed(build_seed: u64, file_identity: &str, value: &str, ordinal: u64) -> u64 {
     let mut mac = Hmac::<Sha256>::new_from_slice(&build_seed.to_be_bytes())
         .expect("HMAC accepts every key length");
     mac.update(b"protected-string\0");
-    mac.update(identity.as_bytes());
+    mac.update(file_identity.as_bytes());
+    mac.update(b"\0");
+    mac.update(value.as_bytes());
+    mac.update(b"\0");
+    mac.update(&ordinal.to_be_bytes());
     let digest = mac.finalize().into_bytes();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
@@ -374,13 +413,132 @@ mod tests {
     #[test]
     fn string_seed_is_stable_and_identity_specific() {
         assert_eq!(
-            derive_stream_seed(7, "src/lib.rs:1:10:license-check"),
-            derive_stream_seed(7, "src/lib.rs:1:10:license-check")
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0)
         );
         assert_ne!(
-            derive_stream_seed(7, "src/lib.rs:1:10:license-check"),
-            derive_stream_seed(7, "src/lib.rs:2:10:license-check")
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/lib.rs", "license-check", 1)
         );
+        assert_ne!(
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/other.rs", "license-check", 0)
+        );
+        assert_ne!(
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/lib.rs", "other-value", 0)
+        );
+    }
+
+    #[test]
+    fn file_identity_is_relative_and_separator_stable() {
+        assert_eq!(
+            relative_file_identity(
+                Path::new("/checkout/one"),
+                Path::new("/checkout/one/src/lib.rs")
+            ),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            relative_file_identity(
+                Path::new("/checkout/two"),
+                Path::new("/checkout/two/src/lib.rs")
+            ),
+            "src/lib.rs"
+        );
+    }
+
+    fn forbidden_for(source: &str, value: &str) -> bool {
+        let file =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        file.syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::String::cast)
+            .find_map(|token| {
+                let literal = syn::parse_str::<syn::LitStr>(token.text()).ok()?;
+                (literal.value() == value).then(|| forbidden_context(token.syntax()))
+            })
+            .unwrap_or_else(|| panic!("string literal {value:?} not found in {source:?}"))
+    }
+
+    #[test]
+    fn compile_time_and_ambiguous_contexts_are_kept() {
+        let cases = [
+            (
+                "#![ no_std ]\nconst VALUE: &str = \"const-protocol\";",
+                "const-protocol",
+            ),
+            (
+                "#[cfg(feature = \"cfg-protocol\")] fn f() {}",
+                "cfg-protocol",
+            ),
+            (
+                "static VALUE: &str = \"static-protocol\";",
+                "static-protocol",
+            ),
+            (
+                "pub(crate) const fn f() -> &'static str { \"const-fn-protocol\" }",
+                "const-fn-protocol",
+            ),
+            (
+                "pub const unsafe fn f() -> &'static str { \"unsafe-const-fn\" }",
+                "unsafe-const-fn",
+            ),
+            (
+                "fn f() { let _ = match \"scrutinee\" { \"match-protocol\" => 1, _ => 0 }; }",
+                "match-protocol",
+            ),
+            (
+                "fn f() { let _: [u8; \"array-length-protocol\".len()] = []; }",
+                "array-length-protocol",
+            ),
+            (
+                "struct S<const N: usize>; type T = S<{ \"const-generic-protocol\".len() }>;",
+                "const-generic-protocol",
+            ),
+            (
+                "fn f() -> &'static str { const { \"inline-const-protocol\" } }",
+                "inline-const-protocol",
+            ),
+            (
+                "fn f() { format_args!(\"format-protocol\"); }",
+                "format-protocol",
+            ),
+            (
+                "fn f() { include_bytes!(\"include-protocol\"); }",
+                "include-protocol",
+            ),
+        ];
+        for (source, value) in cases {
+            assert!(
+                forbidden_for(source, value),
+                "context was treated as runtime: {source}"
+            );
+        }
+        assert!(!forbidden_for(
+            "fn f() -> &'static str { let value = \"runtime-protocol\"; value }",
+            "runtime-protocol"
+        ));
+    }
+
+    #[test]
+    fn no_std_detection_reads_inner_ast_attributes() {
+        for source in [
+            "#![no_std]\nfn f() {}",
+            "#![ no_std ]\nfn f() {}",
+            "#![cfg_attr(feature = \"std\", no_std)]\nfn f() {}",
+        ] {
+            let file =
+                ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+            assert!(has_no_std_attribute(&file), "missed no_std in {source:?}");
+        }
+        let file = ra_ap_syntax::SourceFile::parse(
+            "#[no_std]\nfn f() {}",
+            ra_ap_syntax::Edition::Edition2021,
+        )
+        .tree();
+        assert!(!has_no_std_attribute(&file));
     }
 
     #[test]
