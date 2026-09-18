@@ -418,6 +418,13 @@ fn string_fixture() -> PathBuf {
         .expect("string fixture directory")
 }
 
+fn no_std_string_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/no-std-string")
+        .canonicalize()
+        .expect("no_std string fixture directory")
+}
+
 fn transform_strings_from(input: &Path, seed: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("temp dir");
     let out = tmp.path().join("generated");
@@ -513,6 +520,34 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
         string_report["kept_unsafe_context"].as_u64().unwrap_or(0) >= 2,
         "report did not expose compile-time/macro keeps: {string_report}"
     );
+}
+
+#[test]
+fn no_std_crates_keep_runtime_string_literals() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("generated");
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(&config, "version = 1\nprofile = \"balanced\"\n").unwrap();
+    let result = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(no_std_string_fixture())
+        .args(["--output"])
+        .arg(&out)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--seed", "20240917", "--no-verify"])
+        .output()
+        .unwrap();
+    assert_succeeded(&result);
+
+    let source = read(&out, "src/lib.rs");
+    assert!(source.contains("\"no-std-protocol\""));
+    assert!(mapping(&out)["strings"].as_object().unwrap().is_empty());
+    assert!(report(&out)["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("no_std")));
 }
 
 #[test]
