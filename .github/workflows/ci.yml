@@ -31,6 +31,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Even with Tauri's mock runtime, tauri-runtime links its Linux GTK and
+      # WebKit types. The generated Tauri fixtures are cargo-checked during the
+      # e2e suite, so the Ubuntu runner needs the corresponding pkg-config
+      # metadata available.
+      - name: Install Linux fixture dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libwebkit2gtk-4.1-dev
+
       # rust-toolchain.toml pins the version: rust-analyzer's published crates
       # track the rustc release cycle, and the pinned one is what this code is
       # written against. Installing it explicitly means a failure here is
