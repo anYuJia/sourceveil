@@ -26,6 +26,7 @@ use crate::rust::analysis::{LoadOptions, RustAnalysis};
 use crate::rust::rename::{self, RenameRequest, Shared};
 use crate::scanner::ProjectLayout;
 use crate::seed::{self, SeedInfo};
+use crate::serde::rename::{self as serde_rename, SerdeRenameRequest};
 use crate::tauri::event::{self as tauri_event, EventRequest};
 use crate::tauri::{self, CommandRequest};
 use crate::verify::{self, VerifyContext};
@@ -137,7 +138,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
         // Tauri commands first: this pass consumes names and claims the
         // definition sites it renames, so the symbol pass must see them as
         // taken rather than rename them a second time.
-        let claimed = if plan.tauri.commands {
+        let mut claimed = if plan.tauri.commands {
             let request = CommandRequest {
                 input_root: &layout.root,
                 copied: &copy.copied,
@@ -177,6 +178,35 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             report.warnings.extend(outcome.warnings);
         }
 
+        let mut serde_stats = crate::report::RenameStats::default();
+        let mut serde_files = std::collections::BTreeSet::new();
+        if !plan.rename.is_noop() {
+            let request = SerdeRenameRequest {
+                input_root: &layout.root,
+                copied: &copy.copied,
+                plan: &plan,
+                graph: &layout.crates,
+                seed: seed.seed,
+            };
+            let outcome = serde_rename::run(
+                &analysis,
+                &request,
+                &mut names,
+                &mut edits,
+                &facts.macro_referenced,
+            )
+            .context("running the serde rename pass")?;
+
+            serde_stats = outcome.stats;
+            serde_files = outcome.files_edited;
+            claimed.extend(outcome.claimed);
+            mapping.symbols.extend(outcome.mapping.symbols);
+            for skipped in outcome.skipped {
+                report.skip(skipped);
+            }
+            report.warnings.extend(outcome.warnings);
+        }
+
         if !plan.rename.is_noop() {
             let request = RenameRequest {
                 input_root: &layout.root,
@@ -200,7 +230,14 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             .context("running the rename pass")?;
 
             report.files.rust_scanned = outcome.rust_files_scanned;
-            report.rename = outcome.stats;
+            let mut combined = outcome.stats;
+            combined.fields += serde_stats.fields;
+            combined.enums += serde_stats.enums;
+            combined.edits_applied += serde_stats.edits_applied;
+            let mut edited_files = outcome.files_edited.clone();
+            edited_files.extend(serde_files);
+            combined.files_edited = edited_files.len();
+            report.rename = combined;
             for skipped in outcome.skipped {
                 report.skip(skipped);
             }

@@ -9,3 +9,4 @@
 pub mod attrs;
 pub mod case;
 pub mod model;
+pub mod rename;
