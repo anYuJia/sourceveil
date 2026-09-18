@@ -7,6 +7,6 @@ export function call<T>(command: string, args?: Record<string, unknown>): Promis
   return invoke<T>(command, args);
 }
 
-export function ping(): Promise<string> {
-  return call<string>("ping");
+export function probeVaultHealth(): Promise<string> {
+  return call<string>("probe_vault_health");
 }

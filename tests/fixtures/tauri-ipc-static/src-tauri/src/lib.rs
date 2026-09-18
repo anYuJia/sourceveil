@@ -10,7 +10,7 @@ pub fn build() -> tauri::App<tauri::test::MockRuntime> {
             commands::get_user_info,
             commands::activate_license,
             commands::sync_state,
-            commands::ping,
+            commands::probe_vault_health,
         ])
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("failed to build a mock app")

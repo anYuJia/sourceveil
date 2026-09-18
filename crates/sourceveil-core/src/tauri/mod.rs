@@ -40,7 +40,7 @@ use crate::plan::Plan;
 use crate::rust::analysis::RustAnalysis;
 use crate::rust::candidates::attribute_names;
 use crate::rust::rename::{self, resolve_change_edits};
-use crate::scanner::CrateGraph;
+use crate::scanner::{is_root_like, CrateGraph};
 use anyhow::Result;
 use ra_ap_ide::FileId;
 use ra_ap_syntax::ast::{self, AstNode, HasName};
@@ -184,7 +184,7 @@ pub fn run(
 ) -> Result<CommandOutcome> {
     let mut out = CommandOutcome::default();
 
-    let files = workspace_files(analysis, req.graph);
+    let files = workspace_files(analysis, req.graph, req.plan);
     let mut commands = Vec::new();
     for file in &files {
         let (found, unresolved) = discover(analysis, file, req.input_root);
@@ -531,10 +531,19 @@ fn describe_dynamic_refs(ipc: &IpcAnalysis) -> String {
         .join("\n")
 }
 
-fn workspace_files(analysis: &RustAnalysis, graph: &CrateGraph) -> Vec<RustFile> {
+fn workspace_files(
+    analysis: &RustAnalysis,
+    graph: &CrateGraph,
+    plan: &crate::plan::Plan,
+) -> Vec<RustFile> {
     let mut out = Vec::new();
     for (file_id, path) in analysis.rust_files() {
-        if rename::crate_for_file(graph, &path).is_none() {
+        let Some(krate) = rename::crate_for_file(graph, &path) else {
+            continue;
+        };
+        if !is_root_like(graph, &krate.name)
+            && plan.dependencies.mode_for(&krate.name) != crate::config::DependencyMode::Obfuscate
+        {
             continue;
         }
         let Some((_, text)) = analysis.parse(file_id) else {

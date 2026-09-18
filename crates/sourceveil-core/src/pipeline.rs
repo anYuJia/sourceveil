@@ -17,6 +17,7 @@
 
 use crate::config::{AnalyzeSource, Config, VerifyStage};
 use crate::copier;
+use crate::dependencies::{self as dependency_wrappers, DependencyRequest};
 use crate::edits::EditPlan;
 use crate::frontend::rename as frontend_rename;
 use crate::mapping::Mapping;
@@ -114,11 +115,20 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     let mut event_stats = EventStats::default();
     let mut frontend_stats = crate::report::FrontendStats::default();
 
+    let dependency_wrappers_enabled = plan.dependencies.default
+        == crate::config::DependencyMode::Wrapper
+        || plan
+            .dependencies
+            .crates
+            .values()
+            .any(|mode| *mode == crate::config::DependencyMode::Wrapper);
+
     if !plan.rename.is_noop()
         || plan.tauri.commands
         || plan.tauri.events
         || plan.strings.enabled
         || plan.frontend.rename_private_identifiers
+        || dependency_wrappers_enabled
     {
         let analysis_root = match plan.build.analyze {
             AnalyzeSource::Input => layout.rust_root.clone(),
@@ -183,6 +193,30 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
 
             event_stats = EventStats::from_outcome(&outcome);
             mapping.events = outcome.mapping;
+            report.warnings.extend(outcome.warnings);
+        }
+
+        if plan
+            .dependencies
+            .crates
+            .values()
+            .any(|mode| *mode == crate::config::DependencyMode::Wrapper)
+            || plan.dependencies.default == crate::config::DependencyMode::Wrapper
+        {
+            let request = DependencyRequest {
+                input_root: &layout.root,
+                copied: &copy.copied,
+                graph: &layout.crates,
+                plan: &plan,
+            };
+            let outcome = dependency_wrappers::run(&analysis, &request, &mut names, &mut edits)
+                .context("running the dependency boundary wrapper pass")?;
+            report.dependencies = crate::report::DependencyStats {
+                wrappers_generated: outcome.wrappers_generated,
+                references_rewritten: outcome.references_rewritten,
+                files_edited: outcome.files_edited.len(),
+            };
+            mapping.dependency_wrappers.extend(outcome.mapping);
             report.warnings.extend(outcome.warnings);
         }
 
@@ -275,6 +309,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 copied: &copy.copied,
                 graph: &layout.crates,
                 plan: &plan.strings,
+                dependencies: &plan.dependencies,
                 seed: seed.seed,
                 reserved_protocol_values: &protocol_values,
             };

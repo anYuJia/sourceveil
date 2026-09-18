@@ -36,6 +36,6 @@ pub fn sync_state() -> u32 {
 use tauri::command;
 
 #[command]
-pub fn ping() -> &'static str {
+pub fn probe_vault_health() -> &'static str {
     "pong"
 }

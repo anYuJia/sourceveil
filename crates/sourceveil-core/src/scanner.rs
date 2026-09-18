@@ -33,8 +33,25 @@ pub struct ProjectLayout {
 /// The subset of `cargo metadata` the passes actually consume.
 #[derive(Debug, Clone, Default)]
 pub struct CrateGraph {
-    /// Every workspace member, by crate name.
+    /// Every local package cargo made available to the analysis, by crate
+    /// name. This includes path dependencies outside the workspace when cargo
+    /// reports them, because they are eligible for an explicit closed-world
+    /// dependency policy.
     pub workspace: BTreeMap<String, CrateInfo>,
+    /// Packages that are actual members of the discovered workspace. A local
+    /// path dependency can be present in `workspace` without being a member.
+    pub workspace_members: BTreeSet<String>,
+    /// Crates rooted at the manifest the user asked us to transform. A virtual
+    /// workspace has no package at that path, so the set can be empty.
+    pub root_crates: BTreeSet<String>,
+    /// Cargo dependency name(s) by local package name. The dependency name is
+    /// the identifier that appears in Rust source (`foo_bar`), while the
+    /// package name can legally contain hyphens (`foo-bar`).
+    pub dependency_aliases: BTreeMap<String, BTreeSet<String>>,
+    /// Manifest directories for dependency packages, including registry/git
+    /// crates loaded by rust-analyzer. Used to prove a wrapper path resolves to
+    /// the intended dependency rather than a same-named local module.
+    pub dependency_manifest_dirs: BTreeMap<String, PathBuf>,
     /// Workspace members that something outside the workspace depends on.
     /// Their public API is a contract and must not be renamed.
     pub boundary: BTreeSet<String>,
@@ -42,6 +59,88 @@ pub struct CrateGraph {
     pub workspace_root: Option<PathBuf>,
     /// Warnings worth surfacing in the run report.
     pub warnings: Vec<String>,
+}
+
+/// Path comparisons between Cargo metadata and rust-analyzer need to tolerate
+/// Windows' extended-length (`\\\\?\\`) prefix. Cargo may report a normal
+/// drive path while the VFS returns the extended spelling (or vice versa).
+pub(crate) fn path_starts_with(path: &Path, base: &Path) -> bool {
+    if path.starts_with(base) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let path = normalize_windows_path(path);
+        let base = normalize_windows_path(base);
+        path == base
+            || path
+                .strip_prefix(&base)
+                .is_some_and(|tail| tail.starts_with('\\'))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub(crate) fn path_eq(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        normalize_windows_path(left) == normalize_windows_path(right)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Return a relative path using the same Windows normalization as
+/// [`path_starts_with`]. This is used only as a fallback; the ordinary
+/// `Path::strip_prefix` result remains preferred on every platform.
+pub(crate) fn strip_prefix_path(path: &Path, base: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(base) {
+        return Some(relative.to_path_buf());
+    }
+    #[cfg(windows)]
+    {
+        let normalized_path = normalize_windows_path(path);
+        let normalized_base = normalize_windows_path(base);
+        normalized_path.strip_prefix(&normalized_base)?;
+        // Preserve the original casing in the relative path: `copied` comes
+        // from the filesystem and its `PathBuf` keys remain case-sensitive in
+        // Rust even though Windows lookup is not.
+        let component_count = base.components().count();
+        Some(path.components().skip(component_count).collect())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn normalize_windows_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('/', "\\");
+    raw.strip_prefix(r"\\?\")
+        .unwrap_or(&raw)
+        .to_ascii_lowercase()
+}
+
+/// Whether a crate belongs to the requested closed-world transform. Graphs
+/// produced by cargo metadata carry either the explicit root set or workspace
+/// members; hand-built/unit-test graphs may carry neither, in which case every
+/// listed crate is treated as local for backwards-compatible decision tests.
+pub fn is_root_like(graph: &CrateGraph, name: &str) -> bool {
+    if !graph.workspace_members.is_empty() {
+        return graph.workspace_members.contains(name);
+    }
+    if !graph.root_crates.is_empty() {
+        return graph.root_crates.contains(name);
+    }
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -206,7 +305,14 @@ pub fn load_crate_graph(manifest: &Path) -> Result<CrateGraph> {
             )
         })?;
 
-    fold_metadata(&metadata)
+    let mut graph = fold_metadata(&metadata)?;
+    let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
+    for krate in graph.workspace.values() {
+        if path_eq(&krate.manifest_dir, manifest_dir) {
+            graph.root_crates.insert(krate.name.clone());
+        }
+    }
+    Ok(graph)
 }
 
 fn fold_metadata(metadata: &Metadata) -> Result<CrateGraph> {
@@ -217,16 +323,34 @@ fn fold_metadata(metadata: &Metadata) -> Result<CrateGraph> {
     };
 
     let members: BTreeSet<&PackageId> = metadata.workspace_members.iter().collect();
+    let member_names: BTreeMap<&PackageId, String> = metadata
+        .packages
+        .iter()
+        .filter(|p| members.contains(&p.id))
+        .map(|p| (&p.id, p.name.to_string()))
+        .collect();
 
     for package in &metadata.packages {
-        if !members.contains(&package.id) {
-            continue;
-        }
         let manifest_dir = package
             .manifest_path
             .parent()
             .map(|p| p.as_std_path().to_path_buf())
             .unwrap_or_default();
+        let name = package.name.to_string();
+        // Keep manifest paths even for registry/git dependencies. Their source
+        // is never copied or edited, but a wrapper policy still needs to prove
+        // that rust-analyzer resolved a crate-root reference to this package.
+        graph
+            .dependency_manifest_dirs
+            .insert(name.clone(), manifest_dir.clone());
+
+        // Registry/git dependencies are analyzed by rust-analyzer but are
+        // never part of the copied source tree. Local path dependencies are
+        // retained so an explicit dependency policy can reason about them;
+        // resolve_edit_target still prevents edits outside the copied root.
+        if package.source.is_some() && !members.contains(&package.id) {
+            continue;
+        }
 
         let mut crate_types = BTreeSet::new();
         for ct in package.targets.iter().flat_map(|t| t.crate_types.iter()) {
@@ -244,11 +368,10 @@ fn fold_metadata(metadata: &Metadata) -> Result<CrateGraph> {
             )
         });
 
-        let name = package.name.to_string();
         graph.workspace.insert(
             name.clone(),
             CrateInfo {
-                name,
+                name: name.clone(),
                 src_dir: package
                     .targets
                     .iter()
@@ -261,25 +384,38 @@ fn fold_metadata(metadata: &Metadata) -> Result<CrateGraph> {
                 is_library,
             },
         );
+        if members.contains(&package.id) {
+            graph.workspace_members.insert(name);
+        }
     }
 
     // Which workspace crates are reachable from outside the workspace?
     if let Some(resolve) = &metadata.resolve {
-        let member_names: BTreeMap<&PackageId, String> = metadata
-            .packages
-            .iter()
-            .filter(|p| members.contains(&p.id))
-            .map(|p| (&p.id, p.name.to_string()))
-            .collect();
-
         for node in &resolve.nodes {
-            if member_names.contains_key(&node.id) {
-                continue;
-            }
-            for dep in &node.deps {
-                if let Some(name) = member_names.get(&dep.pkg) {
-                    graph.boundary.insert(name.clone());
+            // A member is an API boundary only when a package outside the
+            // discovered workspace depends on it. Workspace-internal edges
+            // remain inside the closed world and must not pin public items.
+            if !member_names.contains_key(&node.id) {
+                for dep in &node.deps {
+                    if let Some(name) = member_names.get(&dep.pkg) {
+                        graph.boundary.insert(name.clone());
+                    }
                 }
+            }
+
+            // Keep aliases for every local package, including path
+            // dependencies outside the workspace. These are used by the
+            // explicit wrapper policy to rewrite only semantically resolved
+            // crate-root paths.
+            for dep in &node.deps {
+                let Some(package) = metadata.packages.iter().find(|p| p.id == dep.pkg) else {
+                    continue;
+                };
+                graph
+                    .dependency_aliases
+                    .entry(package.name.to_string())
+                    .or_default()
+                    .insert(dep.name.clone());
             }
         }
     } else {
