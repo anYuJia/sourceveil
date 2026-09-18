@@ -599,11 +599,11 @@ fn materialize_wire_name(
         .map(|i| i + 1)
         .unwrap_or(0);
     let before_member = &source[line_start..member_start];
-    let indent = before_member
-        .chars()
-        .all(|c| c == ' ' || c == '\t')
-        .then_some(before_member)
-        .unwrap_or("");
+    let indent = if before_member.chars().all(|c| c == ' ' || c == '\t') {
+        before_member
+    } else {
+        ""
+    };
     let prefix = &source[member_start..name_start];
 
     let attr = serde_rename_attribute(wire);
