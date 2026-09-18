@@ -42,11 +42,10 @@ pub fn scan_file(path: &Path, mapping: &Mapping) -> Result<BinaryScanReport> {
         ..Default::default()
     };
 
-    for value in mapping
-        .protocol_originals()
-        .into_iter()
-        .filter(|value| value.len() >= 3)
-    {
+    // Protocol values are exact cross-language contracts, so even a one- or
+    // two-byte original is fatal evidence. The short-name noise policy below
+    // applies only to ordinary Rust symbols.
+    for value in mapping.protocol_originals() {
         collect_hits(&bytes, value, &mut report.protocol_leaks);
     }
 
@@ -87,7 +86,7 @@ fn collect_hits(bytes: &[u8], value: &str, out: &mut Vec<BinaryLeak>) {
     // Windows-facing strings are often widened before crossing Win32/COM
     // boundaries. Looking for UTF-16LE costs little and catches those too.
     let utf16le: Vec<u8> = value.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    if utf16le.len() >= 6 {
+    if !utf16le.is_empty() {
         for offset in find_all(bytes, &utf16le) {
             out.push(BinaryLeak {
                 value: value.to_string(),
@@ -160,6 +159,30 @@ mod tests {
             .protocol_leaks
             .iter()
             .any(|hit| hit.value == "session-updated" && hit.encoding == "utf-16le"));
+    }
+
+    #[test]
+    fn short_protocol_values_are_not_silently_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("app.bin");
+        let mut bytes = b"go".to_vec();
+        bytes.push(0xff);
+        bytes.extend("go".encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut mapping = mapping();
+        mapping.commands.insert("go".into(), "R7x2p".into());
+        let report = scan_file(&path, &mapping).unwrap();
+
+        assert!(!report.passed());
+        assert!(report
+            .protocol_leaks
+            .iter()
+            .any(|hit| hit.value == "go" && hit.encoding == "utf-8"));
+        assert!(report
+            .protocol_leaks
+            .iter()
+            .any(|hit| hit.value == "go" && hit.encoding == "utf-16le"));
     }
 
     #[test]
