@@ -309,7 +309,10 @@ fn run_scan_binary(args: ScanBinaryArgs) -> Result<()> {
                 leak.encoding, leak.offset, leak.value
             );
         }
-        println!("symbol text hits: {} (informational)", report.symbol_hits.len());
+        println!(
+            "symbol text hits: {} (informational)",
+            report.symbol_hits.len()
+        );
         for hit in report.symbol_hits.iter().take(12) {
             println!(
                 "  note {:<10} @ 0x{:x}  {:?}",

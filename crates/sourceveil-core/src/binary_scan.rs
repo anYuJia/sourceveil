@@ -58,11 +58,15 @@ pub fn scan_file(path: &Path, mapping: &Mapping) -> Result<BinaryScanReport> {
         collect_hits(&bytes, value, &mut report.symbol_hits);
     }
 
-    report.protocol_leaks.sort_by_key(|hit| (hit.offset, hit.value.clone()));
-    report.protocol_leaks.dedup_by(|a, b| {
-        a.offset == b.offset && a.value == b.value && a.encoding == b.encoding
-    });
-    report.symbol_hits.sort_by_key(|hit| (hit.offset, hit.value.clone()));
+    report
+        .protocol_leaks
+        .sort_by_key(|hit| (hit.offset, hit.value.clone()));
+    report
+        .protocol_leaks
+        .dedup_by(|a, b| a.offset == b.offset && a.value == b.value && a.encoding == b.encoding);
+    report
+        .symbol_hits
+        .sort_by_key(|hit| (hit.offset, hit.value.clone()));
     report
         .symbol_hits
         .dedup_by(|a, b| a.offset == b.offset && a.value == b.value && a.encoding == b.encoding);
@@ -120,8 +124,12 @@ mod tests {
 
     fn mapping() -> Mapping {
         let mut mapping = Mapping::new(1);
-        mapping.commands.insert("get_private_status".into(), "Q7Kp2".into());
-        mapping.events.insert("session-updated".into(), "X9mA1".into());
+        mapping
+            .commands
+            .insert("get_private_status".into(), "Q7Kp2".into());
+        mapping
+            .events
+            .insert("session-updated".into(), "X9mA1".into());
         mapping.record_symbol("crate::auth::verify_license", "m7q2x");
         mapping
     }
