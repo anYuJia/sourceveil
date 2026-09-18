@@ -17,7 +17,25 @@ fn macro_owned() {
     println!("{}", "mixed-protocol");
 }
 
+fn benchmark() {
+    let first_start = std::time::Instant::now();
+    std::hint::black_box(internal_state());
+    let first_ns = first_start.elapsed().as_nanos();
+
+    let repeat_start = std::time::Instant::now();
+    for _ in 0..100_000 {
+        std::hint::black_box(internal_state());
+    }
+    let repeat_total_ns = repeat_start.elapsed().as_nanos();
+    println!("first_ns={first_ns} repeat_total_ns={repeat_total_ns}");
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg.len() == 7 && arg.starts_with('-')) {
+        benchmark();
+        return;
+    }
+
     let state = internal_state();
     let (a, b) = repeated_values();
     let mixed = mixed_runtime();
