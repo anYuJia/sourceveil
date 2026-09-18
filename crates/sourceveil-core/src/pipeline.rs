@@ -18,6 +18,7 @@
 use crate::config::{AnalyzeSource, Config, VerifyStage};
 use crate::copier;
 use crate::edits::EditPlan;
+use crate::frontend::rename as frontend_rename;
 use crate::mapping::Mapping;
 use crate::names::NameDeriver;
 use crate::plan::Plan;
@@ -111,8 +112,14 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     let mut mapping = Mapping::new(seed.seed);
     let mut command_stats = CommandStats::default();
     let mut event_stats = EventStats::default();
+    let mut frontend_stats = crate::report::FrontendStats::default();
 
-    if !plan.rename.is_noop() || plan.tauri.commands || plan.tauri.events || plan.strings.enabled {
+    if !plan.rename.is_noop()
+        || plan.tauri.commands
+        || plan.tauri.events
+        || plan.strings.enabled
+        || plan.frontend.rename_private_identifiers
+    {
         let analysis_root = match plan.build.analyze {
             AnalyzeSource::Input => layout.rust_root.clone(),
             AnalyzeSource::Output => output_root.join(layout.rust_relative()),
@@ -286,6 +293,28 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             report.warnings.extend(outcome.warnings);
         }
 
+        if plan.frontend.rename_private_identifiers {
+            if let Some(source_root) = layout.frontend_source.as_deref() {
+                let request = frontend_rename::RenameRequest {
+                    input_root: &layout.root,
+                    source_root,
+                    copied: &copy.copied,
+                };
+                let outcome = frontend_rename::run(&request, &mut names, &mut edits)
+                    .context("running the frontend semantic rename pass")?;
+
+                frontend_stats = outcome.stats;
+                mapping
+                    .frontend_symbols
+                    .extend(outcome.mapping.frontend_symbols);
+                report.warnings.extend(outcome.warnings);
+            } else if plan.frontend.enabled {
+                report.warnings.push(
+                    "frontend rename requested but no frontend source directory was found".into(),
+                );
+            }
+        }
+
         // Every pass has contributed; nothing has been written yet. This is the
         // only place the output tree is modified.
         let applied = edits
@@ -300,6 +329,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
 
     report.commands = command_stats;
     report.events = event_stats;
+    report.frontend = frontend_stats;
 
     // --- 3. mapping ------------------------------------------------------
     let mut mapping_path = None;

@@ -283,6 +283,21 @@ pub struct StringStats {
     pub kept_conflict: usize,
 }
 
+/// What the OXC frontend semantic pass found and changed.
+///
+/// This is deliberately separate from [`RenameStats`]: a TypeScript binding is
+/// not a Rust symbol and must not be mixed into Rust kind counts or the Rust
+/// leak-scan namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FrontendStats {
+    pub files_scanned: usize,
+    pub symbols_discovered: usize,
+    pub symbols_renamed: usize,
+    pub files_edited: usize,
+    pub edits_applied: usize,
+    pub kept_by_reason: BTreeMap<String, usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub report_version: u32,
@@ -293,6 +308,8 @@ pub struct Report {
     pub commands: CommandStats,
     pub events: EventStats,
     pub strings: StringStats,
+    #[serde(default)]
+    pub frontend: FrontendStats,
     /// Count of skipped symbols grouped by reason.
     pub skipped_by_reason: BTreeMap<String, usize>,
     pub skipped: Vec<SkippedSymbol>,
@@ -311,6 +328,7 @@ impl Report {
             commands: CommandStats::default(),
             events: EventStats::default(),
             strings: StringStats::default(),
+            frontend: FrontendStats::default(),
             skipped_by_reason: BTreeMap::new(),
             skipped: Vec::new(),
             verification: Vec::new(),
@@ -443,6 +461,19 @@ impl Report {
             );
             let _ = writeln!(w, "  kept unsafe context:        {}", s.kept_unsafe_context);
             let _ = writeln!(w, "  kept edit conflict:         {}", s.kept_conflict);
+        }
+
+        if self.frontend.symbols_discovered > 0 {
+            let _ = writeln!(w);
+            let f = &self.frontend;
+            let _ = writeln!(w, "Frontend files scanned:      {}", f.files_scanned);
+            let _ = writeln!(w, "Frontend symbols discovered: {}", f.symbols_discovered);
+            let _ = writeln!(w, "Frontend symbols renamed:    {}", f.symbols_renamed);
+            let _ = writeln!(w, "Frontend files edited:       {}", f.files_edited);
+            let _ = writeln!(w, "Frontend text edits applied: {}", f.edits_applied);
+            for (reason, count) in &f.kept_by_reason {
+                let _ = writeln!(w, "  {reason:<28} {count}");
+            }
         }
 
         if !self.verification.is_empty() {

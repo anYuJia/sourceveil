@@ -53,6 +53,9 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedDomain {
     RustSymbol,
+    /// A private JavaScript/TypeScript lexical binding. Kept separate from
+    /// Rust symbols so adding a frontend does not consume their namespace.
+    FrontendSymbol,
     TauriCommand,
     TauriEvent,
 }
@@ -61,6 +64,7 @@ impl SeedDomain {
     fn as_str(self) -> &'static str {
         match self {
             SeedDomain::RustSymbol => "symbol",
+            SeedDomain::FrontendSymbol => "frontend-symbol",
             SeedDomain::TauriCommand => "command",
             SeedDomain::TauriEvent => "event",
         }

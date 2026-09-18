@@ -151,7 +151,10 @@ pub struct Tauri {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frontend {
+    /// Enable the frontend semantic pass. It is conservative by construction:
+    /// member properties, object keys, imports and exports stay untouched.
     pub enabled: Option<bool>,
+    /// Rename private lexical bindings proven local by OXC's semantic model.
     pub rename_private_identifiers: Option<bool>,
     /// Off by design. Property names cross the JSON / React-prop / store
     /// boundary and cannot be proven safe from the frontend alone.

@@ -254,9 +254,12 @@ impl Plan {
 
         // -- frontend -------------------------------------------------------
         let f = &cfg.frontend;
+        let frontend_enabled = f.enabled.unwrap_or(false);
         let frontend = FrontendPlan {
-            enabled: f.enabled.unwrap_or(false),
-            rename_private_identifiers: f.rename_private_identifiers.unwrap_or(balanced),
+            enabled: frontend_enabled,
+            rename_private_identifiers: f
+                .rename_private_identifiers
+                .unwrap_or(balanced || frontend_enabled),
             property_mangling: f.property_mangling.unwrap_or(false),
         };
         if frontend.property_mangling {
@@ -265,11 +268,6 @@ impl Plan {
                  JSON / React-prop / store boundary and cannot be proven safe from the frontend \
                  alone; this build ignores the setting"
                     .to_string(),
-            );
-        }
-        if frontend.enabled || frontend.rename_private_identifiers {
-            unsupported.push(
-                "frontend.*: TypeScript analyzer pass is not implemented in this build".to_string(),
             );
         }
 
@@ -379,6 +377,15 @@ mod tests {
         let p = plan("profile = \"balanced\"");
         assert!(p.rename.fields);
         assert!(p.strings.internal);
+        assert!(p.frontend.rename_private_identifiers);
+    }
+
+    #[test]
+    fn frontend_enable_turns_on_private_binding_rename_without_a_warning() {
+        let p = plan("[frontend]\nenabled = true\n");
+        assert!(p.frontend.enabled);
+        assert!(p.frontend.rename_private_identifiers);
+        assert!(!p.unsupported.iter().any(|u| u.contains("frontend.*")));
     }
 
     #[test]

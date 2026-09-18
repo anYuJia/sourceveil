@@ -20,6 +20,7 @@
 
 pub mod commands;
 pub mod events;
+pub mod rename;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Program;

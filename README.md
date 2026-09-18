@@ -45,7 +45,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 | Tauri event rename (Rust + TypeScript) | done |
 | serde-safe field / enum-variant rename | implemented for the supported subset; unsupported serde representations are kept |
 | runtime Rust string protection | done for safe runtime expressions; compile-time/macro contexts are kept |
-| TypeScript analyzer | not implemented |
+| TypeScript semantic private-binding rename | done — OXC scope-aware; properties/JSON keys/imports/exports are kept |
 | module file rename | not implemented |
 | dependency wrappers | not implemented |
 | final binary leak scanner | done — raw UTF-8/UTF-16LE scan for original protocol values |
@@ -62,6 +62,9 @@ where their absence would break something, the affected symbols are pinned:
 - Module *identifiers* are renamed; module *files* are not, because
   rust-analyzer implements module rename as a file move and that is a separate
   pass with its own verification.
+- Frontend binding renames use OXC's semantic graph. Private functions, classes,
+  parameters and module-local constants may move; member properties, object
+  shorthand, imports/exports and dynamic `eval`/`with` scopes are kept.
 
 ### Serde-safe member renaming
 
