@@ -516,6 +516,7 @@ fn balanced_renames_supported_serde_members_without_changing_wire_bytes() {
         "AdjacentEvent",
         "value_field",
         "modern_name",
+        "r#type",
     ] {
         if member == "AdjacentEvent" {
             // The container type is handled by the ordinary symbol pass, not
@@ -543,6 +544,7 @@ fn balanced_renames_supported_serde_members_without_changing_wire_bytes() {
         "\"current_name\"",
         "\"old_name\"",
         "\"userName\"",
+        "\"type\"",
     ] {
         assert!(
             model.contains(wire),

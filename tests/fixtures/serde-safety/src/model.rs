@@ -59,6 +59,11 @@ pub struct LegacyRecord {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct RawIdentifierRecord {
+    pub r#type: String,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TransparentRecord {
     pub raw_value: String,

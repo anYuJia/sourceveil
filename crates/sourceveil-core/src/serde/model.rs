@@ -101,6 +101,10 @@ pub fn wire_names(
     member: &SerdeAttrs,
     rules: &RenameAllRules,
 ) -> WireNames {
+    // `r#` is source syntax for spelling a Rust keyword as an identifier; it
+    // is not part of the identifier serde places on the wire. In particular,
+    // `r#type` serializes as `"type"`, and rename rules apply to `type`.
+    let rust_name = rust_name.strip_prefix("r#").unwrap_or(rust_name);
     WireNames {
         serialize: one_direction(
             rust_name,
@@ -182,6 +186,18 @@ mod tests {
         assert_eq!(w.serialize, "user_name");
         assert_eq!(w.deserialize, "user_name");
         assert!(w.are_the_same());
+    }
+
+    #[test]
+    fn a_raw_identifier_uses_its_logical_name() {
+        let w = wire_names(
+            "r#type",
+            MemberKind::Field,
+            &SerdeAttrs::default(),
+            &no_rules(),
+        );
+        assert_eq!(w.serialize, "type");
+        assert_eq!(w.deserialize, "type");
     }
 
     #[test]

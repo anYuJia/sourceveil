@@ -9,7 +9,7 @@ mod model;
 
 use model::{
     AdjacentEvent, AppEvent, ConnectionState, DirectionalRecord, FieldRuleEvent, LegacyRecord,
-    RuntimeState, SessionRecord, TransparentRecord, UserAccount,
+    RawIdentifierRecord, RuntimeState, SessionRecord, TransparentRecord, UserAccount,
 };
 
 fn main() {
@@ -81,6 +81,13 @@ fn main() {
     let alias_in = r#"{"old_name":"legacy"}"#;
     let alias: LegacyRecord = serde_json::from_str(alias_in).unwrap();
     lines.push(serde_json::to_string(&alias).unwrap());
+
+    // `r#` escapes a Rust keyword but is not part of serde's wire name.
+    let raw_in = r#"{"type":"protocol-kind"}"#;
+    let raw: RawIdentifierRecord = serde_json::from_str(raw_in).unwrap();
+    let raw_value = raw.r#type.clone();
+    lines.push(serde_json::to_string(&raw).unwrap());
+    lines.push(raw_value);
 
     // Unsupported representation: this field must be claimed and kept.
     let transparent = TransparentRecord {
