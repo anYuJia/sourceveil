@@ -17,9 +17,10 @@
 use std::fmt;
 
 /// A `rename_all` rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenameRule {
     /// No rule, or one that leaves the name alone.
+    #[default]
     None,
     LowerCase,
     UpperCase,

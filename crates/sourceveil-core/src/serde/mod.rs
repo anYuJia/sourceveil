@@ -8,3 +8,4 @@
 
 pub mod attrs;
 pub mod case;
+pub mod model;
