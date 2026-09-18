@@ -271,9 +271,10 @@ fn common_skip(
         return Some((SkipReason::KeepRule, None));
     }
     if candidate.attributes.iter().any(|a| {
-        // serde is owned by this pass; every other intrinsic/user keep
-        // attribute retains its ordinary meaning.
-        a != "serde" && (intrinsic.contains(a.as_str()) || keep_attrs.contains(a.as_str()))
+        // serde is owned by this pass, but an explicit user keep rule still
+        // wins. Only the built-in protocol pin is bypassed here.
+        keep_attrs.contains(a.as_str())
+            || (a != "serde" && intrinsic.contains(a.as_str()))
     }) {
         return Some((SkipReason::IntrinsicAttribute, None));
     }
