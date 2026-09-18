@@ -14,6 +14,7 @@
 //!
 //! So: collect against one snapshot, apply once, in one direction per file.
 
+use crate::scanner::strip_prefix_path;
 use anyhow::{Context, Result};
 use ra_ap_ide::{Indel, TextSize};
 use std::collections::BTreeMap;
@@ -431,7 +432,7 @@ impl EditPlan {
         // expected to be fresh, but checking the complete transaction first
         // prevents a late collision from leaving only part of a plan applied.
         for create in &self.creates {
-            let rel = create.path.strip_prefix(input_root).with_context(|| {
+            let rel = strip_prefix_path(&create.path, input_root).with_context(|| {
                 format!("{} is not under the input root", create.path.display())
             })?;
             let target = output_root.join(rel);
@@ -443,12 +444,11 @@ impl EditPlan {
             }
         }
         for file_move in &self.moves {
-            let source_rel = file_move.source.strip_prefix(input_root).with_context(|| {
-                format!("{} is not under the input root", file_move.source.display())
-            })?;
-            let destination_rel = file_move
-                .destination
-                .strip_prefix(input_root)
+            let source_rel =
+                strip_prefix_path(&file_move.source, input_root).with_context(|| {
+                    format!("{} is not under the input root", file_move.source.display())
+                })?;
+            let destination_rel = strip_prefix_path(&file_move.destination, input_root)
                 .with_context(|| {
                     format!(
                         "{} is not under the input root",
@@ -476,8 +476,7 @@ impl EditPlan {
             if indels.is_empty() {
                 continue;
             }
-            let rel = abs_path
-                .strip_prefix(input_root)
+            let rel = strip_prefix_path(abs_path, input_root)
                 .with_context(|| format!("{} is not under the input root", abs_path.display()))?;
             let target = output_root.join(rel);
 
@@ -523,7 +522,7 @@ impl EditPlan {
         // failed rewrite from leaving a wrapper or other synthetic file behind
         // in an otherwise unusable output tree.
         for create in &self.creates {
-            let rel = create.path.strip_prefix(input_root).with_context(|| {
+            let rel = strip_prefix_path(&create.path, input_root).with_context(|| {
                 format!("{} is not under the input root", create.path.display())
             })?;
             let target = output_root.join(rel);
@@ -546,12 +545,11 @@ impl EditPlan {
         // by `stage_move`, so a fresh generated tree cannot contain a target
         // collision here.
         for file_move in &self.moves {
-            let source_rel = file_move.source.strip_prefix(input_root).with_context(|| {
-                format!("{} is not under the input root", file_move.source.display())
-            })?;
-            let destination_rel = file_move
-                .destination
-                .strip_prefix(input_root)
+            let source_rel =
+                strip_prefix_path(&file_move.source, input_root).with_context(|| {
+                    format!("{} is not under the input root", file_move.source.display())
+                })?;
+            let destination_rel = strip_prefix_path(&file_move.destination, input_root)
                 .with_context(|| {
                     format!(
                         "{} is not under the input root",
