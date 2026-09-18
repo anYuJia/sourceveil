@@ -418,7 +418,7 @@ fn string_fixture() -> PathBuf {
         .expect("string fixture directory")
 }
 
-fn transform_strings(seed: &str) -> (TempDir, PathBuf) {
+fn transform_strings_from(input: &Path, seed: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("temp dir");
     let out = tmp.path().join("generated");
     let config = tmp.path().join("obfuscator.toml");
@@ -428,7 +428,7 @@ fn transform_strings(seed: &str) -> (TempDir, PathBuf) {
     let result = Command::new(binary())
         .arg("transform")
         .arg("--input")
-        .arg(string_fixture())
+        .arg(input)
         .arg("--output")
         .arg(&out)
         .arg("--config")
@@ -438,6 +438,27 @@ fn transform_strings(seed: &str) -> (TempDir, PathBuf) {
         .expect("spawning cargo-obfuscator");
     assert_succeeded(&result);
     (tmp, out)
+}
+
+fn transform_strings(seed: &str) -> (TempDir, PathBuf) {
+    transform_strings_from(&string_fixture(), seed)
+}
+
+fn protected_payloads(root: &Path) -> Vec<String> {
+    let marker = "let mut __b = ::std::vec![";
+    let source = read(root, "src/main.rs");
+    let mut payloads = Vec::new();
+    let mut rest = source.as_str();
+    while let Some(start) = rest.find(marker) {
+        let bytes = &rest[start + marker.len()..];
+        let Some(end) = bytes.find("];") else {
+            break;
+        };
+        payloads.push(bytes[..end].to_string());
+        rest = &bytes[end + 2..];
+    }
+    payloads.sort();
+    payloads
 }
 
 #[test]
@@ -474,6 +495,14 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
             "a kept plaintext must not be advertised as protected"
         );
     }
+    assert!(
+        source.contains("mixed-protocol"),
+        "a value with one macro occurrence must be kept everywhere"
+    );
+    assert!(
+        mapping(&out)["strings"].get("mixed-protocol").is_none(),
+        "a mixed safe/unsafe value must not be advertised as protected"
+    );
 
     let string_report = &report(&out)["strings"];
     assert!(
@@ -497,6 +526,34 @@ fn string_protection_is_deterministic_per_seed() {
         read(&a, "src/main.rs"),
         read(&c, "src/main.rs"),
         "different release seeds should diversify encoded string bytes"
+    );
+}
+
+#[test]
+fn string_identity_survives_checkout_and_unrelated_source_changes() {
+    let tmp = TempDir::new().unwrap();
+    let first_input = tmp.path().join("first-input");
+    let second_input = tmp.path().join("second-input");
+    copy_tree(&string_fixture(), &first_input);
+    copy_tree(&string_fixture(), &second_input);
+
+    let (_first_tmp, first) = transform_strings_from(&first_input, "991");
+    let (_second_tmp, second) = transform_strings_from(&second_input, "991");
+    assert_eq!(
+        protected_payloads(&first),
+        protected_payloads(&second),
+        "checkout path must not affect protected string bytes"
+    );
+
+    let main = second_input.join("src/main.rs");
+    let mut source = std::fs::read_to_string(&main).unwrap();
+    source.insert_str(0, "fn unrelated_item() -> u32 { 7 }\n\n");
+    std::fs::write(&main, source).unwrap();
+    let (_third_tmp, third) = transform_strings_from(&second_input, "991");
+    assert_eq!(
+        protected_payloads(&first),
+        protected_payloads(&third),
+        "adding an unrelated item must not re-encode existing occurrences"
     );
 }
 
