@@ -52,8 +52,8 @@ macros = false
 # representations remain pinned.
 fields = false
 
-# Local bindings and parameters buy very little protection in a release binary
-# and are not implemented in this build.
+# Rust local bindings and parameters remain off here; frontend lexical bindings
+# are controlled independently by [frontend].
 locals = false
 params = false
 
@@ -105,8 +105,8 @@ window_labels = false
 scan_command_literals = true
 
 [frontend]
-# The TypeScript analyzer pass is not implemented in this build. Vite/esbuild
-# already handle minification, tree shaking and identifier mangling.
+# OXC semantic binding rename. Only private lexical identifiers are eligible;
+# member properties, object/JSON keys, imports and exports remain unchanged.
 enabled = false
 rename_private_identifiers = false
 

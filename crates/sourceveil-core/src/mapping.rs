@@ -21,6 +21,11 @@ pub struct Mapping {
     /// Fully-qualified original symbol path -> replacement identifier.
     #[serde(default)]
     pub symbols: BTreeMap<String, String>,
+    /// Frontend lexical binding identity -> replacement identifier. Kept apart
+    /// from Rust symbols because frontend names are not part of the binary
+    /// protocol leak namespace.
+    #[serde(default)]
+    pub frontend_symbols: BTreeMap<String, String>,
     /// Tauri command name -> replacement, applied to both `invoke()` and the
     /// Rust handler.
     #[serde(default)]
@@ -46,6 +51,7 @@ impl Mapping {
             mapping_version: MAPPING_VERSION,
             seed,
             symbols: BTreeMap::new(),
+            frontend_symbols: BTreeMap::new(),
             commands: BTreeMap::new(),
             events: BTreeMap::new(),
             strings: BTreeMap::new(),
@@ -98,6 +104,7 @@ impl Mapping {
 
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
+            && self.frontend_symbols.is_empty()
             && self.commands.is_empty()
             && self.events.is_empty()
             && self.strings.is_empty()
@@ -172,12 +179,18 @@ mod tests {
 
         let mut m = Mapping::new(42);
         m.record_symbol("crate::network::connect", "q7k9a");
+        m.frontend_symbols
+            .insert("frontend::src/app.ts::load@12".into(), "m7q2x".into());
         m.commands.insert("get_profile".into(), "m8q2x".into());
         m.write(&path).unwrap();
 
         let back = Mapping::read(&path).unwrap();
         assert_eq!(back.seed, 42);
         assert_eq!(back.symbols["crate::network::connect"], "q7k9a");
+        assert_eq!(
+            back.frontend_symbols["frontend::src/app.ts::load@12"],
+            "m7q2x"
+        );
         assert_eq!(back.commands["get_profile"], "m8q2x");
     }
 

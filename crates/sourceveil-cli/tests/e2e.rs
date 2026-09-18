@@ -852,6 +852,92 @@ fn dynamic_tauri() -> &'static Path {
         .1
 }
 
+#[test]
+fn frontend_semantic_rename_keeps_protocol_and_property_names() {
+    let tmp = TempDir::new().expect("temp dir");
+    let out = tmp.path().join("generated");
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(
+        &config,
+        r#"
+version = 1
+profile = "safe"
+
+[project]
+frontend_root = "frontend"
+frontend_source = "src"
+
+[rename]
+functions = false
+types = false
+traits = false
+enums = false
+consts = false
+statics = false
+modules = false
+fields = false
+
+[strings]
+enabled = false
+
+[tauri]
+commands = false
+events = false
+
+[frontend]
+enabled = true
+rename_private_identifiers = true
+
+[build]
+verify = false
+"#,
+    )
+    .expect("writing frontend config");
+
+    let result = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(tauri_fixture("tauri-ipc-static"))
+        .args(["--output"])
+        .arg(&out)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--seed", "1", "--no-verify"])
+        .output()
+        .expect("spawning cargo-obfuscator");
+    assert_succeeded(&result);
+
+    let ipc = read(&out, "frontend/src/ipc.ts");
+    let wrapper = read(&out, "frontend/src/wrapper.ts");
+    assert!(!ipc.contains("SYNC_COMMAND"));
+    assert!(ipc.contains("export async function getUserInfo"));
+    assert!(
+        ipc.contains("{ userId }"),
+        "object shorthand must stay stable"
+    );
+    assert!(ipc.contains("{ key }"), "object shorthand must stay stable");
+    assert!(!wrapper.contains("command: string"));
+    assert!(!wrapper.contains("args?: Record"));
+    assert!(wrapper.contains("invoke<T>("));
+
+    let parsed_mapping = mapping(&out);
+    let frontend_mapping = parsed_mapping["frontend_symbols"]
+        .as_object()
+        .expect("frontend_symbols mapping");
+    assert!(frontend_mapping
+        .keys()
+        .any(|key| key.contains("SYNC_COMMAND")));
+    assert!(!frontend_mapping.keys().any(|key| key.contains("::userId@")));
+
+    let frontend_report = &report(&out)["frontend"];
+    assert!(frontend_report["symbols_renamed"].as_u64().unwrap_or(0) >= 3);
+    assert!(
+        frontend_report["kept_by_reason"]["object-shorthand"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+    );
+}
+
 /// Command names appearing in `generate_handler![...]`.
 fn handler_list(root: &Path) -> BTreeSet<String> {
     let lib = read(root, "src-tauri/src/lib.rs");
