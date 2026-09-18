@@ -24,6 +24,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # --- cli ---
 clap = { version = "4", features = ["derive"] }
 
+# --- attribute semantics ---
+# Only used to *understand* an attribute: `syn` never supplies a source span
+# here, because every edit is expressed against ra_ap_syntax offsets.
+syn = { version = "2", features = ["parsing", "extra-traits"] }
+
 # --- serialization ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

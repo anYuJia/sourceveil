@@ -6,4 +6,5 @@
 //! serde put on the wire for this member?* — so the Rust identifier can change
 //! and the answer can stay the same.
 
+pub mod attrs;
 pub mod case;
