@@ -319,22 +319,49 @@ fn scope_name(node: &SyntaxNode) -> Option<String> {
     }
 }
 
-/// Effective visibility after accounting for enclosing modules.
+/// Effective visibility after accounting for everything that encloses it.
 ///
 /// A `pub fn` inside a private `mod` is not reachable from another crate, and
 /// renaming it cannot affect an external consumer. This is the difference
 /// between a rename pass that is usable on a library and one that is not.
+///
+/// Two shapes need care, and both were wrong before:
+///
+/// - **An enum variant has no visibility token.** `pub enum State { Ready }`
+///   makes `Ready` as public as the enum, but reading the variant's own
+///   modifiers finds nothing and answers `Private`.
+/// - **A `pub` field is only as public as its struct.** `pub` on a field of a
+///   private struct reaches nothing at all.
 fn effective_visibility(node: &SyntaxNode) -> Visibility {
-    let own = direct_visibility(node);
+    // A variant takes its visibility from the enum; everything else from its
+    // own modifier. `pub enum State { Ready }` makes `Ready` as public as the
+    // enum, but a variant carries no visibility token to read.
+    let own = if node.kind() == SyntaxKind::VARIANT {
+        match node.ancestors().find(|a| a.kind() == SyntaxKind::ENUM) {
+            Some(enumeration) => direct_visibility(&enumeration),
+            None => Visibility::Private,
+        }
+    } else {
+        direct_visibility(node)
+    };
     if own == Visibility::Private {
         return Visibility::Private;
     }
 
-    // Any non-public ancestor module caps the item at crate scope.
+    // Everything the item sits inside has to be public too, or the modifier
+    // reaches nothing. Modules are the common case; the aggregate types are
+    // what make a `pub` field or a variant answerable at all.
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
-        if current.kind() == SyntaxKind::MODULE && direct_visibility(&current) != Visibility::Public
-        {
+        let encloses = matches!(
+            current.kind(),
+            SyntaxKind::MODULE
+                | SyntaxKind::ENUM
+                | SyntaxKind::STRUCT
+                | SyntaxKind::UNION
+                | SyntaxKind::TRAIT
+        );
+        if encloses && direct_visibility(&current) != Visibility::Public {
             return Visibility::Restricted;
         }
         ancestor = current.parent();
@@ -871,5 +898,61 @@ mod tests {
             }
             "#;
         assert!(flag_of(src, "api_key"));
+    }
+
+    #[test]
+    fn a_variant_inherits_the_visibility_of_its_enum() {
+        let cands = collect_src(
+            r#"
+            pub enum PublicState { Connected, Disconnected }
+            pub struct PublicStruct { pub open: u8, closed: u8 }
+            enum InternalState { Idle }
+            "#,
+        );
+        let vis = |name: &str| {
+            cands
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .visibility
+        };
+        assert_eq!(vis("PublicState"), Visibility::Public);
+        assert_eq!(
+            vis("Connected"),
+            Visibility::Public,
+            "a variant has no visibility token of its own, but it is as reachable as its enum"
+        );
+        assert_eq!(vis("Disconnected"), Visibility::Public);
+        assert_eq!(vis("open"), Visibility::Public);
+        assert_eq!(vis("closed"), Visibility::Private);
+        assert_eq!(vis("InternalState"), Visibility::Private);
+        assert_eq!(vis("Idle"), Visibility::Private);
+    }
+
+    /// `pub` on a field is capped by the struct. `Restricted` rather than
+    /// `Private` because that is the bucket the rename pass acts on — both mean
+    /// "nothing outside this crate can reach it".
+    #[test]
+    fn a_public_field_needs_a_public_struct() {
+        let cands = collect_src("struct Wrapper { pub field: u8 }");
+        let f = cands.iter().find(|c| c.name == "field").unwrap();
+        assert_ne!(
+            f.visibility,
+            Visibility::Public,
+            "`pub` on a field of a private struct reaches nothing outside the crate"
+        );
+
+        let cands = collect_src("pub struct Wrapper { pub field: u8 }");
+        let f = cands.iter().find(|c| c.name == "field").unwrap();
+        assert_eq!(f.visibility, Visibility::Public);
+    }
+
+    /// The same rule one level further out: a public enum inside a private
+    /// module is not public API either.
+    #[test]
+    fn a_variant_is_capped_by_the_module_holding_the_enum() {
+        let cands = collect_src("mod inner { pub enum Public { Ready } }");
+        let v = cands.iter().find(|c| c.name == "Ready").unwrap();
+        assert_ne!(v.visibility, Visibility::Public);
     }
 }

@@ -836,4 +836,61 @@ mod tests {
         let graph = probe_graph();
         assert!(crate_for_file(&graph, Path::new("/p/src-tauri/vendor/dep/src/lib.rs")).is_none());
     }
+
+    /// §40, at the level the rule actually lives: a `pub` variant in a crate
+    /// something outside the workspace depends on is that crate's API.
+    #[test]
+    fn a_public_variant_in_an_api_boundary_crate_is_kept() {
+        use crate::config::Config;
+        use crate::plan::Plan;
+
+        let plan = Plan::resolve(&Config::default()).unwrap();
+        let keep = KeepRules::new(&plan, Default::default());
+
+        let mut graph = CrateGraph::default();
+        graph.workspace.insert(
+            "libcrate".into(),
+            CrateInfo {
+                name: "libcrate".into(),
+                manifest_dir: PathBuf::from("/p/lib"),
+                src_dir: Some(PathBuf::from("/p/lib/src")),
+                crate_types: Default::default(),
+                is_proc_macro: false,
+                is_library: true,
+            },
+        );
+
+        let candidate = |visibility| Candidate {
+            kind: crate::rust::ItemKind::Variant,
+            name: "Connected".into(),
+            name_range: TextRange::new(TextSize::from(9), TextSize::from(18)),
+            file: PathBuf::from("/p/lib/src/lib.rs"),
+            line: 1,
+            path: "libcrate::PublicState::Connected".into(),
+            visibility,
+            attributes: Vec::new(),
+            inline_keep: false,
+            is_extern_abi: false,
+            // Not a serde model, so this measures the API boundary alone.
+            serde_model: false,
+        };
+
+        // Nothing outside depends on it yet, so it is an ordinary internal item.
+        graph.boundary.clear();
+        assert_eq!(keep.reject(&candidate(Visibility::Public), &graph), None);
+
+        // One crate outside the workspace depends on it. Now `pub` is a
+        // contract, and the variant is exactly as public as its enum.
+        graph.boundary.insert("libcrate".into());
+        assert_eq!(
+            keep.reject(&candidate(Visibility::Public), &graph),
+            Some(SkipReason::ExternallyReachable)
+        );
+
+        // A private enum's variants are still nobody's business.
+        assert_ne!(
+            keep.reject(&candidate(Visibility::Private), &graph),
+            Some(SkipReason::ExternallyReachable)
+        );
+    }
 }
