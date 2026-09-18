@@ -89,9 +89,7 @@ pub fn run(
         members.extend(
             candidates::collect(&parsed, &ctx)
                 .into_iter()
-                .filter(|c| {
-                    c.serde_model && matches!(c.kind, ItemKind::Field | ItemKind::Variant)
-                })
+                .filter(|c| c.serde_model && matches!(c.kind, ItemKind::Field | ItemKind::Variant))
                 .map(|c| (*file_id, c)),
         );
         texts.insert(path.clone(), text);
@@ -106,7 +104,13 @@ pub fn run(
     let keep_patterns = crate::copier::build_globset(&req.plan.keep.patterns)
         .unwrap_or_else(|_| globset::GlobSet::empty());
     let intrinsic: HashSet<&str> = INTRINSIC_KEEP_ATTRIBUTES.iter().copied().collect();
-    let keep_attrs: HashSet<&str> = req.plan.keep.attributes.iter().map(String::as_str).collect();
+    let keep_attrs: HashSet<&str> = req
+        .plan
+        .keep
+        .attributes
+        .iter()
+        .map(String::as_str)
+        .collect();
     let keep_names: HashSet<&str> = req.plan.keep.symbols.iter().map(String::as_str).collect();
 
     for (file_id, candidate) in members {
@@ -179,14 +183,14 @@ pub fn run(
                 continue;
             }
         };
-        let mut by_file =
-            match resolve_change_edits(analysis, req.input_root, req.copied, &change) {
-                Ok(edits) => edits,
-                Err((reason, detail)) => {
-                    outcome.skipped.push(skipped(&candidate, reason, detail));
-                    continue;
-                }
-            };
+        let mut by_file = match resolve_change_edits(analysis, req.input_root, req.copied, &change)
+        {
+            Ok(edits) => edits,
+            Err((reason, detail)) => {
+                outcome.skipped.push(skipped(&candidate, reason, detail));
+                continue;
+            }
+        };
 
         if !definition_present(&by_file, &candidate) {
             outcome.skipped.push(skipped(
@@ -228,7 +232,10 @@ pub fn run(
             outcome.skipped.push(skipped(
                 &candidate,
                 SkipReason::EditOutsideOutput,
-                Some(format!("no analysed source snapshot for {}", path.display())),
+                Some(format!(
+                    "no analysed source snapshot for {}",
+                    path.display()
+                )),
             ));
             continue;
         }
@@ -273,8 +280,7 @@ fn common_skip(
     if candidate.attributes.iter().any(|a| {
         // serde is owned by this pass, but an explicit user keep rule still
         // wins. Only the built-in protocol pin is bypassed here.
-        keep_attrs.contains(a.as_str())
-            || (a != "serde" && intrinsic.contains(a.as_str()))
+        keep_attrs.contains(a.as_str()) || (a != "serde" && intrinsic.contains(a.as_str()))
     }) {
         return Some((SkipReason::IntrinsicAttribute, None));
     }
@@ -302,16 +308,19 @@ fn member_context(
     let container = node
         .ancestors()
         .skip(1)
-        .find(|n| matches!(n.kind(), SyntaxKind::STRUCT | SyntaxKind::ENUM | SyntaxKind::UNION))
+        .find(|n| {
+            matches!(
+                n.kind(),
+                SyntaxKind::STRUCT | SyntaxKind::ENUM | SyntaxKind::UNION
+            )
+        })
         .ok_or_else(|| "serde member has no aggregate container".to_string())?;
 
     if container.kind() == SyntaxKind::UNION {
         return Err("serde union members are kept".into());
     }
     if !definitely_serde_container(&container, source) {
-        return Err(
-            "Serialize/Deserialize derive could not be proven to come from serde".into(),
-        );
+        return Err("Serialize/Deserialize derive could not be proven to come from serde".into());
     }
 
     let container_attrs =
@@ -333,8 +342,9 @@ fn member_context(
     }
 
     let rules = match candidate.kind {
-        ItemKind::Variant => RenameAllRules::from(&container_attrs.rename_all)
-            .map_err(|e| e.to_string())?,
+        ItemKind::Variant => {
+            RenameAllRules::from(&container_attrs.rename_all).map_err(|e| e.to_string())?
+        }
         ItemKind::Field => {
             let variant = node
                 .ancestors()
@@ -435,17 +445,20 @@ fn unsupported_member(attrs: &SerdeAttrs) -> Option<&'static str> {
 }
 
 fn find_member_node(parsed: &ast::SourceFile, candidate: &Candidate) -> Option<SyntaxNode> {
-    parsed.syntax().descendants().find(|node| match candidate.kind {
-        ItemKind::Field => ast::RecordField::cast(node.clone())
-            .and_then(|field| field.name())
-            .map(|name| name.syntax().text_range() == candidate.name_range)
-            .unwrap_or(false),
-        ItemKind::Variant => ast::Variant::cast(node.clone())
-            .and_then(|variant| variant.name())
-            .map(|name| name.syntax().text_range() == candidate.name_range)
-            .unwrap_or(false),
-        _ => false,
-    })
+    parsed
+        .syntax()
+        .descendants()
+        .find(|node| match candidate.kind {
+            ItemKind::Field => ast::RecordField::cast(node.clone())
+                .and_then(|field| field.name())
+                .map(|name| name.syntax().text_range() == candidate.name_range)
+                .unwrap_or(false),
+            ItemKind::Variant => ast::Variant::cast(node.clone())
+                .and_then(|variant| variant.name())
+                .map(|name| name.syntax().text_range() == candidate.name_range)
+                .unwrap_or(false),
+            _ => false,
+        })
 }
 
 fn parse_attrs(node: &SyntaxNode) -> std::result::Result<SerdeAttrs, String> {
@@ -477,7 +490,11 @@ fn merge_attrs(dst: &mut SerdeAttrs, src: SerdeAttrs) -> std::result::Result<(),
     merge_option(&mut dst.try_from, src.try_from, "try_from")?;
     merge_option(&mut dst.into, src.into, "into")?;
     merge_option(&mut dst.with, src.with, "with")?;
-    merge_option(&mut dst.serialize_with, src.serialize_with, "serialize_with")?;
+    merge_option(
+        &mut dst.serialize_with,
+        src.serialize_with,
+        "serialize_with",
+    )?;
     merge_option(
         &mut dst.deserialize_with,
         src.deserialize_with,
@@ -605,9 +622,7 @@ fn serde_rename_attribute(wire: &WireNames) -> String {
     if wire.are_the_same() {
         format!("#[serde(rename = {serialize})]")
     } else {
-        format!(
-            "#[serde(rename(serialize = {serialize}, deserialize = {deserialize}))]"
-        )
+        format!("#[serde(rename(serialize = {serialize}, deserialize = {deserialize}))]")
     }
 }
 
