@@ -26,6 +26,9 @@ pub struct Mapping {
     /// protocol leak namespace.
     #[serde(default)]
     pub frontend_symbols: BTreeMap<String, String>,
+    /// Dependency package -> generated boundary wrapper module.
+    #[serde(default)]
+    pub dependency_wrappers: BTreeMap<String, String>,
     /// Tauri command name -> replacement, applied to both `invoke()` and the
     /// Rust handler.
     #[serde(default)]
@@ -52,6 +55,7 @@ impl Mapping {
             seed,
             symbols: BTreeMap::new(),
             frontend_symbols: BTreeMap::new(),
+            dependency_wrappers: BTreeMap::new(),
             commands: BTreeMap::new(),
             events: BTreeMap::new(),
             strings: BTreeMap::new(),
@@ -105,6 +109,7 @@ impl Mapping {
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
             && self.frontend_symbols.is_empty()
+            && self.dependency_wrappers.is_empty()
             && self.commands.is_empty()
             && self.events.is_empty()
             && self.strings.is_empty()

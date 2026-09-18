@@ -46,8 +46,9 @@ V1, at the prototype stage the design calls for. What is implemented:
 | serde-safe field / enum-variant rename | implemented for the supported subset; unsupported serde representations are kept |
 | runtime Rust string protection | done for safe runtime expressions; compile-time/macro contexts are kept |
 | TypeScript semantic private-binding rename | done — OXC scope-aware; properties/JSON keys/imports/exports are kept |
-| module file rename | not implemented |
-| dependency wrappers | not implemented |
+| module file rename | done (opt-in transactional file/dir moves) |
+| dependency boundary policy | done (external, private-obfuscate, obfuscate, wrapper) |
+| reproducible build/size benchmark | done (cargo-obfuscator benchmark) |
 | final binary leak scanner | done — raw UTF-8/UTF-16LE scan for original protocol values |
 
 Unimplemented features are reported in the run output rather than ignored, and
@@ -59,9 +60,14 @@ where their absence would break something, the affected symbols are pinned:
   are kept. Under `balanced`, supported members are renamed only when the old
   serialize/deserialize names can be materialised explicitly; unsupported
   representations are kept and reported. Details below.
-- Module *identifiers* are renamed; module *files* are not, because
-  rust-analyzer implements module rename as a file move and that is a separate
-  pass with its own verification.
+- Module *identifiers* are renamed by default. Physical module-file and
+  directory moves are opt-in ([rename] module_files = true) and are staged
+  transactionally with the declaration edits; a failed move aborts the plan.
+- Dependencies are closed-world by explicit policy. external leaves a
+  dependency untouched, private-obfuscate transforms only private items in a
+  copied path dependency, obfuscate permits the full private dependency pass,
+  and wrapper generates a private crate::sv_* boundary for semantically
+  resolved calls without editing registry sources.
 - Frontend binding renames use OXC's semantic graph. Private functions, classes,
   parameters and module-local constants may move; member properties, object
   shorthand, imports/exports and dynamic `eval`/`with` scopes are kept.
@@ -242,6 +248,13 @@ cargo-obfuscator verify --output ./out
 cargo-obfuscator scan-binary \
   --binary ./target/release/my-app \
   --mapping ./out/.obfuscator/mapping.json
+
+# Compare baseline and transformed release builds, source/binary sizes, and
+# cold-start samples. The output directory must be fresh.
+cargo-obfuscator benchmark \
+  --input ./my-tauri-app \
+  --output ./benchmark-generated \
+  --iterations 5
 ```
 
 Useful flags: `--seed <auto|random|hmac|u64>`, `--stage <name>` (repeatable),
@@ -253,6 +266,23 @@ See [`obfuscator.toml`](obfuscator.toml) — it is the schema, documented, with
 every value at its default. Deleting it changes nothing.
 
 Precedence is: explicit value > selected profile > built-in default.
+
+### Dependency boundaries
+
+Workspace members are part of the closed world and are transformed together.
+Dependencies outside that workspace default to `external`: their source and
+public names are left alone. Path dependencies can be included explicitly with
+`private-obfuscate` or `obfuscate`. The `wrapper` mode
+leaves the dependency itself untouched and generates a private
+`crate::sv_*` module in the root crate; only rust-analyzer-resolved
+crate-root references are routed through that boundary. Package names accept
+either Cargo's hyphenated spelling or the underscore alias used in Rust source.
+
+```toml
+[dependencies]
+default = "external"
+helper-lib = "wrapper"
+```
 
 ### Keeping things
 

@@ -14,6 +14,7 @@
 //!
 //! So: collect against one snapshot, apply once, in one direction per file.
 
+use crate::scanner::strip_prefix_path;
 use anyhow::{Context, Result};
 use ra_ap_ide::{Indel, TextSize};
 use std::collections::BTreeMap;
@@ -123,13 +124,36 @@ fn first_overlap(indels: &[Indel]) -> Option<((u32, u32), (u32, u32))> {
     })
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct EditPlan {
     /// The contents each edited file had when its edits were computed. Kept so
     /// the apply step can prove that the copy on disk is the same text, rather
     /// than trusting that nothing touched it in between.
     sources: BTreeMap<PathBuf, String>,
     edits: BTreeMap<PathBuf, Vec<Indel>>,
+    /// File-system moves requested by semantic module renames. Paths are
+    /// absolute input-tree paths; the apply step maps them onto the copied
+    /// output tree. Keeping moves in this transaction is what prevents a
+    /// module declaration from being rewritten without its backing file.
+    moves: Vec<FileMove>,
+    creates: Vec<FileCreate>,
+}
+
+/// A validated file or directory move staged alongside text edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMove {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub directory: bool,
+}
+
+/// A source file generated as part of a transactional pass (currently the
+/// dependency-boundary wrapper). It is kept in the same plan as text edits so
+/// a failed validation cannot leave a half-created wrapper behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCreate {
+    pub path: PathBuf,
+    pub contents: String,
 }
 
 #[derive(Debug, Default)]
@@ -145,10 +169,54 @@ impl EditPlan {
 
     pub fn is_empty(&self) -> bool {
         self.edits.values().all(|v| v.is_empty())
+            && self.moves.is_empty()
+            && self.creates.is_empty()
     }
 
     pub fn edit_count(&self) -> usize {
         self.edits.values().map(Vec::len).sum()
+    }
+
+    /// Number of staged file-system moves.
+    pub fn move_count(&self) -> usize {
+        self.moves.len()
+    }
+
+    pub fn create_count(&self) -> usize {
+        self.creates.len()
+    }
+
+    /// Stage a generated file, rejecting duplicate paths and collisions with
+    /// another transaction's source/move destination.
+    pub fn stage_create(&mut self, create: FileCreate) -> std::result::Result<(), String> {
+        if self
+            .creates
+            .iter()
+            .any(|existing| existing.path == create.path)
+        {
+            return Err(format!(
+                "generated file {} is already scheduled",
+                create.path.display()
+            ));
+        }
+        if self.edits.contains_key(&create.path) {
+            return Err(format!(
+                "generated file {} is also being edited",
+                create.path.display()
+            ));
+        }
+        if self.moves.iter().any(|file_move| {
+            file_move.destination == create.path
+                || file_move.source == create.path
+                || (file_move.directory && create.path.starts_with(&file_move.source))
+        }) {
+            return Err(format!(
+                "generated file {} overlaps a staged move",
+                create.path.display()
+            ));
+        }
+        self.creates.push(create);
+        Ok(())
     }
 
     /// Files that will be rewritten, workspace-relative to `input_root`.
@@ -293,16 +361,122 @@ impl EditPlan {
         Ok(staged)
     }
 
+    /// Validate and stage a file-system move. A source may only be moved once,
+    /// a destination may only be claimed once, and moves may not overlap an
+    /// already-staged move. The caller performs the input/output boundary
+    /// checks before reaching this method.
+    pub fn validate_move(&self, incoming: &FileMove) -> std::result::Result<(), String> {
+        if incoming.source == incoming.destination {
+            return Err(format!(
+                "refusing a no-op file move for {}",
+                incoming.source.display()
+            ));
+        }
+
+        for existing in &self.moves {
+            if existing.source == incoming.source {
+                return Err(format!(
+                    "{} is already scheduled to move to {}",
+                    incoming.source.display(),
+                    existing.destination.display()
+                ));
+            }
+            if existing.destination == incoming.destination {
+                return Err(format!(
+                    "destination {} is claimed by two moves",
+                    incoming.destination.display()
+                ));
+            }
+            let source_overlap = existing.directory
+                && incoming.source.starts_with(&existing.source)
+                || incoming.directory && existing.source.starts_with(&incoming.source);
+            let destination_overlap = existing.directory
+                && incoming.destination.starts_with(&existing.destination)
+                || incoming.directory && existing.destination.starts_with(&incoming.destination);
+            if source_overlap || destination_overlap {
+                return Err(format!(
+                    "file moves {} -> {} and {} -> {} overlap",
+                    existing.source.display(),
+                    existing.destination.display(),
+                    incoming.source.display(),
+                    incoming.destination.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn stage_move(&mut self, incoming: FileMove) -> std::result::Result<(), String> {
+        self.validate_move(&incoming)?;
+        if self.creates.iter().any(|create| {
+            create.path == incoming.source
+                || create.path == incoming.destination
+                || (incoming.directory && create.path.starts_with(&incoming.source))
+        }) {
+            return Err(format!(
+                "file move {} -> {} overlaps a generated file",
+                incoming.source.display(),
+                incoming.destination.display()
+            ));
+        }
+        self.moves.push(incoming);
+        Ok(())
+    }
+
     /// Write every scheduled edit into the generated tree.
     pub fn apply(&self, input_root: &Path, output_root: &Path) -> Result<ApplyOutcome> {
         let mut outcome = ApplyOutcome::default();
 
+        // Preflight every output path before touching any file. The copy is
+        // expected to be fresh, but checking the complete transaction first
+        // prevents a late collision from leaving only part of a plan applied.
+        for create in &self.creates {
+            let rel = strip_prefix_path(&create.path, input_root).with_context(|| {
+                format!("{} is not under the input root", create.path.display())
+            })?;
+            let target = output_root.join(rel);
+            if target.exists() {
+                anyhow::bail!(
+                    "generated file {} already exists in output",
+                    target.display()
+                );
+            }
+        }
+        for file_move in &self.moves {
+            let source_rel =
+                strip_prefix_path(&file_move.source, input_root).with_context(|| {
+                    format!("{} is not under the input root", file_move.source.display())
+                })?;
+            let destination_rel = strip_prefix_path(&file_move.destination, input_root)
+                .with_context(|| {
+                    format!(
+                        "{} is not under the input root",
+                        file_move.destination.display()
+                    )
+                })?;
+            let source = output_root.join(source_rel);
+            let destination = output_root.join(destination_rel);
+            if !source.exists() {
+                anyhow::bail!(
+                    "staged move source {} is missing from generated output",
+                    source.display()
+                );
+            }
+            if destination.exists() {
+                anyhow::bail!(
+                    "staged move destination {} already exists",
+                    destination.display()
+                );
+            }
+        }
+
+        let mut rewritten_files = Vec::new();
         for (abs_path, indels) in &self.edits {
             if indels.is_empty() {
                 continue;
             }
-            let rel = abs_path
-                .strip_prefix(input_root)
+            let rel = strip_prefix_path(abs_path, input_root)
                 .with_context(|| format!("{} is not under the input root", abs_path.display()))?;
             let target = output_root.join(rel);
 
@@ -329,11 +503,84 @@ impl EditPlan {
             let rewritten = apply_indels(&disk, indels).with_context(|| {
                 format!("applying {} edit(s) to {}", indels.len(), target.display())
             })?;
+            rewritten_files.push((target, rewritten, indels.len()));
+        }
+
+        // All source snapshots and indel ranges have validated above. Only
+        // now start writing, so a stale file or invalid range cannot leave a
+        // partially rewritten transaction.
+        for (target, rewritten, edit_count) in rewritten_files {
             std::fs::write(&target, rewritten)
                 .with_context(|| format!("writing {}", target.display()))?;
 
             outcome.files_edited += 1;
-            outcome.edits_applied += indels.len();
+            outcome.edits_applied += edit_count;
+        }
+
+        // Generated files are committed only after every existing source edit
+        // has validated its snapshot and been written. This ordering keeps a
+        // failed rewrite from leaving a wrapper or other synthetic file behind
+        // in an otherwise unusable output tree.
+        for create in &self.creates {
+            let rel = strip_prefix_path(&create.path, input_root).with_context(|| {
+                format!("{} is not under the input root", create.path.display())
+            })?;
+            let target = output_root.join(rel);
+            if target.exists() {
+                anyhow::bail!(
+                    "generated file {} already exists in output",
+                    target.display()
+                );
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(&target, &create.contents)
+                .with_context(|| format!("writing generated file {}", target.display()))?;
+        }
+
+        // Text edits are applied before moves because their offsets refer to
+        // the original paths rust-analyzer loaded. Every move was prevalidated
+        // by `stage_move`, so a fresh generated tree cannot contain a target
+        // collision here.
+        for file_move in &self.moves {
+            let source_rel =
+                strip_prefix_path(&file_move.source, input_root).with_context(|| {
+                    format!("{} is not under the input root", file_move.source.display())
+                })?;
+            let destination_rel = strip_prefix_path(&file_move.destination, input_root)
+                .with_context(|| {
+                    format!(
+                        "{} is not under the input root",
+                        file_move.destination.display()
+                    )
+                })?;
+            let source = output_root.join(source_rel);
+            let destination = output_root.join(destination_rel);
+            if !source.exists() {
+                anyhow::bail!(
+                    "staged move source {} is missing from generated output",
+                    source.display()
+                );
+            }
+            if destination.exists() {
+                anyhow::bail!(
+                    "staged move destination {} already exists",
+                    destination.display()
+                );
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::rename(&source, &destination).with_context(|| {
+                format!(
+                    "moving generated {} -> {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
         }
 
         Ok(outcome)

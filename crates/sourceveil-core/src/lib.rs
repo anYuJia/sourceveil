@@ -31,14 +31,17 @@
 //! - [`config`] — the `obfuscator.toml` schema.
 //! - [`plan`] — resolution of config + profile into concrete pass settings.
 //! - [`scanner`] — project discovery via `cargo metadata`.
+//! - [`benchmark`] — reproducible baseline/transformed build measurements.
 //! - [`copier`] — the output workspace copier.
 //! - [`rust`] — the semantic analysis and rename passes.
 //! - [`mapping`] / [`report`] — run artifacts.
 //! - [`verify`] — the post-generation verification pipeline.
 
+pub mod benchmark;
 pub mod binary_scan;
 pub mod config;
 pub mod copier;
+pub mod dependencies;
 pub mod edits;
 pub mod frontend;
 pub mod mapping;

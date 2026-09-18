@@ -31,7 +31,7 @@ use crate::names::{NameCase, NameDeriver, SeedDomain};
 use crate::plan::Plan;
 use crate::rust::analysis::RustAnalysis;
 use crate::rust::rename;
-use crate::scanner::CrateGraph;
+use crate::scanner::{is_root_like, CrateGraph};
 use anyhow::Result;
 use ra_ap_ide::{FileId, FilePosition, GotoDefinitionConfig, Indel};
 use ra_ap_syntax::ast::{self, AstNode, HasArgList};
@@ -204,7 +204,7 @@ pub fn run(
     let mut out = EventOutcome::default();
 
     // ---- the Rust side ----------------------------------------------------
-    let files = workspace_files(analysis, req.graph);
+    let files = workspace_files(analysis, req.graph, req.plan);
     let mut rust_refs: Vec<RustEventRef> = Vec::new();
     for file in &files {
         rust_refs.extend(collect_rust_refs(analysis, file, req.input_root));
@@ -484,10 +484,19 @@ struct RustFile {
     text: String,
 }
 
-fn workspace_files(analysis: &RustAnalysis, graph: &CrateGraph) -> Vec<RustFile> {
+fn workspace_files(
+    analysis: &RustAnalysis,
+    graph: &CrateGraph,
+    plan: &crate::plan::Plan,
+) -> Vec<RustFile> {
     let mut out = Vec::new();
     for (file_id, path) in analysis.rust_files() {
-        if rename::crate_for_file(graph, &path).is_none() {
+        let Some(krate) = rename::crate_for_file(graph, &path) else {
+            continue;
+        };
+        if !is_root_like(graph, &krate.name)
+            && plan.dependencies.mode_for(&krate.name) != crate::config::DependencyMode::Obfuscate
+        {
             continue;
         }
         let Some((_, text)) = analysis.parse(file_id) else {

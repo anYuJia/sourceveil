@@ -58,6 +58,8 @@ pub enum SeedDomain {
     FrontendSymbol,
     TauriCommand,
     TauriEvent,
+    /// A generated dependency boundary wrapper module.
+    DependencyWrapper,
 }
 
 impl SeedDomain {
@@ -67,6 +69,7 @@ impl SeedDomain {
             SeedDomain::FrontendSymbol => "frontend-symbol",
             SeedDomain::TauriCommand => "command",
             SeedDomain::TauriEvent => "event",
+            SeedDomain::DependencyWrapper => "dependency-wrapper",
         }
     }
 }

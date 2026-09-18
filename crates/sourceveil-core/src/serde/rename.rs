@@ -23,7 +23,7 @@ use crate::rust::rename::{
     crate_for_file, module_prefix_for, propose_rename, resolve_change_edits,
 };
 use crate::rust::ItemKind;
-use crate::scanner::CrateGraph;
+use crate::scanner::{is_root_like, CrateGraph};
 use anyhow::Result;
 use ra_ap_ide::{FileId, Indel};
 use ra_ap_syntax::ast::{self, AstNode, HasName};
@@ -284,11 +284,26 @@ fn common_skip(
     }) {
         return Some((SkipReason::IntrinsicAttribute, None));
     }
-    if candidate.visibility == Visibility::Public {
-        if let Some(krate) = crate_for_file(req.graph, &candidate.file) {
-            if krate.has_external_consumers(req.graph) || krate.is_proc_macro {
-                return Some((SkipReason::ExternallyReachable, None));
+    if let Some(krate) = crate_for_file(req.graph, &candidate.file) {
+        if !is_root_like(req.graph, &krate.name) {
+            match req.plan.dependencies.mode_for(&krate.name) {
+                crate::config::DependencyMode::External
+                | crate::config::DependencyMode::Wrapper => {
+                    return Some((SkipReason::DependencyExternal, None));
+                }
+                crate::config::DependencyMode::PrivateObfuscate
+                    if candidate.visibility == Visibility::Public =>
+                {
+                    return Some((SkipReason::ExternallyReachable, None));
+                }
+                crate::config::DependencyMode::PrivateObfuscate
+                | crate::config::DependencyMode::Obfuscate => {}
             }
+        }
+        if candidate.visibility == Visibility::Public
+            && (krate.has_external_consumers(req.graph) || krate.is_proc_macro)
+        {
+            return Some((SkipReason::ExternallyReachable, None));
         }
     }
     if macro_referenced.contains(&candidate.name) {

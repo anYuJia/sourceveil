@@ -1,0 +1,9 @@
+[package]
+name = "path-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+helper_lib = { package = "helper-lib", path = "../helper" }
+
+[workspace]

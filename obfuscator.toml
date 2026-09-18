@@ -37,8 +37,9 @@ consts = true
 statics = true
 modules = true
 
-# Physical module-file renaming is a V2 pass; module identifiers are renamed
-# and the files stay where they are.
+# Physical module-file and directory moves are opt-in. They are staged in the
+# same transaction as module declaration edits and verified in the generated
+# tree.
 module_files = false
 
 # `macro_rules!` bodies are a token-level protocol. Renaming works when the
@@ -119,7 +120,9 @@ property_mangling = false
 # `external` (leave alone), `private-obfuscate`, `obfuscate`, or `wrapper`.
 default = "external"
 
-# Per-crate overrides:
+# Per-crate overrides. A dependency not listed here uses default; package
+# names may use Cargo's hyphenated spelling or the underscore alias used in
+# Rust source.
 #
 # reqwest = { mode = "wrapper" }
 # my_core_lib = "private-obfuscate"

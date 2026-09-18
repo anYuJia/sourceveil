@@ -57,8 +57,11 @@ pub enum SkipReason {
     Unresolvable,
     /// The rename would have had to edit a file outside the generated tree.
     EditOutsideOutput,
-    /// The rename would have moved or renamed a file, which is a V2 pass.
+    /// The rename would have moved or renamed a file outside the enabled
+    /// module-file transaction.
     RequiresFileRename,
+    /// A local/path dependency is external to the configured closed world.
+    DependencyExternal,
     /// Would have collided with an edit already scheduled at the same span.
     EditConflict,
     /// The item kind is not enabled in the active profile.
@@ -82,6 +85,7 @@ impl SkipReason {
             SkipReason::Unresolvable => "unresolvable",
             SkipReason::EditOutsideOutput => "edit-outside-output",
             SkipReason::RequiresFileRename => "requires-file-rename",
+            SkipReason::DependencyExternal => "dependency-external",
             SkipReason::EditConflict => "edit-conflict",
             SkipReason::KindDisabled => "kind-disabled",
             SkipReason::AbiBoundary => "abi-boundary",
@@ -298,6 +302,14 @@ pub struct FrontendStats {
     pub kept_by_reason: BTreeMap<String, usize>,
 }
 
+/// What dependency-boundary handling generated for this build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DependencyStats {
+    pub wrappers_generated: usize,
+    pub references_rewritten: usize,
+    pub files_edited: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub report_version: u32,
@@ -310,6 +322,8 @@ pub struct Report {
     pub strings: StringStats,
     #[serde(default)]
     pub frontend: FrontendStats,
+    #[serde(default)]
+    pub dependencies: DependencyStats,
     /// Count of skipped symbols grouped by reason.
     pub skipped_by_reason: BTreeMap<String, usize>,
     pub skipped: Vec<SkippedSymbol>,
@@ -329,6 +343,7 @@ impl Report {
             events: EventStats::default(),
             strings: StringStats::default(),
             frontend: FrontendStats::default(),
+            dependencies: DependencyStats::default(),
             skipped_by_reason: BTreeMap::new(),
             skipped: Vec::new(),
             verification: Vec::new(),
@@ -474,6 +489,18 @@ impl Report {
             for (reason, count) in &f.kept_by_reason {
                 let _ = writeln!(w, "  {reason:<28} {count}");
             }
+        }
+
+        if self.dependencies.wrappers_generated > 0 {
+            let _ = writeln!(w);
+            let d = &self.dependencies;
+            let _ = writeln!(w, "Dependency wrappers generated: {}", d.wrappers_generated);
+            let _ = writeln!(
+                w,
+                "Dependency refs rewritten:     {}",
+                d.references_rewritten
+            );
+            let _ = writeln!(w, "Dependency files edited:       {}", d.files_edited);
         }
 
         if !self.verification.is_empty() {

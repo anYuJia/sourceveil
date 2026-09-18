@@ -37,6 +37,10 @@ enum Command {
 
     /// Scan a final executable or library for original protocol values.
     ScanBinary(ScanBinaryArgs),
+
+    /// Measure baseline and transformed build, source-size, binary-size, and
+    /// startup deltas for a project.
+    Benchmark(BenchmarkArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -99,6 +103,37 @@ struct ScanBinaryArgs {
 }
 
 #[derive(Debug, Parser)]
+struct BenchmarkArgs {
+    /// Project root to read. Never written to.
+    #[arg(long, default_value = ".")]
+    input: PathBuf,
+
+    /// Directory to write the benchmark's transformed workspace into.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Path to `obfuscator.toml`.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Override `[build] seed`: `auto`, `random`, `hmac`, or a decimal u64.
+    #[arg(long)]
+    seed: Option<String>,
+
+    /// Number of cold-start samples for each release binary.
+    #[arg(long, default_value_t = 5)]
+    iterations: usize,
+
+    /// Emit the machine-readable benchmark report as JSON.
+    #[arg(long)]
+    json: bool,
+
+    /// Print more detail about the transform while it runs.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+#[derive(Debug, Parser)]
 struct VerifyArgs {
     /// A previously generated workspace root.
     #[arg(long)]
@@ -146,6 +181,7 @@ fn main() -> Result<()> {
         Command::Transform(a) => a.verbose,
         Command::Scan(a) => a.verbose,
         Command::Verify(a) => a.verbose,
+        Command::Benchmark(a) => a.verbose,
         Command::ScanBinary(_) => false,
     };
     init_tracing(verbose);
@@ -155,6 +191,7 @@ fn main() -> Result<()> {
         Command::Scan(args) => run_scan(args),
         Command::Verify(args) => run_verify(args),
         Command::ScanBinary(args) => run_scan_binary(args),
+        Command::Benchmark(args) => run_benchmark(args),
     }
 }
 
@@ -327,6 +364,25 @@ fn run_scan_binary(args: ScanBinaryArgs) -> Result<()> {
             report.protocol_leaks.len(),
             args.binary.display()
         );
+    }
+    Ok(())
+}
+
+fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
+    let config = load_config(args.config.as_deref())?;
+    let report = sourceveil_core::benchmark::run(&sourceveil_core::benchmark::BenchmarkRequest {
+        input: args.input,
+        output: args.output,
+        config,
+        seed_override: args.seed,
+        iterations: args.iterations,
+    })?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.render());
+        println!("generated workspace: {}", report.output.display());
     }
     Ok(())
 }

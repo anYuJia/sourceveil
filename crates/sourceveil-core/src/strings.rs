@@ -17,10 +17,10 @@
 //! static string tables and break the strings -> XREF shortcut.
 
 use crate::edits::{replace, Contribution, EditPlan};
-use crate::plan::StringsPlan;
+use crate::plan::{DependenciesPlan, StringsPlan};
 use crate::rust::analysis::RustAnalysis;
 use crate::rust::rename::crate_for_file;
-use crate::scanner::CrateGraph;
+use crate::scanner::{is_root_like, CrateGraph};
 use anyhow::Result;
 use hmac::{Hmac, Mac};
 use ra_ap_syntax::ast::{self, AstNode, AstToken, HasAttrs};
@@ -59,6 +59,7 @@ pub struct StringRequest<'a> {
     pub copied: &'a BTreeSet<PathBuf>,
     pub graph: &'a CrateGraph,
     pub plan: &'a StringsPlan,
+    pub dependencies: &'a DependenciesPlan,
     pub seed: u64,
     /// Tauri commands/events (renamed or kept). The string pass must never
     /// reinterpret those protocol values as ordinary literals.
@@ -104,6 +105,14 @@ pub fn run(
         let Some(krate) = crate_for_file(req.graph, &path) else {
             continue;
         };
+        if !is_root_like(req.graph, &krate.name)
+            && matches!(
+                req.dependencies.mode_for(&krate.name),
+                crate::config::DependencyMode::External | crate::config::DependencyMode::Wrapper
+            )
+        {
+            continue;
+        }
         if no_std_crates.contains(&krate.name) {
             continue;
         }

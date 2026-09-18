@@ -268,6 +268,156 @@ fn rename_reaches_across_module_and_file_boundaries() {
 }
 
 #[test]
+fn module_file_rename_moves_a_directory_transactionally() {
+    let tmp = TempDir::new().expect("temp dir");
+    let out = tmp.path().join("generated");
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(
+        &config,
+        r#"
+version = 1
+profile = "safe"
+
+[rename]
+module_files = true
+
+[build]
+verify = false
+"#,
+    )
+    .expect("writing module-file config");
+
+    let result = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(fixture())
+        .args(["--output"])
+        .arg(&out)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--seed", "4242", "--no-verify"])
+        .output()
+        .expect("spawning cargo-obfuscator");
+    assert_succeeded(&result);
+
+    let parsed = mapping(&out);
+    let new_module = parsed["symbols"]
+        .as_object()
+        .expect("symbols mapping")
+        .iter()
+        .find_map(|(old, new)| {
+            old.ends_with("::auth")
+                .then(|| new.as_str().expect("module replacement").to_string())
+        })
+        .expect("auth module should be renamed");
+    let moved_dir = out.join("src").join(&new_module);
+    assert!(moved_dir.join("mod.rs").is_file());
+    assert!(moved_dir.join("token.rs").is_file());
+    assert!(
+        !out.join("src/auth").exists(),
+        "old module directory survived"
+    );
+    assert!(read(&out, "src/main.rs").contains(&format!("mod {new_module};")));
+
+    let check = Command::new("cargo")
+        .args(["check", "--locked", "--all-targets"])
+        .current_dir(&out)
+        .output()
+        .expect("checking module-file output");
+    assert!(
+        check.status.success(),
+        "module-file output failed to compile\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn path_dependency_policy_is_closed_world_and_explicit() {
+    let input = tauri_fixture("workspace-path-dependency");
+
+    let transform_with = |dependency_line: &str| {
+        let tmp = TempDir::new().expect("temp dir");
+        let out = tmp.path().join("generated");
+        let config = tmp.path().join("obfuscator.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "version = 1\nprofile = \"safe\"\n\n[project]\nrust_root = \"app\"\n\n[dependencies]\n{dependency_line}\n\n[build]\nverify = false\n"
+            ),
+        )
+        .expect("writing dependency config");
+        let result = Command::new(binary())
+            .args(["transform", "--input"])
+            .arg(&input)
+            .args(["--output"])
+            .arg(&out)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--seed", "7001", "--no-verify"])
+            .output()
+            .expect("spawning cargo-obfuscator");
+        assert_succeeded(&result);
+        (tmp, out)
+    };
+
+    let (_external_tmp, external) = transform_with("\"helper-lib\" = \"external\"");
+    let external_source = read(&external, "helper/src/lib.rs");
+    assert!(external_source.contains("private_calculation"));
+    assert!(
+        report(&external)["skipped_by_reason"]["dependency-external"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+
+    let (_private_tmp, private) = transform_with("\"helper-lib\" = \"private-obfuscate\"");
+    let private_source = read(&private, "helper/src/lib.rs");
+    assert!(!private_source.contains("private_calculation"));
+    assert!(private_source.contains("pub fn public_api"));
+    let private_check = Command::new("cargo")
+        .args(["check", "--locked"])
+        .current_dir(private.join("app"))
+        .output()
+        .expect("checking path dependency output");
+    assert!(
+        private_check.status.success(),
+        "path dependency output failed to compile\n{}",
+        String::from_utf8_lossy(&private_check.stderr)
+    );
+
+    let (_wrapper_tmp, wrapper) = transform_with("\"helper-lib\" = \"wrapper\"");
+    let wrapper_main = read(&wrapper, "app/src/main.rs");
+    let wrapper_module = std::fs::read_dir(wrapper.join("app/src"))
+        .expect("wrapper source directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sv_") && name.ends_with(".rs"))
+        })
+        .expect("generated dependency wrapper");
+    let wrapper_name = wrapper_module
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("wrapper module name");
+    assert!(wrapper_main.contains(&format!("mod {wrapper_name};")));
+    assert!(wrapper_main.contains(&format!("crate::{wrapper_name}::public_api")));
+    assert!(mapping(&wrapper)["dependency_wrappers"]
+        .as_object()
+        .is_some_and(|m| m.contains_key("helper-lib")));
+    let wrapper_check = Command::new("cargo")
+        .args(["check", "--locked"])
+        .current_dir(wrapper.join("app"))
+        .output()
+        .expect("checking dependency wrapper output");
+    assert!(
+        wrapper_check.status.success(),
+        "dependency wrapper output failed to compile\n{}",
+        String::from_utf8_lossy(&wrapper_check.stderr)
+    );
+}
+
+#[test]
 fn ffi_and_keep_rules_pin_exactly_what_they_should() {
     let out = shared();
     let main_rs = read(out, "src/main.rs");
@@ -852,6 +1002,68 @@ fn dynamic_tauri() -> &'static Path {
         .1
 }
 
+/// The integration corpus is a real Tauri 2 project, not a hand-written
+/// parser fixture: the generated tree is checked with Cargo and its shipped
+/// frontend is built before the protocol assertions below run.
+#[test]
+fn real_tauri_integration_fixture_is_verified_end_to_end() {
+    let out = static_tauri();
+    assert!(out.join("src-tauri/Cargo.toml").is_file());
+    assert!(out.join("src-tauri/tauri.conf.json").is_file());
+    assert!(out.join("frontend/dist").is_dir());
+    assert!(read(out, "src-tauri/Cargo.toml").contains("tauri"));
+
+    let generated_report = report(out);
+    let verification = generated_report["verification"]
+        .as_array()
+        .expect("verification stages");
+    for stage in verification {
+        assert_eq!(stage["passed"], true, "verification failed: {stage}");
+    }
+    assert!(
+        verification
+            .iter()
+            .any(|stage| stage["stage"] == "cargo-check"),
+        "real Tauri fixture must pass cargo-check: {verification:?}"
+    );
+    assert!(
+        verification
+            .iter()
+            .any(|stage| stage["stage"] == "npm-build"),
+        "real Tauri fixture must build its shipped frontend: {verification:?}"
+    );
+
+    let release = Command::new("cargo")
+        .args(["build", "--release", "--locked"])
+        .current_dir(out.join("src-tauri"))
+        .output()
+        .expect("building the transformed Tauri release library");
+    assert!(
+        release.status.success(),
+        "transformed Tauri release build failed\n{}",
+        String::from_utf8_lossy(&release.stderr)
+    );
+    let release_dir = out.join("src-tauri/target/release");
+    let artifact = ["libtauri_ipc_static_lib.rlib", "tauri_ipc_static_lib.lib"]
+        .iter()
+        .map(|name| release_dir.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("release artifact missing under {}", release_dir.display()));
+    let scan = Command::new(binary())
+        .args(["scan-binary", "--binary"])
+        .arg(&artifact)
+        .args(["--mapping"])
+        .arg(out.join(".obfuscator/mapping.json"))
+        .output()
+        .expect("scanning transformed Tauri release artifact");
+    assert!(
+        scan.status.success(),
+        "transformed Tauri binary leak scan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+}
+
 #[test]
 fn frontend_semantic_rename_keeps_protocol_and_property_names() {
     let tmp = TempDir::new().expect("temp dir");
@@ -1007,7 +1219,7 @@ fn tauri_commands_move_together_across_both_languages() {
     assert_eq!(renamed.len(), 4, "{renamed:?}");
     assert!(renamed.contains_key("get_user_info"));
     assert!(
-        renamed.contains_key("ping"),
+        renamed.contains_key("probe_vault_health"),
         "the short-form attribute must be found"
     );
 
@@ -1047,7 +1259,7 @@ fn tauri_commands_move_together_across_both_languages() {
 fn tauri_rust_command_literals_are_rewritten() {
     let out = static_tauri();
     let allow = read(out, "src-tauri/src/allow.rs");
-    // The three the fixture actually lists. `ping` is reached through the
+    // The three the fixture actually lists. probe_vault_health is reached through the
     // handler list and the frontend wrapper, not through the allow-list.
     let renamed: BTreeMap<String, String> = mapping(out)["commands"]
         .as_object()
@@ -1123,7 +1335,12 @@ fn tauri_commands_are_owned_by_the_command_pass() {
         .cloned()
         .unwrap_or_default();
     for key in symbols.keys() {
-        for command in ["get_user_info", "activate_license", "sync_state", "ping"] {
+        for command in [
+            "get_user_info",
+            "activate_license",
+            "sync_state",
+            "probe_vault_health",
+        ] {
             assert!(
                 !key.ends_with(&format!("::{command}")),
                 "`{command}` was also renamed by the symbol pass as `{key}`"

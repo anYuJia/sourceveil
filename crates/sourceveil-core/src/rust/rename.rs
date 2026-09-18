@@ -21,14 +21,18 @@
 
 use super::analysis::RustAnalysis;
 use super::candidates::{self, Candidate, FileContext, Visibility};
-use crate::edits::{EditPlan, SourceRef};
+use crate::edits::{Contribution, EditPlan, FileMove};
 use crate::mapping::Mapping;
 use crate::names::{NameDeriver, SeedDomain};
 use crate::plan::Plan;
 use crate::report::{RenameStats, SkipReason, SkippedSymbol};
-use crate::scanner::{CrateGraph, CrateInfo};
+use crate::rust::ItemKind;
+use crate::scanner::{
+    is_root_like, path_eq, path_starts_with, strip_prefix_path, CrateGraph, CrateInfo,
+};
 use anyhow::Result;
 use ra_ap_ide::{FileId, FilePosition, Indel, RenameConfig, SourceChange, TextSize};
+use ra_ap_ide_db::source_change::FileSystemEdit;
 use ra_ap_syntax::ast::AstNode;
 use ra_ap_syntax::TextRange;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -168,7 +172,16 @@ pub fn run(
             }
         };
 
-        match stage_change(analysis, change, candidate, req, &analyzed_text, plan) {
+        let allow_file_moves = candidate.kind == ItemKind::Module && req.plan.rename.module_files;
+        match stage_change(
+            analysis,
+            change,
+            candidate,
+            req,
+            &analyzed_text,
+            plan,
+            allow_file_moves,
+        ) {
             Ok((applied, files)) => {
                 outcome.stats.bump(candidate.kind);
                 outcome.stats.edits_applied += applied;
@@ -278,8 +291,29 @@ fn stage_change(
     req: &RenameRequest<'_>,
     analyzed_text: &BTreeMap<PathBuf, String>,
     plan: &mut EditPlan,
+    allow_file_moves: bool,
 ) -> std::result::Result<(usize, Vec<PathBuf>), Skip> {
-    let by_file = resolve_change_edits(analysis, req.input_root, req.copied, &change)?;
+    let (by_file, file_moves) = if allow_file_moves {
+        if analyzed_text
+            .values()
+            .any(|text| text.contains("include!("))
+        {
+            return Err((
+                SkipReason::RequiresFileRename,
+                Some(
+                    "module file moves are disabled when include! paths are present; \
+                     rust-analyzer cannot prove those macro-relative paths"
+                        .into(),
+                ),
+            ));
+        }
+        resolve_change_edits_with_file_moves(analysis, req.input_root, req.copied, &change)?
+    } else {
+        (
+            resolve_change_edits(analysis, req.input_root, req.copied, &change)?,
+            Vec::new(),
+        )
+    };
 
     // Verify the definition site is among the edits. If rust-analyzer resolved
     // the position to something other than the item we think we are renaming,
@@ -303,19 +337,11 @@ fn stage_change(
         ));
     }
 
-    // All-or-nothing across every file the rename touches, not just within one.
-    for (path, indels) in &by_file {
-        for indel in indels {
-            if let Some(clash) = plan.would_conflict(path, indel) {
-                return Err((SkipReason::EditConflict, Some(clash.to_string())));
-            }
-        }
-    }
-
     let staged = by_file.values().map(Vec::len).sum();
     let touched: Vec<PathBuf> = by_file.keys().cloned().collect();
-    for (path, indels) in by_file {
-        for indel in &indels {
+    let mut contributions = Vec::with_capacity(by_file.len());
+    for (path, indels) in &by_file {
+        for indel in indels {
             tracing::debug!(
                 symbol = %candidate.name,
                 file = %path.display(),
@@ -325,7 +351,7 @@ fn stage_change(
                 "staged edit"
             );
         }
-        let Some(text) = analyzed_text.get(&path) else {
+        let Some(text) = analyzed_text.get(path) else {
             return Err((
                 SkipReason::EditOutsideOutput,
                 Some(format!(
@@ -334,15 +360,183 @@ fn stage_change(
                 )),
             ));
         };
-        if let Err(clash) = plan.stage(SourceRef { path: &path, text }, indels) {
-            // Unreachable: the same spans were checked above. Reported rather
-            // than unwrapped, because a panic here would be a bug in this
-            // function and not in the project being transformed.
-            return Err((SkipReason::EditConflict, Some(clash.to_string())));
-        }
+        contributions.push(Contribution::new(path, text, indels.clone()));
     }
 
+    // Stage the text edits and every associated file move on a clone. A move
+    // conflict must not leave the rename's source edits (or an earlier move
+    // from the same semantic change) in the shared plan.
+    let mut trial = plan.clone();
+    if let Err(error) = trial.stage_transaction(contributions) {
+        return Err((SkipReason::EditConflict, Some(error.to_string())));
+    }
+    for file_move in file_moves {
+        if let Err(detail) = trial.stage_move(file_move) {
+            return Err((SkipReason::EditConflict, Some(detail)));
+        }
+    }
+    *plan = trial;
+
     Ok((staged, touched))
+}
+
+type ResolvedFileMoves = (BTreeMap<PathBuf, Vec<Indel>>, Vec<FileMove>);
+
+/// Resolve a semantic rename that includes rust-analyzer's module file-system
+/// edits. The ordinary symbol pass deliberately rejects those edits; module
+/// file renaming opts into them only after the source/destination paths have
+/// been proven to stay within the copied workspace.
+fn resolve_change_edits_with_file_moves(
+    analysis: &RustAnalysis,
+    input_root: &Path,
+    copied: &BTreeSet<PathBuf>,
+    change: &SourceChange,
+) -> std::result::Result<ResolvedFileMoves, Skip> {
+    let mut by_file = BTreeMap::new();
+    for (file_id, (text_edit, _snippet)) in change.source_file_edits.iter() {
+        let Some(abs) = resolve_edit_target(analysis, input_root, copied, *file_id) else {
+            return Err((
+                SkipReason::EditOutsideOutput,
+                Some(format!(
+                    "edit targets file id {file_id:?}, which is not a copied workspace file"
+                )),
+            ));
+        };
+        by_file
+            .entry(abs)
+            .or_insert_with(Vec::new)
+            .extend(text_edit.iter().cloned());
+    }
+
+    if change.file_system_edits.is_empty() {
+        return Err((
+            SkipReason::Unresolvable,
+            Some("module rename did not produce a file move".into()),
+        ));
+    }
+
+    let mut moves = Vec::new();
+    for fs_edit in &change.file_system_edits {
+        let file_move = match fs_edit {
+            FileSystemEdit::MoveFile { src, dst } => {
+                let Some(source) = analysis.file_path(*src) else {
+                    return Err((
+                        SkipReason::RequiresFileRename,
+                        Some("module move source has no filesystem path".into()),
+                    ));
+                };
+                let Some(destination) = resolve_anchored_path(analysis, dst) else {
+                    return Err((
+                        SkipReason::RequiresFileRename,
+                        Some("module move destination has no filesystem path".into()),
+                    ));
+                };
+                FileMove {
+                    source,
+                    destination,
+                    directory: false,
+                }
+            }
+            FileSystemEdit::MoveDir { src, dst, .. } => {
+                let Some(source) = resolve_anchored_path(analysis, src) else {
+                    return Err((
+                        SkipReason::RequiresFileRename,
+                        Some("module directory move source has no filesystem path".into()),
+                    ));
+                };
+                let Some(destination) = resolve_anchored_path(analysis, dst) else {
+                    return Err((
+                        SkipReason::RequiresFileRename,
+                        Some("module directory move destination has no filesystem path".into()),
+                    ));
+                };
+                FileMove {
+                    source,
+                    destination,
+                    directory: true,
+                }
+            }
+            FileSystemEdit::CreateFile { .. } => {
+                return Err((
+                    SkipReason::RequiresFileRename,
+                    Some("module rename requested file creation, not a simple move".into()),
+                ));
+            }
+        };
+
+        let source_rel = strip_prefix_path(&file_move.source, input_root);
+        let destination_rel = strip_prefix_path(&file_move.destination, input_root);
+        let (Some(source_rel), Some(_destination_rel)) = (source_rel, destination_rel) else {
+            return Err((
+                SkipReason::EditOutsideOutput,
+                Some(format!(
+                    "module move {} -> {} leaves the copied workspace",
+                    file_move.source.display(),
+                    file_move.destination.display()
+                )),
+            ));
+        };
+
+        if file_move.directory {
+            if !copied.iter().any(|p| p.starts_with(&source_rel)) {
+                return Err((
+                    SkipReason::EditOutsideOutput,
+                    Some(format!(
+                        "module directory {} contains no copied source files",
+                        source_rel.display()
+                    )),
+                ));
+            }
+        } else if !copied.contains(&source_rel) {
+            return Err((
+                SkipReason::EditOutsideOutput,
+                Some(format!(
+                    "module file {} was not copied into the output",
+                    source_rel.display()
+                )),
+            ));
+        }
+
+        moves.push(file_move);
+    }
+
+    if by_file.is_empty() {
+        return Err((
+            SkipReason::Unresolvable,
+            Some("rust-analyzer produced no text edits for the module rename".into()),
+        ));
+    }
+    Ok((by_file, moves))
+}
+
+fn resolve_anchored_path(
+    analysis: &RustAnalysis,
+    path: &ra_ap_vfs::AnchoredPathBuf,
+) -> Option<PathBuf> {
+    let anchor = analysis.file_path(path.anchor)?;
+    let parent = anchor.parent()?;
+    Some(normalize_path(&parent.join(&path.path)))
+}
+
+/// Normalize an anchored rust-analyzer path without touching the filesystem.
+/// `MoveDir` commonly uses paths such as `src/auth/../auth`; lexical
+/// normalization is required before comparing them with the copier's relative
+/// file set, and `canonicalize` cannot be used because a destination does not
+/// exist yet.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Map a rust-analyzer `FileId` onto the output tree, refusing anything we did
@@ -359,8 +553,8 @@ pub(crate) fn resolve_edit_target(
     file_id: FileId,
 ) -> Option<PathBuf> {
     let abs = analysis.file_path(file_id)?;
-    let rel = abs.strip_prefix(input_root).ok()?;
-    copied.contains(rel).then_some(abs)
+    let rel = strip_prefix_path(&abs, input_root)?;
+    copied.contains(&rel).then_some(abs)
 }
 
 fn skipped_for(candidate: &Candidate, reason: SkipReason, detail: Option<String>) -> SkippedSymbol {
@@ -390,14 +584,14 @@ fn skipped_for(candidate: &Candidate, reason: SkipReason, detail: Option<String>
 ///   at any depth is what swept in `target/` in the first place.
 pub(crate) fn crate_for_file<'a>(graph: &'a CrateGraph, path: &Path) -> Option<&'a CrateInfo> {
     if let Some(target) = &graph.target_directory {
-        if path.starts_with(target) {
+        if path_starts_with(path, target) {
             return None;
         }
     }
 
     let mut best: Option<(&CrateInfo, usize)> = None;
     let mut consider = |krate: &'a CrateInfo, dir: &Path| {
-        if !path.starts_with(dir) {
+        if !path_starts_with(path, dir) {
             return;
         }
         let depth = dir.components().count();
@@ -410,7 +604,10 @@ pub(crate) fn crate_for_file<'a>(graph: &'a CrateGraph, path: &Path) -> Option<&
         if let Some(src_dir) = &krate.src_dir {
             consider(krate, src_dir);
         }
-        if path.parent() == Some(krate.manifest_dir.as_path()) {
+        if path
+            .parent()
+            .is_some_and(|parent| path_eq(parent, &krate.manifest_dir))
+        {
             consider(krate, &krate.manifest_dir);
         }
     }
@@ -502,7 +699,7 @@ pub fn collect_syntax_facts(
 /// token tree, notice its parent is not `MACRO_CALL`, and conclude the token is
 /// ordinary code. The walk has to continue outwards until it either finds a
 /// token tree belonging to a macro or runs out of ancestors.
-fn is_inside_macro_token_tree(token: &ra_ap_syntax::SyntaxToken) -> bool {
+pub(crate) fn is_inside_macro_token_tree(token: &ra_ap_syntax::SyntaxToken) -> bool {
     use ra_ap_syntax::SyntaxKind as K;
     let mut node = token.parent();
     while let Some(current) = node {
@@ -532,6 +729,7 @@ const LINKAGE_ATTRIBUTES: &[&str] = &[
 /// The keep rules, compiled once.
 struct KeepRules {
     rename: crate::plan::RenamePlan,
+    dependencies: crate::plan::DependenciesPlan,
     symbols: HashSet<String>,
     patterns: globset::GlobSet,
     attributes: HashSet<String>,
@@ -570,6 +768,7 @@ impl KeepRules {
 
         Self {
             rename: plan.rename.clone(),
+            dependencies: plan.dependencies.clone(),
             symbols,
             patterns: crate::copier::build_globset(&plan.keep.patterns)
                 .unwrap_or_else(|_| globset::GlobSet::empty()),
@@ -589,6 +788,35 @@ impl KeepRules {
 
         if self.symbols.contains(&candidate.name) || self.patterns.is_match(&candidate.name) {
             return Some(SkipReason::KeepRule);
+        }
+
+        // Workspace members are inside the requested closed world. Local path
+        // dependencies outside that workspace (and registry/git packages)
+        // default to an external boundary unless the dependency policy opts
+        // them in explicitly.
+        if let Some(krate) = crate_for_file(graph, &candidate.file) {
+            if !is_root_like(graph, &krate.name) {
+                match self.dependencies.mode_for(&krate.name) {
+                    crate::config::DependencyMode::External
+                    | crate::config::DependencyMode::Wrapper => {
+                        return Some(SkipReason::DependencyExternal);
+                    }
+                    crate::config::DependencyMode::PrivateObfuscate
+                        if candidate.visibility == Visibility::Public =>
+                    {
+                        return Some(SkipReason::ExternallyReachable);
+                    }
+                    crate::config::DependencyMode::PrivateObfuscate
+                    | crate::config::DependencyMode::Obfuscate => {}
+                }
+            }
+        }
+
+        if candidate.kind == ItemKind::Module
+            && self.rename.module_files
+            && candidate.attributes.iter().any(|a| a == "path")
+        {
+            return Some(SkipReason::RequiresFileRename);
         }
 
         // The wire-format rule.

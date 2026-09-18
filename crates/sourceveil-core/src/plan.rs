@@ -102,7 +102,15 @@ pub struct DependenciesPlan {
 
 impl DependenciesPlan {
     pub fn mode_for(&self, name: &str) -> DependencyMode {
-        self.crates.get(name).copied().unwrap_or(self.default)
+        self.crates
+            .get(name)
+            // Cargo permits a package such as `helper-lib` to be imported as
+            // `helper_lib`; accepting both spellings makes the policy match
+            // either the package name reported by metadata or the alias in
+            // source/config without weakening the default boundary.
+            .or_else(|| self.crates.get(&name.replace('-', "_")))
+            .copied()
+            .unwrap_or(self.default)
     }
 }
 
@@ -203,13 +211,6 @@ impl Plan {
             name_len: (name_len_min, name_len_max),
         };
 
-        if rename.module_files {
-            unsupported.push(
-                "rename.module_files: physical module-file renaming is a V2 pass; \
-                 module identifiers will be renamed but files stay in place"
-                    .to_string(),
-            );
-        }
         if rename.locals || rename.params {
             unsupported.push(
                 "rename.locals/params: local-binding rename is not implemented in this build"
@@ -386,6 +387,23 @@ mod tests {
         assert!(p.frontend.enabled);
         assert!(p.frontend.rename_private_identifiers);
         assert!(!p.unsupported.iter().any(|u| u.contains("frontend.*")));
+    }
+
+    #[test]
+    fn module_file_rename_is_explicitly_supported() {
+        let p = plan("[rename]\nmodule_files = true\n");
+        assert!(p.rename.module_files);
+        assert!(!p.unsupported.iter().any(|u| u.contains("module_files")));
+    }
+
+    #[test]
+    fn dependency_modes_resolve_by_package_name() {
+        let p = plan("[dependencies]\nhelper_lib = \"private-obfuscate\"\n");
+        assert_eq!(
+            p.dependencies.mode_for("helper_lib"),
+            DependencyMode::PrivateObfuscate
+        );
+        assert_eq!(p.dependencies.mode_for("unknown"), DependencyMode::External);
     }
 
     #[test]

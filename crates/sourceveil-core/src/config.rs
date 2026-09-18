@@ -93,10 +93,11 @@ pub struct Rename {
     pub consts: Option<bool>,
     pub statics: Option<bool>,
     /// Inline `mod name { .. }` blocks. File-backed `mod name;` additionally
-    /// moves the file; that only happens when `module_files` is also enabled.
+    /// moves the file when `module_files` is enabled.
     pub modules: Option<bool>,
-    /// Physically rename `foo.rs` / `foo/mod.rs` alongside the module.
-    /// V2 capability; defaults to `false` even under `balanced`.
+    /// Physically rename `foo.rs` / `foo/mod.rs` alongside the module. This is
+    /// opt-in because a file path can be referenced by build scripts or tools
+    /// outside Cargo's semantic graph.
     pub module_files: Option<bool>,
     /// Local `macro_rules!` definitions.
     pub macros: Option<bool>,
@@ -387,6 +388,18 @@ mod tests {
         assert_eq!(
             c.dependencies.crates["core_lib"].mode(),
             DependencyMode::PrivateObfuscate
+        );
+
+        let hyphen = Config::parse(
+            r#"
+            [dependencies]
+            "helper-lib" = "wrapper"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            hyphen.dependencies.crates["helper-lib"].mode(),
+            DependencyMode::Wrapper
         );
     }
 }
