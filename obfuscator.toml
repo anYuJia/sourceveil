@@ -64,9 +64,9 @@ name_len_min = 5
 name_len_max = 9
 
 [strings]
-# String protection is not implemented in this build. The settings are accepted
-# so that a config written today keeps working, and are reported as unsupported
-# rather than silently ignored.
+# Runtime Rust string protection. `balanced` enables the pass and internal
+# machine-like literals by default. Compile-time, macro, pattern and ABI
+# contexts remain untouched.
 enabled = false
 logs = false
 errors = false

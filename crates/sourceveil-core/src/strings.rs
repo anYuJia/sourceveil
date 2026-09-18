@@ -1,0 +1,578 @@
+//! Runtime string-literal protection.
+//!
+//! This pass is intentionally narrower than "encrypt every string". It only
+//! rewrites ordinary runtime Rust string expressions whose type can remain
+//! \`&'static str\`. Compile-time contexts (attributes, macro token trees,
+//! const/static initialisers, patterns, ABI strings, const fn bodies) are left
+//! alone.
+//!
+//! A protected value is transformed only when *every* occurrence selected for
+//! protection is safe. That makes the mapping honest: once a value appears in
+//! \`mapping.strings\`, source/binary leak scans may require the original
+//! plaintext to be gone.
+//!
+//! The runtime representation uses a per-occurrence HMAC-derived seed and a
+//! tiny xorshift64* stream. This is obfuscation, not cryptographic secrecy: the
+//! decoder and seed ship in the client. Its purpose is to remove plaintext from
+//! static string tables and break the strings -> XREF shortcut.
+
+use crate::edits::{replace, Contribution, EditPlan};
+use crate::plan::StringsPlan;
+use crate::rust::analysis::RustAnalysis;
+use crate::rust::rename::crate_for_file;
+use crate::scanner::CrateGraph;
+use anyhow::Result;
+use hmac::{Hmac, Mac};
+use ra_ap_syntax::ast::{self, AstNode, AstToken, HasAttrs};
+use sha2::Sha256;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
+
+const STREAM_MULTIPLIER: u64 = 0x2545_F491_4F6C_DD1D;
+
+#[derive(Debug, Clone, Default)]
+pub struct StringOutcome {
+    pub files_scanned: usize,
+    pub values_discovered: usize,
+    pub occurrences_discovered: usize,
+    pub values_protected: usize,
+    pub occurrences_protected: usize,
+    pub kept_unsafe_context: usize,
+    pub kept_conflict: usize,
+    pub files_edited: BTreeSet<PathBuf>,
+    /// Original plaintext -> representation marker.
+    pub mapping: BTreeMap<String, String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Occurrence {
+    file: PathBuf,
+    source: String,
+    start: u32,
+    end: u32,
+    safe: bool,
+}
+
+pub struct StringRequest<'a> {
+    pub input_root: &'a Path,
+    pub copied: &'a BTreeSet<PathBuf>,
+    pub graph: &'a CrateGraph,
+    pub plan: &'a StringsPlan,
+    pub seed: u64,
+    /// Tauri commands/events (renamed or kept). The string pass must never
+    /// reinterpret those protocol values as ordinary literals.
+    pub reserved_protocol_values: &'a HashSet<String>,
+}
+
+pub fn run(
+    analysis: &RustAnalysis,
+    req: &StringRequest<'_>,
+    edits: &mut EditPlan,
+) -> Result<StringOutcome> {
+    let mut out = StringOutcome::default();
+    if !req.plan.enabled {
+        return Ok(out);
+    }
+
+    // First find no_std crates. A block-local OnceLock relies on std, so these
+    // crates are deliberately out of scope rather than made to compile by
+    // smuggling std into them.
+    let mut no_std_crates = HashSet::new();
+    let mut parsed_files = Vec::new();
+    for (file_id, path) in analysis.rust_files() {
+        let Ok(rel) = path.strip_prefix(req.input_root) else {
+            continue;
+        };
+        if !req.copied.contains(rel) {
+            continue;
+        }
+        let Some((parsed, source)) = analysis.parse(file_id) else {
+            continue;
+        };
+        if has_no_std_attribute(&parsed) {
+            if let Some(krate) = crate_for_file(req.graph, &path) {
+                no_std_crates.insert(krate.name.clone());
+            }
+        }
+        parsed_files.push((path, parsed, source));
+    }
+
+    let mut by_value: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
+
+    for (path, parsed, source) in parsed_files {
+        let Some(krate) = crate_for_file(req.graph, &path) else {
+            continue;
+        };
+        if no_std_crates.contains(&krate.name) {
+            continue;
+        }
+        out.files_scanned += 1;
+
+        for token in parsed
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::String::cast)
+        {
+            let text = token.text();
+            let Ok(lit) = syn::parse_str::<syn::LitStr>(text) else {
+                continue;
+            };
+            let value = lit.value();
+            if classify(&value, req.plan).is_none() {
+                continue;
+            }
+            if req.reserved_protocol_values.contains(&value) {
+                continue;
+            }
+
+            let range = token.syntax().text_range();
+            let start = u32::from(range.start());
+            let end = u32::from(range.end());
+            let safe = !forbidden_context(token.syntax());
+
+            by_value.entry(value).or_default().push(Occurrence {
+                file: path.clone(),
+                source: source.clone(),
+                start,
+                end,
+                safe,
+            });
+        }
+    }
+
+    out.values_discovered = by_value.len();
+    out.occurrences_discovered = by_value.values().map(Vec::len).sum();
+
+    for (value, mut occurrences) in by_value {
+        // One unsafe occurrence keeps this plaintext globally. Otherwise
+        // mapping.strings would promise the leak scanner that it disappeared
+        // when it did not.
+        if occurrences.iter().any(|occ| !occ.safe) {
+            out.kept_unsafe_context += 1;
+            tracing::debug!(
+                value = %value,
+                occurrences = occurrences.len(),
+                "keeping string because at least one occurrence is compile-time/ambiguous"
+            );
+            continue;
+        }
+
+        // rust-analyzer's file iteration order is an implementation detail.
+        // Sort before assigning ordinals so identical inputs produce the same
+        // per-occurrence identity on every host.
+        occurrences.sort_by(|left, right| {
+            left.file
+                .cmp(&right.file)
+                .then_with(|| left.start.cmp(&right.start))
+        });
+
+        let mut contributions_by_file: BTreeMap<PathBuf, (String, Vec<ra_ap_ide::Indel>)> =
+            BTreeMap::new();
+        let mut occurrence_ordinals: BTreeMap<String, u64> = BTreeMap::new();
+
+        for occ in &occurrences {
+            let file_identity = relative_file_identity(req.input_root, &occ.file);
+            let ordinal = occurrence_ordinals
+                .entry(file_identity.clone())
+                .or_default();
+            let stream_seed = derive_stream_seed(req.seed, &file_identity, &value, *ordinal);
+            *ordinal += 1;
+            let encoded = encode(value.as_bytes(), stream_seed);
+            let replacement = protected_expression(&encoded, stream_seed);
+
+            let entry = contributions_by_file
+                .entry(occ.file.clone())
+                .or_insert_with(|| (occ.source.clone(), Vec::new()));
+            entry.1.push(replace(occ.start, occ.end, replacement));
+        }
+
+        let contributions: Vec<Contribution<'_>> = contributions_by_file
+            .iter()
+            .map(|(path, (source, indels))| Contribution::new(path, source, indels.clone()))
+            .collect();
+
+        match edits.stage_transaction(contributions) {
+            Ok(applied) => {
+                out.values_protected += 1;
+                out.occurrences_protected += applied;
+                out.files_edited
+                    .extend(contributions_by_file.keys().cloned());
+                out.mapping
+                    .insert(value, "runtime-xorshift64star".to_string());
+            }
+            Err(error) => {
+                out.kept_conflict += 1;
+                tracing::debug!(%error, "keeping string because its edit transaction conflicted");
+            }
+        }
+    }
+
+    if !no_std_crates.is_empty() {
+        out.warnings.push(format!(
+            "string protection skipped {} no_std crate(s): {}",
+            no_std_crates.len(),
+            {
+                let mut names: Vec<_> = no_std_crates.into_iter().collect();
+                names.sort();
+                names.join(", ")
+            }
+        ));
+    }
+
+    Ok(out)
+}
+
+fn has_no_std_attribute(parsed: &ast::SourceFile) -> bool {
+    parsed
+        .attrs()
+        .filter(|attr| attr.kind().is_inner())
+        .flat_map(|attr| attr.skip_cfg_attrs().into_iter())
+        .any(|meta| meta.simple_name().is_some_and(|name| name == "no_std"))
+}
+
+fn relative_file_identity(root: &Path, file: &Path) -> String {
+    file.strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Which configured class owns this value.
+///
+/// The default balanced profile only enables \`internal\`, and this deliberately
+/// recognises machine-like semantic strings rather than every piece of copy.
+fn classify(value: &str, plan: &StringsPlan) -> Option<&'static str> {
+    if value.len() < 4 || value.len() > 1024 || value.contains('\0') {
+        return None;
+    }
+
+    let lower = value.to_ascii_lowercase();
+    let endpoint = lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ws://")
+        || lower.starts_with("wss://");
+    if endpoint {
+        return plan.endpoints.then_some("endpoint");
+    }
+
+    let looks_ui = value.chars().any(char::is_whitespace) || !value.is_ascii();
+    if looks_ui {
+        return plan.ui.then_some("ui");
+    }
+
+    if !plan.internal {
+        return None;
+    }
+
+    let has_alpha = value.bytes().any(|b| b.is_ascii_alphabetic());
+    let has_semantic_separator = value
+        .bytes()
+        .any(|b| matches!(b, b'_' | b'-' | b':' | b'/' | b'.'));
+    let protocol_style = has_alpha
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'));
+
+    (has_alpha && (has_semantic_separator || protocol_style)).then_some("internal")
+}
+
+/// Contexts where replacing a literal expression with a runtime block would
+/// change whether the source is const-evaluable, pattern syntax, ABI syntax, or
+/// macro/attribute input.
+fn forbidden_context(token: &ra_ap_syntax::SyntaxToken) -> bool {
+    let mut current = token.parent();
+    while let Some(node) = current {
+        let kind = format!("{:?}", node.kind());
+
+        if matches!(
+            kind.as_str(),
+            "ATTR"
+                | "TOKEN_TREE"
+                | "CONST"
+                | "STATIC"
+                | "ABI"
+                | "EXTERN_CRATE"
+                | "CONST_ARG"
+                | "CONST_PARAM"
+                | "ARRAY_TYPE"
+        ) || kind.ends_with("_PAT")
+        {
+            return true;
+        }
+
+        if kind.starts_with("ASM_")
+            || kind.starts_with("FORMAT_ARGS_")
+            || kind == "INCLUDE_BYTES_EXPR"
+        {
+            return true;
+        }
+
+        if kind == "BLOCK_EXPR"
+            && ast::BlockExpr::cast(node.clone()).is_some_and(|block| block.const_token().is_some())
+        {
+            return true;
+        }
+
+        if kind == "FN" {
+            if ast::Fn::cast(node).is_some_and(|function| function.const_token().is_some()) {
+                return true;
+            }
+            // Once a normal runtime function owns the literal, outer item
+            // syntax cannot make the expression const.
+            return false;
+        }
+
+        current = node.parent();
+    }
+    false
+}
+
+fn derive_stream_seed(build_seed: u64, file_identity: &str, value: &str, ordinal: u64) -> u64 {
+    let mut mac = Hmac::<Sha256>::new_from_slice(&build_seed.to_be_bytes())
+        .expect("HMAC accepts every key length");
+    mac.update(b"protected-string\0");
+    mac.update(file_identity.as_bytes());
+    mac.update(b"\0");
+    mac.update(value.as_bytes());
+    mac.update(b"\0");
+    mac.update(&ordinal.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    // xorshift's all-zero state is absorbing.
+    u64::from_be_bytes(bytes) | 1
+}
+
+fn next_stream_byte(state: &mut u64) -> u8 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    (state.wrapping_mul(STREAM_MULTIPLIER) >> 56) as u8
+}
+
+fn encode(value: &[u8], seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    value
+        .iter()
+        .map(|byte| byte ^ next_stream_byte(&mut state))
+        .collect()
+}
+
+fn protected_expression(encoded: &[u8], seed: u64) -> String {
+    let bytes = encoded
+        .iter()
+        .map(|byte| format!("0x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "{{\
+static __SV: ::std::sync::OnceLock<::std::string::String> = ::std::sync::OnceLock::new();\
+__SV.get_or_init(|| {{\
+let mut __b = ::std::vec![{bytes}];\
+let mut __s: u64 = 0x{seed:016x};\
+for __x in &mut __b {{\
+__s ^= __s >> 12;\
+__s ^= __s << 25;\
+__s ^= __s >> 27;\
+*__x ^= (__s.wrapping_mul(0x{STREAM_MULTIPLIER:016x}) >> 56) as u8;\
+}}\
+::std::string::String::from_utf8_lossy(&__b).into_owned()\
+}}).as_str()\
+}}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::StringsPlan;
+
+    fn balanced_strings() -> StringsPlan {
+        StringsPlan {
+            enabled: true,
+            internal: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn encoding_roundtrips_with_the_runtime_stream() {
+        let original = b"license-check";
+        let seed = 0x1234_5678_9abc_def1;
+        let mut encoded = encode(original, seed);
+        let mut state = seed;
+        for byte in &mut encoded {
+            *byte ^= next_stream_byte(&mut state);
+        }
+        assert_eq!(encoded, original);
+    }
+
+    #[test]
+    fn string_seed_is_stable_and_identity_specific() {
+        assert_eq!(
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0)
+        );
+        assert_ne!(
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/lib.rs", "license-check", 1)
+        );
+        assert_ne!(
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/other.rs", "license-check", 0)
+        );
+        assert_ne!(
+            derive_stream_seed(7, "src/lib.rs", "license-check", 0),
+            derive_stream_seed(7, "src/lib.rs", "other-value", 0)
+        );
+    }
+
+    #[test]
+    fn file_identity_is_relative_and_separator_stable() {
+        assert_eq!(
+            relative_file_identity(
+                Path::new("/checkout/one"),
+                Path::new("/checkout/one/src/lib.rs")
+            ),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            relative_file_identity(
+                Path::new("/checkout/two"),
+                Path::new("/checkout/two/src/lib.rs")
+            ),
+            "src/lib.rs"
+        );
+    }
+
+    fn forbidden_for(source: &str, value: &str) -> bool {
+        let file =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        file.syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::String::cast)
+            .find_map(|token| {
+                let literal = syn::parse_str::<syn::LitStr>(token.text()).ok()?;
+                (literal.value() == value).then(|| forbidden_context(token.syntax()))
+            })
+            .unwrap_or_else(|| panic!("string literal {value:?} not found in {source:?}"))
+    }
+
+    #[test]
+    fn compile_time_and_ambiguous_contexts_are_kept() {
+        let cases = [
+            (
+                "#![ no_std ]\nconst VALUE: &str = \"const-protocol\";",
+                "const-protocol",
+            ),
+            (
+                "#[cfg(feature = \"cfg-protocol\")] fn f() {}",
+                "cfg-protocol",
+            ),
+            (
+                "static VALUE: &str = \"static-protocol\";",
+                "static-protocol",
+            ),
+            (
+                "pub(crate) const fn f() -> &'static str { \"const-fn-protocol\" }",
+                "const-fn-protocol",
+            ),
+            (
+                "pub const unsafe fn f() -> &'static str { \"unsafe-const-fn\" }",
+                "unsafe-const-fn",
+            ),
+            (
+                "fn f() { let _ = match \"scrutinee\" { \"match-protocol\" => 1, _ => 0 }; }",
+                "match-protocol",
+            ),
+            (
+                "fn f() { let _: [u8; \"array-length-protocol\".len()] = []; }",
+                "array-length-protocol",
+            ),
+            (
+                "struct S<const N: usize>; type T = S<{ \"const-generic-protocol\".len() }>;",
+                "const-generic-protocol",
+            ),
+            (
+                "fn f() -> &'static str { const { \"inline-const-protocol\" } }",
+                "inline-const-protocol",
+            ),
+            (
+                "fn f() { format_args!(\"format-protocol\"); }",
+                "format-protocol",
+            ),
+            (
+                "fn f() { include_bytes!(\"include-protocol\"); }",
+                "include-protocol",
+            ),
+        ];
+        for (source, value) in cases {
+            assert!(
+                forbidden_for(source, value),
+                "context was treated as runtime: {source}"
+            );
+        }
+        assert!(!forbidden_for(
+            "fn f() -> &'static str { let value = \"runtime-protocol\"; value }",
+            "runtime-protocol"
+        ));
+    }
+
+    #[test]
+    fn no_std_detection_reads_inner_ast_attributes() {
+        for source in [
+            "#![no_std]\nfn f() {}",
+            "#![ no_std ]\nfn f() {}",
+            "#![cfg_attr(feature = \"std\", no_std)]\nfn f() {}",
+        ] {
+            let file =
+                ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+            assert!(has_no_std_attribute(&file), "missed no_std in {source:?}");
+        }
+        let file = ra_ap_syntax::SourceFile::parse(
+            "#[no_std]\nfn f() {}",
+            ra_ap_syntax::Edition::Edition2021,
+        )
+        .tree();
+        assert!(!has_no_std_attribute(&file));
+    }
+
+    #[test]
+    fn default_internal_classification_is_machine_like() {
+        let plan = balanced_strings();
+        assert_eq!(classify("license-check", &plan), Some("internal"));
+        assert_eq!(classify("HOLE_PUNCH_REQUEST", &plan), Some("internal"));
+        assert_eq!(classify("state.value", &plan), Some("internal"));
+        assert_eq!(classify("Connected", &plan), None);
+        assert_eq!(classify("Cancel download", &plan), None);
+        assert_eq!(classify("确定", &plan), None);
+    }
+
+    #[test]
+    fn endpoint_and_ui_are_explicit_classes() {
+        let mut plan = balanced_strings();
+        assert_eq!(classify("https://example.invalid/api", &plan), None);
+        plan.endpoints = true;
+        assert_eq!(
+            classify("https://example.invalid/api", &plan),
+            Some("endpoint")
+        );
+
+        assert_eq!(classify("Download complete", &plan), None);
+        plan.ui = true;
+        assert_eq!(classify("Download complete", &plan), Some("ui"));
+    }
+
+    #[test]
+    fn generated_expression_contains_no_plaintext() {
+        let value = "device-validation";
+        let seed = 11;
+        let expression = protected_expression(&encode(value.as_bytes(), seed), seed);
+        assert!(!expression.contains(value));
+        assert!(expression.contains("OnceLock"));
+    }
+}

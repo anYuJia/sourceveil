@@ -408,6 +408,226 @@ fn refuses_to_write_into_a_populated_output_directory() {
 }
 
 // ---------------------------------------------------------------------------
+// runtime string protection
+// ---------------------------------------------------------------------------
+
+fn string_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/string-protection")
+        .canonicalize()
+        .expect("string fixture directory")
+}
+
+fn no_std_string_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/no-std-string")
+        .canonicalize()
+        .expect("no_std string fixture directory")
+}
+
+fn transform_strings_from(input: &Path, seed: &str) -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().expect("temp dir");
+    let out = tmp.path().join("generated");
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(&config, "version = 1\nprofile = \"balanced\"\n")
+        .expect("writing balanced config");
+
+    let result = Command::new(binary())
+        .arg("transform")
+        .arg("--input")
+        .arg(input)
+        .arg("--output")
+        .arg(&out)
+        .arg("--config")
+        .arg(&config)
+        .args(["--seed", seed])
+        .output()
+        .expect("spawning cargo-obfuscator");
+    assert_succeeded(&result);
+    (tmp, out)
+}
+
+fn transform_strings(seed: &str) -> (TempDir, PathBuf) {
+    transform_strings_from(&string_fixture(), seed)
+}
+
+fn protected_payloads(root: &Path) -> Vec<String> {
+    let marker = "let mut __b = ::std::vec![";
+    let source = read(root, "src/main.rs");
+    let mut payloads = Vec::new();
+    let mut rest = source.as_str();
+    while let Some(start) = rest.find(marker) {
+        let bytes = &rest[start + marker.len()..];
+        let Some(end) = bytes.find("];") else {
+            break;
+        };
+        payloads.push(bytes[..end].to_string());
+        rest = &bytes[end + 2..];
+    }
+    payloads.sort();
+    payloads
+}
+
+#[test]
+fn balanced_protects_runtime_strings_without_changing_behaviour() {
+    let original = run_crate(&string_fixture());
+    let (_tmp, out) = transform_strings("20240917");
+
+    assert_eq!(
+        run_crate(&out),
+        original,
+        "runtime string protection changed program behaviour"
+    );
+
+    let source = all_source(&out);
+    for protected in ["license-check", "device-validation"] {
+        assert!(
+            !source.contains(&format!("\"{protected}\"")),
+            "protected plaintext {protected:?} remains as a Rust literal"
+        );
+        assert!(
+            mapping(&out)["strings"].get(protected).is_some(),
+            "{protected:?} is missing from mapping.strings"
+        );
+    }
+
+    // These are deliberately outside the safe runtime subset.
+    for kept in ["compile-time-protocol", "macro-protocol-name"] {
+        assert!(
+            source.contains(kept),
+            "{kept:?} lives in a compile-time/macro context and must be kept"
+        );
+        assert!(
+            mapping(&out)["strings"].get(kept).is_none(),
+            "a kept plaintext must not be advertised as protected"
+        );
+    }
+    assert!(
+        source.contains("mixed-protocol"),
+        "a value with one macro occurrence must be kept everywhere"
+    );
+    assert!(
+        mapping(&out)["strings"].get("mixed-protocol").is_none(),
+        "a mixed safe/unsafe value must not be advertised as protected"
+    );
+
+    let string_report = &report(&out)["strings"];
+    assert!(
+        string_report["values_protected"].as_u64().unwrap_or(0) >= 2,
+        "report did not count protected values: {string_report}"
+    );
+    assert!(
+        string_report["kept_unsafe_context"].as_u64().unwrap_or(0) >= 2,
+        "report did not expose compile-time/macro keeps: {string_report}"
+    );
+}
+
+#[test]
+fn no_std_crates_keep_runtime_string_literals() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("generated");
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(&config, "version = 1\nprofile = \"balanced\"\n").unwrap();
+    let result = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(no_std_string_fixture())
+        .args(["--output"])
+        .arg(&out)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--seed", "20240917", "--no-verify"])
+        .output()
+        .unwrap();
+    assert_succeeded(&result);
+
+    let source = read(&out, "src/lib.rs");
+    assert!(source.contains("\"no-std-protocol\""));
+    assert!(mapping(&out)["strings"].as_object().unwrap().is_empty());
+    assert!(report(&out)["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("no_std")));
+}
+
+#[test]
+fn string_protection_is_deterministic_per_seed() {
+    let (_a_tmp, a) = transform_strings("77");
+    let (_b_tmp, b) = transform_strings("77");
+    assert_eq!(source_tree(&a), source_tree(&b));
+
+    let (_c_tmp, c) = transform_strings("78");
+    assert_ne!(
+        read(&a, "src/main.rs"),
+        read(&c, "src/main.rs"),
+        "different release seeds should diversify encoded string bytes"
+    );
+}
+
+#[test]
+fn protected_strings_are_absent_from_the_release_binary() {
+    let (_tmp, out) = transform_strings("20240917");
+    let build = Command::new("cargo")
+        .args(["build", "--release", "--manifest-path"])
+        .arg(out.join("Cargo.toml"))
+        .output()
+        .expect("building transformed string fixture");
+    assert!(
+        build.status.success(),
+        "release build failed\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let binary_name = if cfg!(windows) {
+        "string-protection-fixture.exe"
+    } else {
+        "string-protection-fixture"
+    };
+    let artifact = out.join("target/release").join(binary_name);
+    let scan = Command::new(binary())
+        .args(["scan-binary", "--binary"])
+        .arg(&artifact)
+        .args(["--mapping"])
+        .arg(out.join(".obfuscator/mapping.json"))
+        .output()
+        .expect("scanning transformed release binary");
+    assert!(
+        scan.status.success(),
+        "protected string leaked into release binary\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+}
+
+#[test]
+fn string_identity_survives_checkout_and_unrelated_source_changes() {
+    let tmp = TempDir::new().unwrap();
+    let first_input = tmp.path().join("first-input");
+    let second_input = tmp.path().join("second-input");
+    copy_tree(&string_fixture(), &first_input);
+    copy_tree(&string_fixture(), &second_input);
+
+    let (_first_tmp, first) = transform_strings_from(&first_input, "991");
+    let (_second_tmp, second) = transform_strings_from(&second_input, "991");
+    assert_eq!(
+        protected_payloads(&first),
+        protected_payloads(&second),
+        "checkout path must not affect protected string bytes"
+    );
+
+    let main = second_input.join("src/main.rs");
+    let mut source = std::fs::read_to_string(&main).unwrap();
+    source.insert_str(0, "fn unrelated_item() -> u32 { 7 }\n\n");
+    std::fs::write(&main, source).unwrap();
+    let (_third_tmp, third) = transform_strings_from(&second_input, "991");
+    assert_eq!(
+        protected_payloads(&first),
+        protected_payloads(&third),
+        "adding an unrelated item must not re-encode existing occurrences"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // serde wire format
 // ---------------------------------------------------------------------------
 //

@@ -27,6 +27,7 @@ use crate::rust::rename::{self, RenameRequest, Shared};
 use crate::scanner::ProjectLayout;
 use crate::seed::{self, SeedInfo};
 use crate::serde::rename::{self as serde_rename, SerdeRenameRequest};
+use crate::strings::{self as string_protection, StringRequest};
 use crate::tauri::event::{self as tauri_event, EventRequest};
 use crate::tauri::{self, CommandRequest};
 use crate::verify::{self, VerifyContext};
@@ -111,7 +112,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     let mut command_stats = CommandStats::default();
     let mut event_stats = EventStats::default();
 
-    if !plan.rename.is_noop() || plan.tauri.commands || plan.tauri.events {
+    if !plan.rename.is_noop() || plan.tauri.commands || plan.tauri.events || plan.strings.enabled {
         let analysis_root = match plan.build.analyze {
             AnalyzeSource::Input => layout.rust_root.clone(),
             AnalyzeSource::Output => output_root.join(layout.rust_relative()),
@@ -253,6 +254,36 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 files = report.rename.files_edited,
                 "rename pass complete"
             );
+        }
+
+        if plan.strings.enabled {
+            let mut protocol_values = std::collections::HashSet::new();
+            protocol_values.extend(mapping.commands.keys().cloned());
+            protocol_values.extend(mapping.events.keys().cloned());
+            protocol_values.extend(command_stats.kept.iter().map(|item| item.name.clone()));
+            protocol_values.extend(event_stats.kept.iter().map(|item| item.name.clone()));
+
+            let request = StringRequest {
+                input_root: &layout.root,
+                copied: &copy.copied,
+                graph: &layout.crates,
+                plan: &plan.strings,
+                seed: seed.seed,
+                reserved_protocol_values: &protocol_values,
+            };
+            let outcome = string_protection::run(&analysis, &request, &mut edits)
+                .context("running the string protection pass")?;
+
+            report.strings = crate::report::StringStats {
+                values_discovered: outcome.values_discovered,
+                occurrences_discovered: outcome.occurrences_discovered,
+                values_protected: outcome.values_protected,
+                occurrences_protected: outcome.occurrences_protected,
+                kept_unsafe_context: outcome.kept_unsafe_context,
+                kept_conflict: outcome.kept_conflict,
+            };
+            mapping.strings.extend(outcome.mapping);
+            report.warnings.extend(outcome.warnings);
         }
 
         // Every pass has contributed; nothing has been written yet. This is the
