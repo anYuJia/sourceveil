@@ -50,6 +50,7 @@ pub mod rng;
 pub mod scanner;
 pub mod seed;
 pub mod serde;
+pub mod strings;
 pub mod tauri;
 pub mod verify;
 

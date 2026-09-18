@@ -273,6 +273,16 @@ impl EventStats {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StringStats {
+    pub values_discovered: usize,
+    pub occurrences_discovered: usize,
+    pub values_protected: usize,
+    pub occurrences_protected: usize,
+    pub kept_unsafe_context: usize,
+    pub kept_conflict: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub report_version: u32,
@@ -282,6 +292,7 @@ pub struct Report {
     pub rename: RenameStats,
     pub commands: CommandStats,
     pub events: EventStats,
+    pub strings: StringStats,
     /// Count of skipped symbols grouped by reason.
     pub skipped_by_reason: BTreeMap<String, usize>,
     pub skipped: Vec<SkippedSymbol>,
@@ -299,6 +310,7 @@ impl Report {
             rename: RenameStats::default(),
             commands: CommandStats::default(),
             events: EventStats::default(),
+            strings: StringStats::default(),
             skipped_by_reason: BTreeMap::new(),
             skipped: Vec::new(),
             verification: Vec::new(),
@@ -417,6 +429,16 @@ impl Report {
                 e.frontend_listen_refs
             );
             let _ = writeln!(w, "  dynamic event refs:         {}", e.dynamic_refs);
+        }
+
+        if self.strings.values_discovered > 0 {
+            let _ = writeln!(w);
+            let s = &self.strings;
+            let _ = writeln!(w, "String values discovered:    {}", s.values_discovered);
+            let _ = writeln!(w, "String values protected:     {}", s.values_protected);
+            let _ = writeln!(w, "String occurrences protected: {}", s.occurrences_protected);
+            let _ = writeln!(w, "  kept unsafe context:        {}", s.kept_unsafe_context);
+            let _ = writeln!(w, "  kept edit conflict:         {}", s.kept_conflict);
         }
 
         if !self.verification.is_empty() {

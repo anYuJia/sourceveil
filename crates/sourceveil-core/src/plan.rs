@@ -228,15 +228,10 @@ impl Plan {
             ui: s.ui.unwrap_or(false),
             endpoints: s.endpoints.unwrap_or(false),
         };
-        if strings.enabled
-            && (strings.logs
-                || strings.errors
-                || strings.internal
-                || strings.ui
-                || strings.endpoints)
-        {
+        if strings.enabled && (strings.logs || strings.errors) {
             unsupported.push(
-                "strings.*: string protection pass is not implemented in this build".to_string(),
+                "strings.logs/errors: macro arguments are intentionally outside the V1 runtime                  string pass; those literals stay unchanged"
+                    .to_string(),
             );
         }
 

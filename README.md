@@ -44,7 +44,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 | Tauri command rename (Rust + TypeScript + allow-lists) | done |
 | Tauri event rename (Rust + TypeScript) | done |
 | serde-safe field / enum-variant rename | implemented for the supported subset; unsupported serde representations are kept |
-| string protection | not implemented |
+| runtime Rust string protection | done for safe runtime expressions; compile-time/macro contexts are kept |
 | TypeScript analyzer | not implemented |
 | module file rename | not implemented |
 | dependency wrappers | not implemented |
@@ -382,6 +382,26 @@ the tree is generated.
 If the project generates an integrity manifest or resource checksums, run that
 *after* the transform and *before* the Rust build. Generating it earlier means
 hashing sources that are about to change.
+
+## Runtime string protection
+
+Under `balanced`, machine-like internal literals such as
+`"license-check"`, `"device-validation"` and `"HOLE_PUNCH_REQUEST"` are
+removed from Rust's static plaintext tables when they occur in an ordinary
+runtime expression. Each occurrence gets a build-specific HMAC-derived stream
+seed and encoded bytes; the generated expression lazily decodes once into a
+block-local `OnceLock<String>` and still evaluates to `&'static str`.
+
+This is deliberately not applied to attributes, macro token trees, const/static
+initialisers, patterns, ABI strings, const functions or `no_std` crates.
+Tauri command/event strings remain owned by their dedicated cross-language
+passes. A value is recorded in `mapping.strings` only if every selected
+occurrence can be transformed as one transaction, so source/binary leak scans
+can safely treat the original plaintext as fatal evidence.
+
+The encoding is obfuscation, not a secret store: the client ships both encoded
+bytes and a decoder. The goal is to remove the static `strings -> XREF`
+shortcut while keeping the hot-path cost to one lazy decode per literal.
 
 ## What this does not defend against
 
