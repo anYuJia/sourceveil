@@ -216,18 +216,6 @@ impl Plan {
                     .to_string(),
             );
         }
-        if rename.fields {
-            // Saying so matters: `balanced` turns field rename on, and a user
-            // who reads that and then finds their fields untouched deserves the
-            // reason rather than a silently smaller result.
-            unsupported.push(
-                "rename.fields: members of serde data models are kept regardless of this \
-                 setting — a field's name is a wire-format key, and the pass that would \
-                 preserve the wire format while renaming the identifier is not implemented \
-                 yet. Non-serde fields are renamed normally."
-                    .to_string(),
-            );
-        }
 
         // -- strings --------------------------------------------------------
         let s = &cfg.strings;

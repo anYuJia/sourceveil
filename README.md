@@ -43,7 +43,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 | verification pipeline | done |
 | Tauri command rename (Rust + TypeScript + allow-lists) | done |
 | Tauri event rename (Rust + TypeScript) | done |
-| serde-safe field rename | not implemented — serde members are pinned, see below |
+| serde-safe field / enum-variant rename | implemented for the supported subset; unsupported serde representations are kept |
 | string protection | not implemented |
 | TypeScript analyzer | not implemented |
 | module file rename | not implemented |
@@ -54,15 +54,17 @@ where their absence would break something, the affected symbols are pinned:
 
 - An event that reaches outside the workspace in either direction is
   **kept** — see below.
-- Every field and variant of a type deriving `Serialize`/`Deserialize` is
-  **kept**. The pass that renames the identifier while pinning the wire format
-  with `#[serde(rename = "...")]` does not exist yet, so there is no safe amount
-  of field rename inside a serde model to allow. Details below.
+- Serde fields and variants are owned by a dedicated pass. Under `safe` they
+  are kept. Under `balanced`, supported members are renamed only when the old
+  serialize/deserialize names can be materialised explicitly; unsupported
+  representations are kept and reported. Details below.
 - Module *identifiers* are renamed; module *files* are not, because
   rust-analyzer implements module rename as a file move and that is a separate
   pass with its own verification.
 
-### Why serde members are pinned
+### Serde-safe member renaming
+
+A serde member is both a Rust identifier and a protocol value:
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -71,41 +73,40 @@ struct User {
 }
 ```
 
-`user_name` is not really a Rust identifier — it is a JSON key that happens to
-be spelled like one. Rename it and the code still compiles, the tests that do
-not round-trip still pass, and the breakage appears against a real peer that
-sends `{"user_name": ...}`.
-
-Nothing the compiler can see distinguishes a safe field rename from an unsafe
-one, so until the dedicated pass exists the only correct answer is to keep them:
+Renaming only the Rust identifier changes the JSON key and still compiles. The
+serde pass computes the original serialize and deserialize wire names *before*
+the identifier moves, asks rust-analyzer for the semantic rename, and stages
+that rename in the same transaction as an explicit wire contract:
 
 ```rust
-// what happens today                // what the serde pass will do
-#[derive(Serialize, Deserialize)]    #[derive(Serialize, Deserialize)]
-struct X7Qp {                        struct X7Qp {
-    user_name: String,                   #[serde(rename = "user_name")]
-}                                        m9_k: String,
-                                     }
+#[derive(Serialize, Deserialize)]
+struct X7Qp {
+    #[serde(rename = "user_name")]
+    m9_k: String,
+}
 ```
 
-This applies to enum variants as well, and therefore holds under the `safe`
-profile too — a variant name is the key of an externally-tagged representation,
-and variants are renamed by default.
+The same mechanism covers enum variants, `rename_all`,
+`rename_all_fields`, explicit `rename`, aliases, and externally/internally/
+adjacently tagged enums. Serialize and deserialize names stay separate: a
+directional contract such as
 
-The detection covers every spelling (`#[derive(Serialize)]`,
-`#[derive(Deserialize)]`, `#[derive(serde::Serialize)]`, several derives in one
-list, several `#[derive]` attributes) and propagates from the type to its
-fields, its variants, and the fields inside those variants. The type's own name
-is *not* pinned, because serde does not serialize it — so `User` becomes `X7Qp`
-while `user_name` stays put.
+```rust
+#[serde(rename(serialize = "outValue", deserialize = "in_value"))]
+```
 
-`tests/fixtures/serde-safety` is the proof. It covers a plain model, a
-`rename_all` container, an externally tagged enum, an internally tagged enum, a
-per-field `rename`, and one non-serde struct. The end-to-end test runs the
-fixture before and after the transform, under both `safe` and `balanced`, and
-compares the serialized output byte for byte — and separately checks that the
-non-serde struct's fields *do* get renamed, so the fixture cannot pass by
-pinning everything.
+is never collapsed to one string.
+
+The implementation is deliberately conservative. `flatten`, `transparent`,
+`remote`, `untagged`, `serde(other)`, conversion containers,
+`skip*`, unknown metadata, one-sided explicit renames, external Rust API
+members and macro-token-tree references are kept rather than guessed at.
+
+`tests/fixtures/serde-safety` is an executable protocol corpus. The end-to-end
+tests run the original and transformed crates, compare actual serde output byte
+for byte, and feed old payloads back through the transformed build. The fixture
+also contains an unsupported transparent representation to prove that the pass
+can mix renamed and pinned members in one project.
 
 ### Tauri commands are one protocol across four places
 

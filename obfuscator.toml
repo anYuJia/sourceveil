@@ -12,7 +12,7 @@ version = 1
 
 # `safe`       symbol rename, build diversification, release string behaviour.
 #              Near-zero runtime cost, maximum build compatibility.
-# `balanced`   adds private field rename and internal-string protection.
+# `balanced`   adds private field rename, including serde-safe members where the wire contract can be proven, and internal-string protection.
 # `aggressive` reserved for V3 transforms; currently resolves to `balanced`.
 profile = "safe"
 
@@ -46,8 +46,10 @@ module_files = false
 # crate, so it stays opt-in.
 macros = false
 
-# Fields are off under `safe` because a field name can be a wire-format
-# contract. `balanced` turns them on.
+# Fields are off under `safe`. `balanced` turns them on. Serde model
+# members are handled by a dedicated pass that preserves their original
+# serialize/deserialize names with explicit attributes; unsupported serde
+# representations remain pinned.
 fields = false
 
 # Local bindings and parameters buy very little protection in a release binary

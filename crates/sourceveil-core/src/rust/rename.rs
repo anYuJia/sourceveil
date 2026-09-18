@@ -418,7 +418,7 @@ pub(crate) fn crate_for_file<'a>(graph: &'a CrateGraph, path: &Path) -> Option<&
 }
 
 /// Path segments implied by a file's location inside its crate.
-fn module_prefix_for(krate: &CrateInfo, path: &Path) -> Vec<String> {
+pub(crate) fn module_prefix_for(krate: &CrateInfo, path: &Path) -> Vec<String> {
     let Some(src_dir) = &krate.src_dir else {
         return Vec::new();
     };

@@ -42,6 +42,12 @@ pub enum SkipReason {
     /// key rather than a Rust identifier. Renaming it would change the JSON
     /// without changing anything the compiler can see.
     SerdeModel,
+    /// A serde member uses a representation this pass deliberately keeps
+    /// rather than guessing at its wire semantics.
+    SerdeUnsupported,
+    /// A serde attribute could not be parsed safely enough to preserve the
+    /// protocol exactly.
+    SerdeAttributeParseFailed,
     /// `pub` item in a crate that something outside the workspace depends on.
     ExternallyReachable,
     /// Lives inside a `macro_rules!` body or a macro invocation we cannot
@@ -69,6 +75,8 @@ impl SkipReason {
             SkipReason::IntrinsicAttribute => "intrinsic-attribute",
             SkipReason::MacroCallReference => "macro-call-reference",
             SkipReason::SerdeModel => "serde-model",
+            SkipReason::SerdeUnsupported => "serde-unsupported",
+            SkipReason::SerdeAttributeParseFailed => "serde-attribute-parse-failed",
             SkipReason::ExternallyReachable => "externally-reachable",
             SkipReason::MacroGenerated => "macro-generated",
             SkipReason::Unresolvable => "unresolvable",
