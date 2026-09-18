@@ -530,6 +530,41 @@ fn string_protection_is_deterministic_per_seed() {
 }
 
 #[test]
+fn protected_strings_are_absent_from_the_release_binary() {
+    let (_tmp, out) = transform_strings("20240917");
+    let build = Command::new("cargo")
+        .args(["build", "--release", "--manifest-path"])
+        .arg(out.join("Cargo.toml"))
+        .output()
+        .expect("building transformed string fixture");
+    assert!(
+        build.status.success(),
+        "release build failed\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let binary_name = if cfg!(windows) {
+        "string-protection-fixture.exe"
+    } else {
+        "string-protection-fixture"
+    };
+    let artifact = out.join("target/release").join(binary_name);
+    let scan = Command::new(binary())
+        .args(["scan-binary", "--binary"])
+        .arg(&artifact)
+        .args(["--mapping"])
+        .arg(out.join(".obfuscator/mapping.json"))
+        .output()
+        .expect("scanning transformed release binary");
+    assert!(
+        scan.status.success(),
+        "protected string leaked into release binary\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+}
+
+#[test]
 fn string_identity_survives_checkout_and_unrelated_source_changes() {
     let tmp = TempDir::new().unwrap();
     let first_input = tmp.path().join("first-input");
