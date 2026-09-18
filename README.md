@@ -47,7 +47,8 @@ V1, at the prototype stage the design calls for. What is implemented:
 | string protection | not implemented |
 | TypeScript analyzer | not implemented |
 | module file rename | not implemented |
-| dependency wrappers, binary scanner | not implemented |
+| dependency wrappers | not implemented |
+| final binary leak scanner | done — raw UTF-8/UTF-16LE scan for original protocol values |
 
 Unimplemented features are reported in the run output rather than ignored, and
 where their absence would break something, the affected symbols are pinned:
@@ -233,6 +234,11 @@ cargo-obfuscator transform --input ./app --output ./out --config obfuscator.toml
 
 # Re-run verification against an already-generated tree.
 cargo-obfuscator verify --output ./out
+
+# Inspect the final PE/ELF/Mach-O for original command/event/string values.
+cargo-obfuscator scan-binary \
+  --binary ./target/release/my-app \
+  --mapping ./out/.obfuscator/mapping.json
 ```
 
 Useful flags: `--seed <auto|random|hmac|u64>`, `--stage <name>` (repeatable),
@@ -291,6 +297,20 @@ build_seed = HMAC-SHA256(OBFUSCATION_SEED_KEY, "<git-sha>:<release-tag>")
 
 so that each release differs, any release can be rebuilt, and knowing the commit
 SHA alone does not let anyone regenerate the mapping.
+
+## Final binary scan
+
+Source-level verification is necessary but not sufficient: the optimizer,
+framework glue or generated code can still leave protocol values in the final
+artifact. `scan-binary` searches the shipped bytes directly for every original
+Tauri command/event/protected-string value in `mapping.json`, in both UTF-8
+and UTF-16LE. Those hits are fatal. Original Rust symbol names are weaker
+evidence and are reported only as notes, because the same word can survive
+legitimately in third-party code, comments embedded in debug data or unrelated
+APIs.
+
+The scan is format-agnostic and read-only, so the same command works for PE,
+ELF, Mach-O, static libraries and sidecar blobs.
 
 ## Artifacts
 

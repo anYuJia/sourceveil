@@ -34,6 +34,9 @@ enum Command {
 
     /// Run the verification pipeline against an already-generated tree.
     Verify(VerifyArgs),
+
+    /// Scan a final executable or library for original protocol values.
+    ScanBinary(ScanBinaryArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -78,6 +81,21 @@ struct ScanArgs {
 
     #[arg(short, long)]
     verbose: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ScanBinaryArgs {
+    /// Built PE/ELF/Mach-O (or any binary blob) to inspect.
+    #[arg(long)]
+    binary: PathBuf,
+
+    /// mapping.json produced by the transform.
+    #[arg(long)]
+    mapping: PathBuf,
+
+    /// Emit the full machine-readable report as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -128,6 +146,7 @@ fn main() -> Result<()> {
         Command::Transform(a) => a.verbose,
         Command::Scan(a) => a.verbose,
         Command::Verify(a) => a.verbose,
+        Command::ScanBinary(_) => false,
     };
     init_tracing(verbose);
 
@@ -135,6 +154,7 @@ fn main() -> Result<()> {
         Command::Transform(args) => run_transform(args),
         Command::Scan(args) => run_scan(args),
         Command::Verify(args) => run_verify(args),
+        Command::ScanBinary(args) => run_scan_binary(args),
     }
 }
 
@@ -265,6 +285,45 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
 
     if !report.passed() {
         anyhow::bail!("verification failed");
+    }
+    Ok(())
+}
+
+fn run_scan_binary(args: ScanBinaryArgs) -> Result<()> {
+    let mapping = sourceveil_core::mapping::Mapping::read(&args.mapping)
+        .with_context(|| format!("reading {}", args.mapping.display()))?;
+    let report = sourceveil_core::binary_scan::scan_file(&args.binary, &mapping)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "scanned {} ({} bytes)",
+            report.path.display(),
+            report.bytes_scanned
+        );
+        println!("protocol leaks: {}", report.protocol_leaks.len());
+        for leak in report.protocol_leaks.iter().take(40) {
+            println!(
+                "  FAIL {:<10} @ 0x{:x}  {:?}",
+                leak.encoding, leak.offset, leak.value
+            );
+        }
+        println!("symbol text hits: {} (informational)", report.symbol_hits.len());
+        for hit in report.symbol_hits.iter().take(12) {
+            println!(
+                "  note {:<10} @ 0x{:x}  {:?}",
+                hit.encoding, hit.offset, hit.value
+            );
+        }
+    }
+
+    if !report.passed() {
+        anyhow::bail!(
+            "{} original protocol value occurrence(s) remain in {}",
+            report.protocol_leaks.len(),
+            args.binary.display()
+        );
     }
     Ok(())
 }
