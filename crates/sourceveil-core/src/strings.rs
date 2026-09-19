@@ -152,7 +152,10 @@ pub fn run(
             if classify(&value, req.plan).is_none() {
                 continue;
             }
-            if req.reserved_protocol_values.contains(&value) {
+            // A retained wire value such as `Audio132K` also retains `132K`
+            // as raw bytes. The final binary scanner intentionally searches
+            // substrings, so exact equality is not a sufficient reservation.
+            if collides_with_reserved_protocol(&value, req.reserved_protocol_values) {
                 continue;
             }
 
@@ -322,6 +325,10 @@ fn has_rust_literal_collision(value: &str, literals: &BTreeSet<String>) -> bool 
         .any(|literal| literal != value && literal.contains(value))
 }
 
+fn collides_with_reserved_protocol(value: &str, reserved: &HashSet<String>) -> bool {
+    reserved.iter().any(|protocol| protocol.contains(value))
+}
+
 pub(crate) fn external_dependency_plaintext_collisions(
     graph: &CrateGraph,
     input_root: &Path,
@@ -363,13 +370,234 @@ pub(crate) fn external_dependency_plaintext_collisions(
             let Ok(bytes) = std::fs::read(entry.path()) else {
                 continue;
             };
-            for found in matcher.find_overlapping_iter(&bytes) {
-                collisions.insert(patterns[found.pattern().as_usize()].clone());
+            if entry.path().extension().is_some_and(|value| value == "rs") {
+                scan_rust_dependency_values(&bytes, &matcher, &patterns, &mut collisions);
+            } else {
+                record_plaintext_matches(&bytes, &matcher, &patterns, &mut collisions);
             }
         }
     }
 
+    // Some dependencies construct static data from numeric byte tables. The
+    // Brotli dictionary is a real example: Chinese and ASCII words are written
+    // as `0xe9, 0x98, ...` in Rust source and only become searchable plaintext
+    // in the compiled rlib. rust-analyzer's loading check has already produced
+    // dependency artifacts by this point, so inspect only resolved external
+    // library artifacts, never the workspace crate that still contains the
+    // candidate literals by definition.
+    if let Some(target_dir) = &graph.target_directory {
+        for entry in walkdir::WalkDir::new(target_dir)
+            .into_iter()
+            .filter_entry(|entry| {
+                !entry.file_type().is_dir()
+                    || !matches!(
+                        entry.file_name().to_string_lossy().as_ref(),
+                        "incremental" | ".fingerprint" | "build" | "examples"
+                    )
+            })
+            .filter_map(|entry| entry.ok())
+        {
+            if !entry.file_type().is_file() || !is_external_dependency_artifact(entry.path(), graph)
+            {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            record_plaintext_matches(&bytes, &matcher, &patterns, &mut collisions);
+        }
+    }
+
     Ok(collisions)
+}
+
+fn record_plaintext_matches(
+    bytes: &[u8],
+    matcher: &AhoCorasick,
+    patterns: &[String],
+    collisions: &mut BTreeSet<String>,
+) {
+    for found in matcher.find_overlapping_iter(bytes) {
+        collisions.insert(patterns[found.pattern().as_usize()].clone());
+    }
+}
+
+fn scan_rust_dependency_values(
+    bytes: &[u8],
+    matcher: &AhoCorasick,
+    patterns: &[String],
+    collisions: &mut BTreeSet<String>,
+) {
+    // Most dependency files contain neither a candidate spelling nor a static
+    // byte table. Avoid constructing a full syntax tree for all of crates.io;
+    // parsing only plausible files keeps this proof linear in bytes read
+    // instead of linear in the complete dependency AST.
+    let has_raw_candidate = matcher.is_match(bytes);
+    let may_have_u8_table = bytes.windows(3).any(|window| window == b"[u8")
+        && encoded_integer_stream_may_match(bytes, matcher);
+    if !has_raw_candidate && !may_have_u8_table {
+        return;
+    }
+
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    let parsed = ast::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+
+    // Rust comments (including rustdoc examples) are not linked data. Decode
+    // actual string/byte/C-string tokens instead of searching the raw `.rs`
+    // text so examples do not conservatively pin unrelated application
+    // protocols.
+    if has_raw_candidate {
+        for value in parsed
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::AnyString::cast)
+            .filter_map(|literal| literal.value().ok().map(|value| value.into_owned()))
+        {
+            record_plaintext_matches(value.as_bytes(), matcher, patterns, collisions);
+        }
+    }
+
+    // A dependency may spell linked bytes as numeric array elements rather
+    // than a literal. Reconstruct plain u8 arrays so data such as Brotli's
+    // static dictionary participates in the same collision proof.
+    if may_have_u8_table {
+        for array in parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::ArrayExpr::cast)
+        {
+            if array.semicolon_token().is_some() {
+                continue;
+            }
+            let values = array
+                .exprs()
+                .map(|expression| parse_u8_literal(&expression))
+                .collect::<Option<Vec<_>>>();
+            if let Some(values) = values.filter(|values| !values.is_empty()) {
+                record_plaintext_matches(&values, matcher, patterns, collisions);
+            }
+        }
+    }
+}
+
+/// Cheap prefilter for Rust numeric byte tables.
+///
+/// Parsing a large generated dependency file into a syntax tree is expensive.
+/// Extract its integer literals first and only parse when their byte stream can
+/// actually contain one of the candidate plaintexts. A false positive merely
+/// causes a parse; the AST array check remains the authority.
+fn encoded_integer_stream_may_match(source: &[u8], matcher: &AhoCorasick) -> bool {
+    let mut stream = Vec::new();
+    let mut cursor = 0;
+    while cursor < source.len() {
+        if !source[cursor].is_ascii_digit()
+            || (cursor > 0
+                && (source[cursor - 1].is_ascii_alphanumeric() || source[cursor - 1] == b'_'))
+        {
+            cursor += 1;
+            continue;
+        }
+
+        let start = cursor;
+        let (radix, prefix) =
+            if source[start..].starts_with(b"0x") || source[start..].starts_with(b"0X") {
+                (16, 2)
+            } else if source[start..].starts_with(b"0o") || source[start..].starts_with(b"0O") {
+                (8, 2)
+            } else if source[start..].starts_with(b"0b") || source[start..].starts_with(b"0B") {
+                (2, 2)
+            } else {
+                (10, 0)
+            };
+        cursor += prefix;
+        let digits_start = cursor;
+        while cursor < source.len()
+            && (source[cursor] == b'_' || (source[cursor] as char).is_digit(radix))
+        {
+            cursor += 1;
+        }
+        if cursor == digits_start {
+            cursor = start + 1;
+            continue;
+        }
+        let digits = source[digits_start..cursor]
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'_')
+            .collect::<Vec<_>>();
+        let value = std::str::from_utf8(&digits)
+            .ok()
+            .and_then(|digits| u16::from_str_radix(digits, radix).ok())
+            .and_then(|value| u8::try_from(value).ok());
+        // NUL is not valid in any protected protocol value and safely breaks
+        // a run when the integer is not a byte (for example an array length).
+        stream.push(value.unwrap_or(0));
+    }
+    matcher.is_match(&stream)
+}
+
+fn parse_u8_literal(expression: &ast::Expr) -> Option<u8> {
+    if expression.syntax().kind() != ra_ap_syntax::SyntaxKind::LITERAL {
+        return None;
+    }
+    let token = expression
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.kind() == ra_ap_syntax::SyntaxKind::INT_NUMBER)?;
+    let compact = token.text().replace('_', "");
+    let (radix, digits) = if let Some(value) = compact.strip_prefix("0x") {
+        (16, value)
+    } else if let Some(value) = compact.strip_prefix("0o") {
+        (8, value)
+    } else if let Some(value) = compact.strip_prefix("0b") {
+        (2, value)
+    } else {
+        (10, compact.as_str())
+    };
+    let valid = |character: char| character.is_digit(radix);
+    let end = digits
+        .find(|character| !valid(character))
+        .unwrap_or(digits.len());
+    (end > 0)
+        .then(|| u8::from_str_radix(&digits[..end], radix).ok())
+        .flatten()
+}
+
+fn is_external_dependency_artifact(path: &Path, graph: &CrateGraph) -> bool {
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .is_none_or(|name| name != "deps")
+    {
+        return false;
+    }
+
+    let extension = path.extension().and_then(|value| value.to_str());
+    if !matches!(
+        extension,
+        Some("rlib" | "a" | "lib" | "so" | "dylib" | "dll")
+    ) {
+        return false;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let extension = extension.expect("the artifact extension was checked above");
+    let without_extension = file_name
+        .strip_suffix(&format!(".{extension}"))
+        .unwrap_or(file_name);
+    let base = without_extension
+        .strip_prefix("lib")
+        .unwrap_or(without_extension);
+    graph
+        .dependency_artifact_stems
+        .iter()
+        .any(|stem| base == stem || base.starts_with(&format!("{stem}-")))
 }
 
 fn has_no_std_attribute(parsed: &ast::SourceFile) -> bool {
@@ -775,6 +1003,14 @@ mod tests {
     }
 
     #[test]
+    fn a_string_inside_a_retained_wire_value_is_reserved() {
+        let reserved = HashSet::from(["Audio132K".to_string(), "download://progress".to_string()]);
+        assert!(collides_with_reserved_protocol("132K", &reserved));
+        assert!(collides_with_reserved_protocol("progress", &reserved));
+        assert!(!collides_with_reserved_protocol("private-token", &reserved));
+    }
+
+    #[test]
     fn external_dependency_sources_are_plaintext_collisions() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
@@ -782,7 +1018,13 @@ mod tests {
         std::fs::create_dir_all(dependency.join("src")).unwrap();
         std::fs::write(
             dependency.join("src/lib.rs"),
-            r#"pub const MIME: &str = "application/octet-stream";"#,
+            r#"
+/// A documentation-only-token example must not pin an application value.
+pub const MIME: &str = "application/octet-stream";
+pub static TABLE: [u8; 9] = [
+    0x68, 0x65, 0x78, 0x2d, 0x74, 0x6f, 0x6b, 0x65, 0x6e,
+];
+"#,
         )
         .unwrap();
         std::fs::create_dir_all(dependency.join("guest-js")).unwrap();
@@ -810,6 +1052,8 @@ mod tests {
         let candidates = BTreeSet::from([
             ".downloaded".to_string(),
             "application/octet-stream".to_string(),
+            "documentation-only-token".to_string(),
+            "hex-token".to_string(),
             "private-runtime-token".to_string(),
         ]);
 
@@ -823,8 +1067,62 @@ mod tests {
             collisions,
             BTreeSet::from([
                 ".downloaded".to_string(),
-                "application/octet-stream".to_string()
+                "application/octet-stream".to_string(),
+                "hex-token".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn compiled_dependency_byte_tables_are_plaintext_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deps = tmp.path().join("target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(
+            deps.join("libbyte_table_dep-123456.rlib"),
+            b"archive-prefix compiled-only-token archive-suffix",
+        )
+        .unwrap();
+        std::fs::write(
+            deps.join("libworkspace_root-123456.rlib"),
+            b"workspace-only-token",
+        )
+        .unwrap();
+
+        let mut graph = CrateGraph {
+            target_directory: Some(tmp.path().join("target")),
+            ..Default::default()
+        };
+        graph
+            .dependency_artifact_stems
+            .insert("byte_table_dep".into());
+        let candidates = BTreeSet::from([
+            "compiled-only-token".to_string(),
+            "workspace-only-token".to_string(),
+        ]);
+
+        let collisions = external_dependency_plaintext_collisions(
+            &graph,
+            &tmp.path().join("input"),
+            &candidates,
+        )
+        .unwrap();
+        assert_eq!(
+            collisions,
+            BTreeSet::from(["compiled-only-token".to_string()])
+        );
+    }
+
+    #[test]
+    fn numeric_table_prefilter_finds_encoded_bytes_without_parsing_unrelated_tables() {
+        let matcher = AhoCorasick::new(["hex-token", "not-present"]).unwrap();
+        assert!(encoded_integer_stream_may_match(
+            b"static X: [u8; 9] = [0x68,0x65,0x78,0x2d,0x74,0x6f,0x6b,0x65,0x6e];",
+            &matcher
+        ));
+        assert!(!encoded_integer_stream_may_match(
+            b"static X: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];",
+            &matcher
+        ));
     }
 }

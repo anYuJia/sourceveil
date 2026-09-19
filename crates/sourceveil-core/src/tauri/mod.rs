@@ -70,6 +70,10 @@ pub struct CommandOutcome {
     pub mapping: BTreeMap<String, String>,
     /// Definition sites this pass owns, so the symbol rename pass skips them.
     pub claimed: HashSet<(PathBuf, TextRange)>,
+    /// Rust parameter spellings and their Tauri wire-format spellings. They
+    /// are IPC keys (or framework injection keys), so ordinary runtime string
+    /// protection must not claim their raw bytes disappeared.
+    pub wire_parameters: BTreeSet<String>,
     pub refs: CommandRefCounts,
     pub warnings: Vec<String>,
 }
@@ -164,6 +168,7 @@ struct DiscoveredCommand {
     file_id: FileId,
     name_range: TextRange,
     line: u32,
+    wire_parameters: BTreeSet<String>,
 }
 
 /// A read-only view of one workspace Rust file.
@@ -207,6 +212,11 @@ pub fn run(
     }
 
     out.discovered = commands.len();
+    out.wire_parameters.extend(
+        commands
+            .iter()
+            .flat_map(|command| command.wire_parameters.iter().cloned()),
+    );
     if commands.is_empty() {
         return Ok(out);
     }
@@ -693,16 +703,57 @@ fn discover(
         }
 
         let name = name_node.syntax().text().to_string();
+        let wire_parameters = command_argument_values(&function);
         found.push(DiscoveredCommand {
             name,
             file: file.path.clone(),
             file_id: file.file_id,
             name_range: name_node.syntax().text_range(),
             line: line_of(&file.text, node.text_range()),
+            wire_parameters,
         });
     }
 
     (found, unresolved)
+}
+
+fn command_argument_values(function: &ast::Fn) -> BTreeSet<String> {
+    let snake_case = function
+        .syntax()
+        .children()
+        .filter_map(ast::Attr::cast)
+        .any(|attr| {
+            let text = attr.syntax().text().to_string();
+            (text.contains("tauri::command") || text.contains("command"))
+                && text.contains("rename_all")
+                && text.contains("\"snake_case\"")
+        });
+
+    let source_names = function
+        .param_list()
+        .into_iter()
+        .flat_map(|parameters| parameters.params())
+        .filter_map(|parameter| parameter.pat())
+        .flat_map(|pattern| {
+            pattern
+                .syntax()
+                .descendants()
+                .filter_map(ast::IdentPat::cast)
+                .filter_map(|binding| binding.name())
+                .map(|name| name.syntax().text().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut values = source_names.clone();
+    if !snake_case {
+        values.extend(
+            source_names
+                .iter()
+                .map(|name| crate::serde::case::RenameRule::CamelCase.apply_to_field(name)),
+        );
+    }
+    values
 }
 
 /// Does the short-form attribute on this item resolve into `tauri`?
@@ -970,6 +1021,38 @@ mod tests {
 
         let collisions = uncovered_plaintext_occurrences("verify_cookie", &texts, &pending);
         assert_eq!(collisions, vec!["src/lib.rs:2"]);
+    }
+
+    #[test]
+    fn command_arguments_reserve_rust_and_tauri_wire_spellings() {
+        let parsed = ast::SourceFile::parse(
+            r#"
+#[tauri::command]
+async fn update(add_media_ids: Vec<i64>, cookie: String) {}
+#[tauri::command(rename_all = "snake_case")]
+fn legacy(del_media_ids: Vec<i64>) {}
+"#,
+            ra_ap_syntax::Edition::Edition2021,
+        )
+        .tree();
+        let functions = parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            command_argument_values(&functions[0]),
+            BTreeSet::from([
+                "add_media_ids".to_string(),
+                "addMediaIds".to_string(),
+                "cookie".to_string(),
+            ])
+        );
+        assert_eq!(
+            command_argument_values(&functions[1]),
+            BTreeSet::from(["del_media_ids".to_string()])
+        );
     }
 
     #[test]

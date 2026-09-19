@@ -423,9 +423,10 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
     // Grouped so a hundred hits of one common name is one line, not a hundred.
     let mut symbol_hits: BTreeMap<String, (usize, String)> = BTreeMap::new();
 
-    // Protocol values are unambiguous: a command name is a value the frontend
-    // sends, so finding one in the output means a call site was missed. Symbol
-    // names are ordinary identifiers and are only reported — see
+    // Protocol values are a raw-byte promise, matching the final artifact
+    // scanner. A substring inside a larger literal or generated identifier is
+    // still fatal because the binary scanner cannot recover its provenance.
+    // Symbol names are ordinary identifiers and are only reported — see
     // [`crate::mapping::Mapping::symbol_originals`] for why.
     let protocol: Vec<&str> = ctx
         .mapping
@@ -496,11 +497,7 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
         }
 
         for needle in &protocol {
-            let allow_backtick = matches!(
-                ext.as_str(),
-                "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "html" | "vue" | "svelte"
-            );
-            if contains_quoted(&text, needle, allow_backtick) {
+            if text.contains(needle) {
                 fatal.push(format!("{needle:?} found in {rel}"));
             }
         }
@@ -554,26 +551,6 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
     Ok(Some(notes.join("; ")))
 }
 
-/// Does the text contain this value as a quoted literal?
-///
-/// A protocol value leaks by surviving as a *string* — an `invoke("...")` that
-/// was not rewritten, a command name left in an allow-list. Matching the bare
-/// word instead would also fire on an unrelated identifier that happens to
-/// share the name, which is common: a frontend helper named `ping` beside a
-/// command named `ping` is not a leak.
-fn contains_quoted(haystack: &str, needle: &str, allow_backtick: bool) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let mut quotes = vec!['"', '\''];
-    if allow_backtick {
-        quotes.push('`');
-    }
-    quotes
-        .iter()
-        .any(|quote| haystack.contains(&format!("{quote}{needle}{quote}")))
-}
-
 /// Word-boundary containment.
 ///
 /// A plain `contains` would report `connect` as leaking when all that is
@@ -617,27 +594,17 @@ pub fn resolve_mapping_dir(output_root: &Path, dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A command name beside an unrelated identifier of the same name.
     #[test]
-    fn a_bare_identifier_sharing_a_protocol_value_is_not_a_leak() {
-        assert!(contains_quoted(r#"invoke("ping")"#, "ping", true));
-        assert!(!contains_quoted(
+    fn a_protocol_substring_is_raw_byte_evidence() {
+        for text in [
+            r#"invoke("ping")"#,
             "export function ping() { return 1; }",
-            "ping",
-            true,
-        ));
-        assert!(!contains_quoted(
-            "#[tauri::command] fn ping() {}",
-            "ping",
-            false,
-        ));
-        assert!(contains_quoted("const ALLOWED = ['ping'];", "ping", true));
-        assert!(contains_quoted("const s = `ping`;", "ping", true));
-        assert!(!contains_quoted(
-            "/// Reads the hidden `.downloaded` marker.",
-            ".downloaded",
-            false,
-        ));
+            "const ALLOWED = ['ping'];",
+            "const s = `ping`;",
+            "repinger",
+        ] {
+            assert!(text.contains("ping"), "{text}");
+        }
     }
 
     #[test]

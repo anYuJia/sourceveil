@@ -189,6 +189,8 @@ pub struct CommandStats {
     pub frontend_dynamic_refs: usize,
     pub handler_refs: usize,
     pub rust_literal_refs: usize,
+    #[serde(default)]
+    pub wire_parameters: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +228,7 @@ impl CommandStats {
             frontend_dynamic_refs: outcome.refs.frontend_dynamic,
             handler_refs: outcome.refs.handler,
             rust_literal_refs: outcome.refs.rust_literals,
+            wire_parameters: outcome.wire_parameters.len(),
         }
     }
 }
@@ -466,6 +469,7 @@ impl Report {
             );
             let _ = writeln!(w, "  generate_handler refs:      {}", c.handler_refs);
             let _ = writeln!(w, "  Rust command literals:      {}", c.rust_literal_refs);
+            let _ = writeln!(w, "  reserved argument spellings: {}", c.wire_parameters);
         }
 
         if self.events.discovered > 0 {

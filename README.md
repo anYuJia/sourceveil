@@ -167,6 +167,11 @@ they are changed as one transaction, and any doubt keeps the command whole:
 | a name that also appears as a Rust string outside a recognised context | kept |
 | original bytes also occur in a retained source/dependency substring | kept and reported; a raw final-binary scan could not prove provenance |
 
+Tauri command argument names are also treated as wire-format keys. They are
+reserved from ordinary string protection because the command macro may embed
+those bytes in generated dispatch code even when the same spelling is also used
+as an HTTP/query key elsewhere.
+
 The `generate_handler!` list is parsed by hand, because rust-analyzer's
 reference search does not reach inside a macro token tree. Only the spans of the
 names it recognises are rewritten; nothing else in the token tree is touched.
@@ -518,9 +523,12 @@ passes. A value is recorded in `mapping.strings` only if every selected
 occurrence can be transformed as one transaction and it is not a substring of
 another retained Rust/frontend/config literal. That conservative substring
 check matters because the final binary scanner operates on raw bytes, not
-source-level literal boundaries. Source/binary leak scans can therefore treat
-the original plaintext as fatal evidence without a known same-project
-collision.
+source-level literal boundaries. Resolved dependency sources and compiled
+dependency library artifacts are checked too; the latter catches values
+reconstructed from numeric byte tables (for example a compression dictionary)
+that never appear verbatim in source. Source/binary leak scans can therefore
+treat the original plaintext as fatal evidence without a known same-project or
+linked-dependency collision.
 
 The encoding is obfuscation, not a secret store: the client ships both encoded
 bytes and a decoder. The goal is to remove the static `strings -> XREF`

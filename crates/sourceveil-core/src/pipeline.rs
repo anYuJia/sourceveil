@@ -132,6 +132,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     // --- 2. analyze, then run the passes ----------------------------------
     let mut mapping = Mapping::new(seed.seed);
     let mut command_stats = CommandStats::default();
+    let mut command_wire_values = std::collections::BTreeSet::new();
     let mut event_stats = EventStats::default();
     let mut frontend_stats = crate::report::FrontendStats::default();
 
@@ -201,6 +202,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 .context("running the tauri command pass")?;
 
             command_stats = CommandStats::from_outcome(&outcome);
+            command_wire_values = outcome.wire_parameters.clone();
             mapping.commands = outcome.mapping;
             report.warnings.extend(outcome.warnings);
             report.files.frontend_scanned =
@@ -343,6 +345,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             protocol_values.extend(command_stats.kept.iter().map(|item| item.name.clone()));
             protocol_values.extend(event_stats.kept.iter().map(|item| item.name.clone()));
             protocol_values.extend(serde_wire_values);
+            protocol_values.extend(command_wire_values);
 
             let request = StringRequest {
                 input_root: &layout.root,

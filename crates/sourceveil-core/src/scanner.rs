@@ -58,6 +58,11 @@ pub struct CrateGraph {
     /// set, while semantic name resolution above intentionally stays keyed by
     /// package name.
     pub dependency_source_dirs: BTreeSet<PathBuf>,
+    /// Rust library target names for packages outside the workspace. Cargo
+    /// uses these names in `target/*/deps/lib<name>-<hash>.*`; scanning those
+    /// artifacts catches plaintext reconstructed from numeric byte tables or
+    /// build output that does not occur verbatim in dependency source files.
+    pub dependency_artifact_stems: BTreeSet<String>,
     /// Workspace members that something outside the workspace depends on.
     /// Their public API is a contract and must not be renamed.
     pub boundary: BTreeSet<String>,
@@ -410,6 +415,25 @@ fn fold_metadata(metadata: &Metadata) -> Result<CrateGraph> {
             .dependency_manifest_dirs
             .insert(name.clone(), manifest_dir.clone());
         graph.dependency_source_dirs.insert(manifest_dir.clone());
+
+        if !members.contains(&package.id) {
+            for target in &package.targets {
+                if target.kind.iter().any(|kind| {
+                    matches!(
+                        kind,
+                        TargetKind::Lib
+                            | TargetKind::RLib
+                            | TargetKind::DyLib
+                            | TargetKind::CDyLib
+                            | TargetKind::StaticLib
+                    )
+                }) {
+                    graph
+                        .dependency_artifact_stems
+                        .insert(target.name.replace('-', "_"));
+                }
+            }
+        }
 
         // Registry/git dependencies are analyzed by rust-analyzer but are
         // never part of the copied source tree. Local path dependencies are

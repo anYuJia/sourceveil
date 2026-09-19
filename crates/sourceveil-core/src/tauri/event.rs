@@ -91,6 +91,9 @@ pub enum EventKeepReason {
     UnresolvedEventReference,
     /// A framework or plugin event, which is not this project's protocol.
     FrameworkEvent,
+    /// The original bytes also occur outside the exact producer/consumer
+    /// edits or in a linked dependency artifact.
+    PlaintextCollision,
     /// Another pass already scheduled an overlapping edit.
     EditConflict,
     /// rust-analyzer would not produce an edit set.
@@ -105,6 +108,7 @@ impl EventKeepReason {
             EventKeepReason::DynamicEventReference => "dynamic-event-reference",
             EventKeepReason::UnresolvedEventReference => "unresolved-event-reference",
             EventKeepReason::FrameworkEvent => "framework-event",
+            EventKeepReason::PlaintextCollision => "plaintext-substring-collision",
             EventKeepReason::EditConflict => "edit-conflict",
             EventKeepReason::Unresolvable => "unresolvable",
         }
@@ -307,8 +311,30 @@ pub fn run(
         names.reserve(name.clone());
     }
 
+    let event_names = graph.keys().cloned().collect::<BTreeSet<_>>();
+    let external_plaintext_collisions = crate::strings::external_dependency_plaintext_collisions(
+        req.graph,
+        req.input_root,
+        &event_names,
+    )?;
+
     // ---- one transaction per event ----------------------------------------
     for (name, edges) in &graph {
+        if external_plaintext_collisions.contains(name) {
+            out.kept.push(KeptEvent {
+                name: name.clone(),
+                file: String::new(),
+                line: 0,
+                reason: EventKeepReason::PlaintextCollision,
+                detail: Some(
+                    "the original event bytes also occur in an external dependency source or \
+                     compiled library artifact; the strict final-binary scan could not prove \
+                     their provenance"
+                        .into(),
+                ),
+            });
+            continue;
+        }
         if let Some(reason) = keep_reason(name, edges) {
             out.kept.push(KeptEvent {
                 name: name.clone(),
@@ -430,6 +456,22 @@ fn rename_event(
             &call.file,
             crate::edits::replace(span.start, span.end, format!("{quote}{new_name}{quote}")),
         );
+    }
+
+    let pending_for_scan = pending
+        .iter()
+        .map(|(path, edits)| (path.clone(), edits.clone()))
+        .collect::<Vec<_>>();
+    let collisions = super::uncovered_plaintext_occurrences(name, texts, &pending_for_scan);
+    if !collisions.is_empty() {
+        return Err((
+            EventKeepReason::PlaintextCollision,
+            Some(format!(
+                "the original event bytes also occur outside the exact producer/consumer \
+                 edits; the strict final-binary scan could not establish provenance: {}",
+                collisions.join(", ")
+            )),
+        ));
     }
 
     let mut contributions = Vec::with_capacity(pending.len());
@@ -672,6 +714,14 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn plaintext_collision_reason_has_a_stable_report_name() {
+        assert_eq!(
+            EventKeepReason::PlaintextCollision.as_str(),
+            "plaintext-substring-collision"
+        );
     }
 
     #[test]
