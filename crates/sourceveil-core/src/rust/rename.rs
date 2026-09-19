@@ -597,6 +597,15 @@ pub(crate) fn reconcile_resolved_edits(
     new_name: &str,
     analyzed_text: &BTreeMap<PathBuf, String>,
 ) {
+    // A missing exact index is different from a proven empty reference set.
+    // It can happen when the host and rust-analyzer use different-but-equal
+    // spellings for a Windows path. In that case the high-level rename is the
+    // only complete semantic transaction we have; retaining it is safer than
+    // reducing the change to the definition and leaving its call sites stale.
+    let Some(references) = references else {
+        return;
+    };
+
     // Retain only the definition from rust-analyzer's high-level rename. Its
     // search can include a same-spelled shadowed binding in macro-heavy code;
     // references are rebuilt from the exact definition index below. Module
@@ -609,7 +618,7 @@ pub(crate) fn reconcile_resolved_edits(
     }
     by_file.retain(|_, edits| !edits.is_empty());
 
-    for (path, range) in references.into_iter().flatten() {
+    for (path, range) in references {
         if *path == candidate.file && range.contains_range(candidate.name_range) {
             continue;
         }
@@ -1392,8 +1401,18 @@ fn semantic_definition_targets(
         .into_iter()
         .filter_map(|target| {
             let macro_path = paths.file_path(target.file_id)?;
-            let relative = strip_prefix_path(&macro_path, output_root)?;
-            Some((input_root.join(relative), target.focus_or_full_range()))
+            // When both roots name the same analysis tree, keep the VFS path
+            // verbatim. Rebuilding it through strip/join can change a Windows
+            // drive/prefix spelling and make an otherwise identical HashMap
+            // key fail to match the candidate path. A macro-shell analysis is
+            // the only case that actually needs output -> input remapping.
+            let source_path = if path_eq(input_root, output_root) {
+                macro_path
+            } else {
+                let relative = strip_prefix_path(&macro_path, output_root)?;
+                input_root.join(relative)
+            };
+            Some((source_path, target.focus_or_full_range()))
         })
         .collect();
     definitions.sort_by(|left, right| {
@@ -1647,6 +1666,57 @@ impl KeepRules {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_exact_index_keeps_the_complete_semantic_rename() {
+        let path = PathBuf::from("C:/workspace/helper/src/lib.rs");
+        let source = "fn private_calculation() {} fn call() { private_calculation(); }";
+        let definition_start = source.find("private_calculation").unwrap() as u32;
+        let call_start = source.rfind("private_calculation").unwrap() as u32;
+        let name_len = "private_calculation".len() as u32;
+        let definition = TextRange::new(
+            TextSize::from(definition_start),
+            TextSize::from(definition_start + name_len),
+        );
+        let call = TextRange::new(
+            TextSize::from(call_start),
+            TextSize::from(call_start + name_len),
+        );
+        let mut edits = BTreeMap::from([(
+            path.clone(),
+            vec![
+                Indel::replace(definition, "hidden_calculation".into()),
+                Indel::replace(call, "hidden_calculation".into()),
+            ],
+        )]);
+        let candidate = Candidate {
+            kind: ItemKind::Function,
+            name: "private_calculation".into(),
+            name_range: definition,
+            file: path.clone(),
+            line: 1,
+            path: "helper::private_calculation".into(),
+            visibility: Visibility::Private,
+            attributes: Vec::new(),
+            inline_keep: false,
+            is_extern_abi: false,
+            serde_model: false,
+            is_method: false,
+            trait_method: false,
+            scope_range: None,
+        };
+
+        reconcile_resolved_edits(
+            &mut edits,
+            &candidate,
+            None,
+            "hidden_calculation",
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(edits[&path].len(), 2);
+        assert!(edits[&path].iter().any(|edit| edit.delete == call));
+    }
 
     #[test]
     fn module_prefix_reflects_file_location() {
