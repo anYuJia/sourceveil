@@ -21,7 +21,7 @@ pub struct ProjectLayout {
     pub rust_root: PathBuf,
     /// The manifest passed to `cargo metadata`.
     pub rust_manifest: PathBuf,
-    /// Directory holding `package.json`, when the project has a frontend.
+    /// Frontend directory; explicit static roots need not contain package.json.
     pub frontend_root: Option<PathBuf>,
     /// Frontend source directory (defaults to `<frontend_root>/src`).
     pub frontend_source: Option<PathBuf>,
@@ -189,17 +189,44 @@ impl ProjectLayout {
 
         let crates = load_crate_graph(&rust_manifest)?;
 
+        let tauri_frontend = detect_tauri_frontend_dist(&root, &rust_root);
         let frontend_root = match frontend_root_override {
-            Some(p) => Some(root.join(p)),
-            None => detect_frontend_root(&root, &rust_root),
+            Some(p) => {
+                let configured = root.join(p);
+                if !configured.is_dir() {
+                    bail!(
+                        "configured frontend root {} is not a directory",
+                        configured.display()
+                    );
+                }
+                // An explicit root may be a pre-built/static frontend. Those
+                // projects often have no package.json, but their JS still
+                // contains Tauri invoke/event protocol references that must be
+                // rewritten together with Rust.
+                Some(configured)
+            }
+            None => detect_frontend_root(&root, &rust_root)
+                .filter(|p| p.join("package.json").is_file())
+                .or_else(|| tauri_frontend.clone()),
         };
-        let frontend_root = frontend_root.filter(|p| p.join("package.json").is_file());
 
         let frontend_source = match (frontend_root.as_ref(), frontend_source_override) {
             (Some(fr), Some(p)) => Some(fr.join(p)),
             (Some(fr), None) => {
                 let src = fr.join("src");
-                src.is_dir().then_some(src)
+                if src.is_dir() {
+                    Some(src)
+                } else if tauri_frontend
+                    .as_ref()
+                    .is_some_and(|root| path_eq(root, fr))
+                {
+                    // A pre-built/static frontend still contains the shipped
+                    // invoke/event call sites and is also required by
+                    // `tauri::generate_context!` during verification.
+                    Some(fr.clone())
+                } else {
+                    None
+                }
             }
             (None, _) => None,
         };
@@ -255,7 +282,12 @@ fn detect_rust_root(root: &Path) -> Result<PathBuf> {
 }
 
 fn detect_frontend_root(root: &Path, rust_root: &Path) -> Option<PathBuf> {
-    if root.join("package.json").is_file() {
+    let root_package = root.join("package.json").is_file();
+    // A root package with its own source tree is the ordinary single-package
+    // Tauri layout. When it only proxies scripts into `frontend/`, prefer the
+    // actual nested package so semantic binding rename and npm verification run
+    // against the code that ships.
+    if root_package && root.join("src").is_dir() {
         return Some(root.to_path_buf());
     }
     // The conventional Tauri layout keeps the UI next to `src-tauri`.
@@ -265,6 +297,9 @@ fn detect_frontend_root(root: &Path, rust_root: &Path) -> Option<PathBuf> {
         if candidate.join("package.json").is_file() {
             return Some(candidate);
         }
+    }
+    if root_package {
+        return Some(root.to_path_buf());
     }
     // Any immediate subdirectory with a package.json, if there is exactly one.
     let mut found = Vec::new();
@@ -282,6 +317,31 @@ fn detect_frontend_root(root: &Path, rust_root: &Path) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Resolve Tauri's configured static frontend directory. The path is relative
+/// to the directory containing `tauri.conf.json`, not to the process cwd.
+/// URLs name a dev server and are deliberately ignored.
+fn detect_tauri_frontend_dist(root: &Path, rust_root: &Path) -> Option<PathBuf> {
+    let config = find_tauri_conf(rust_root)?;
+    if config
+        .extension()
+        .is_none_or(|extension| extension != "json")
+    {
+        return None;
+    }
+    let source = std::fs::read_to_string(config).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&source).ok()?;
+    let configured = value
+        .get("build")?
+        .get("frontendDist")
+        .or_else(|| value.get("build")?.get("distDir"))?
+        .as_str()?;
+    if configured.contains("://") {
+        return None;
+    }
+    let path = rust_root.join(configured).canonicalize().ok()?;
+    (path.is_dir() && path_starts_with(&path, root)).then_some(path)
 }
 
 /// Locate `tauri.conf.json` (or its json5 variant) next to the manifest.
@@ -499,6 +559,64 @@ mod tests {
 
         let found = detect_frontend_root(root, &root.join("src-tauri"));
         assert_eq!(found, Some(root.join("frontend")));
+    }
+
+    #[test]
+    fn nested_frontend_beats_a_root_script_proxy_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
+        std::fs::create_dir_all(root.join("frontend/src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build":"npm --prefix frontend run build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("frontend/package.json"), "{}").unwrap();
+
+        let found = detect_frontend_root(root, &root.join("src-tauri"));
+        assert_eq!(found, Some(root.join("frontend")));
+    }
+
+    #[test]
+    fn detects_static_frontend_from_tauri_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let rust_root = root.join("src-tauri");
+        std::fs::create_dir_all(&rust_root).unwrap();
+        std::fs::create_dir_all(root.join("dist/assets")).unwrap();
+        std::fs::write(
+            rust_root.join("tauri.conf.json"),
+            r#"{"build":{"frontendDist":"../dist"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_tauri_frontend_dist(&root, &rust_root),
+            Some(root.join("dist"))
+        );
+    }
+
+    #[test]
+    fn explicit_static_frontend_does_not_require_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src-tauri/src")).unwrap();
+        std::fs::create_dir_all(root.join("dist/js")).unwrap();
+        std::fs::write(
+            root.join("src-tauri/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src-tauri/src/lib.rs"), "").unwrap();
+
+        let layout =
+            ProjectLayout::discover(root, None, Some(Path::new("dist")), Some(Path::new(".")))
+                .unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(layout.frontend_root, Some(canonical_root.join("dist")));
+        assert_eq!(layout.frontend_source, Some(canonical_root.join("dist")));
     }
 
     #[test]

@@ -75,6 +75,19 @@ pub struct CopyOutcome {
 /// `extra_ignore` holds additional gitignore-style globs, matched against
 /// workspace-relative paths.
 pub fn copy_workspace(input: &Path, output: &Path, extra_ignore: &[String]) -> Result<CopyOutcome> {
+    copy_workspace_preserving(input, output, extra_ignore, &[])
+}
+
+/// Copy a workspace while allowing explicitly configured source roots to
+/// override the built-in generated-directory list for that exact directory.
+/// Descendant `target`, `node_modules`, or nested `dist` directories remain
+/// ignored.
+pub fn copy_workspace_preserving(
+    input: &Path,
+    output: &Path,
+    extra_ignore: &[String],
+    preserve_roots: &[PathBuf],
+) -> Result<CopyOutcome> {
     let input = input
         .canonicalize()
         .with_context(|| format!("resolving input root {}", input.display()))?;
@@ -96,6 +109,10 @@ pub fn copy_workspace(input: &Path, output: &Path, extra_ignore: &[String]) -> R
 
     let output_abs = absolutize(output)?;
     let extra = build_globset(extra_ignore)?;
+    let preserve_roots: BTreeSet<PathBuf> = preserve_roots
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
 
     let mut outcome = CopyOutcome {
         copied: BTreeSet::new(),
@@ -107,7 +124,7 @@ pub fn copy_workspace(input: &Path, output: &Path, extra_ignore: &[String]) -> R
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| should_descend(e, &input, &output_abs, &extra));
+        .filter_entry(|e| should_descend(e, &input, &output_abs, &extra, &preserve_roots));
 
     for entry in walker {
         let entry = entry.with_context(|| format!("walking {}", input.display()))?;
@@ -166,6 +183,7 @@ fn should_descend(
     input: &Path,
     output_abs: &Path,
     extra: &GlobSet,
+    preserve_roots: &BTreeSet<PathBuf>,
 ) -> bool {
     let path = entry.path();
     if path == input {
@@ -180,9 +198,10 @@ fn should_descend(
     }
 
     let name = entry.file_name().to_string_lossy();
+    let explicitly_preserved = preserve_roots.contains(path);
 
     if entry.file_type().is_dir() {
-        if IGNORED_DIRS.iter().any(|d| *d == name) {
+        if !explicitly_preserved && IGNORED_DIRS.iter().any(|d| *d == name) {
             return false;
         }
     } else if IGNORED_FILES.iter().any(|f| *f == name) {
@@ -320,6 +339,25 @@ mod tests {
 
         assert!(output.join("keep.rs").is_file());
         assert!(!output.join("vendor").exists());
+    }
+
+    #[test]
+    fn explicit_static_frontend_root_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("in");
+        let output = tmp.path().join("out");
+
+        write(&input.join("src/main.rs"), "fn main() {}");
+        write(&input.join("dist/app.js"), "invoke('ping')");
+        write(&input.join("dist/node_modules/pkg/index.js"), "junk");
+        write(&input.join("dist/nested/dist/stale.js"), "junk");
+
+        let out = copy_workspace_preserving(&input, &output, &[], &[input.join("dist")]).unwrap();
+
+        assert!(output.join("dist/app.js").is_file());
+        assert!(!output.join("dist/node_modules").exists());
+        assert!(!output.join("dist/nested/dist").exists());
+        assert!(out.copied.contains(Path::new("dist/app.js")));
     }
 
     #[test]

@@ -101,6 +101,13 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
+            // A configured source root is authoritative even when its own
+            // directory name is normally considered generated output (for
+            // example a static Tauri frontend rooted directly at `dist`).
+            // Skip matching directories only below that root.
+            if e.depth() == 0 {
+                return true;
+            }
             if e.file_type().is_dir() {
                 let name = e.file_name().to_string_lossy();
                 return !SKIP_DIRS.contains(&name.as_ref());
@@ -144,4 +151,21 @@ fn slice(source: &str, start: u32, end: u32) -> &str {
 fn line_of(source: &str, offset: u32) -> u32 {
     let offset = (offset as usize).min(source.len());
     1 + source[..offset].matches('\n').count() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_dist_root_is_scanned_but_nested_dist_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(dist.join("nested/dist")).unwrap();
+        std::fs::write(dist.join("app.js"), "invoke('ping')").unwrap();
+        std::fs::write(dist.join("nested/dist/stale.js"), "invoke('stale')").unwrap();
+
+        let files = collect_files(&dist);
+        assert_eq!(files, vec![dist.join("app.js")]);
+    }
 }
