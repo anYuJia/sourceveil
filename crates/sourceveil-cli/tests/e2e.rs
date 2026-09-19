@@ -714,8 +714,11 @@ fn transform_strings_from(input: &Path, seed: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("temp dir");
     let out = tmp.path().join("generated");
     let config = tmp.path().join("obfuscator.toml");
-    std::fs::write(&config, "version = 1\nprofile = \"balanced\"\n")
-        .expect("writing balanced config");
+    std::fs::write(
+        &config,
+        "version = 1\nprofile = \"balanced\"\n\n[strings]\nui = true\n",
+    )
+    .expect("writing balanced config");
 
     let result = Command::new(binary())
         .arg("transform")
@@ -773,6 +776,17 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
         assert!(
             mapping(&out)["strings"].get(protected).is_some(),
             "{protected:?} is missing from mapping.strings"
+        );
+    }
+
+    for protected in ["Cookie 无效: ", "indexed ", " named ", "raw {label} "] {
+        assert!(
+            !source.contains(protected),
+            "format literal fragment {protected:?} remains in generated source"
+        );
+        assert!(
+            mapping(&out)["strings"].get(protected).is_some(),
+            "format fragment {protected:?} is missing from mapping.strings"
         );
     }
 

@@ -1,10 +1,13 @@
 //! Runtime string-literal protection.
 //!
-//! This pass is intentionally narrower than "encrypt every string". It only
+//! This pass is intentionally narrower than "encrypt every string". It
 //! rewrites ordinary runtime Rust string expressions whose type can remain
-//! \`&'static str\`. Compile-time contexts (attributes, macro token trees,
-//! const/static initialisers, patterns, ABI strings, const fn bodies) are left
-//! alone.
+//! \`&'static str\`, plus the literal text pieces of structurally proven
+//! formatting macros. Format placeholders stay in a compile-time literal and
+//! each visible text piece becomes a generated named argument whose value is
+//! decoded at runtime. Other macro token trees and compile-time contexts
+//! (attributes, const/static initialisers, patterns, ABI strings and const fn
+//! bodies) are left alone.
 //!
 //! A protected value is transformed only when *every* occurrence selected for
 //! protection is safe. That makes the mapping honest: once a value appears in
@@ -24,9 +27,12 @@ use crate::scanner::{is_root_like, path_starts_with, CrateGraph};
 use aho_corasick::AhoCorasick;
 use anyhow::Result;
 use hmac::{Hmac, Mac};
-use ra_ap_syntax::ast::{self, AstNode, AstToken, HasAttrs};
+use ra_ap_syntax::{
+    ast::{self, AstNode, AstToken, HasAttrs, HasName},
+    SyntaxKind,
+};
 use sha2::Sha256;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 const STREAM_MULTIPLIER: u64 = 0x2545_F491_4F6C_DD1D;
@@ -54,6 +60,54 @@ struct Occurrence {
     start: u32,
     end: u32,
     safe: bool,
+    kind: OccurrenceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct LiteralId {
+    file: PathBuf,
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug, Clone)]
+enum OccurrenceKind {
+    Ordinary,
+    Format {
+        template: LiteralId,
+        fragment: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum FormatPart {
+    Literal { fragment: usize, value: String },
+    Argument(String),
+}
+
+#[derive(Debug, Clone)]
+struct FormatTemplate {
+    id: LiteralId,
+    file: PathBuf,
+    source: String,
+    literal_start: u32,
+    literal_end: u32,
+    insert_at: u32,
+    trailing_comma: bool,
+    parts: Vec<FormatPart>,
+    used_identifiers: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RustLiteralRecord {
+    id: LiteralId,
+    value: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedFormatFragment {
+    expression: String,
+    stream_seed: u64,
 }
 
 pub struct StringRequest<'a> {
@@ -102,27 +156,38 @@ pub fn run(
     }
 
     // Keep every decoded Rust literal, including values that are not selected
-    // for protection. The binary scanner is deliberately a raw byte scanner:
-    // protecting `token-name` cannot be claimed as complete when an unrelated
-    // literal such as `missing token-name in response` will compile the same
-    // bytes back into the artifact.
-    let rust_literal_values = parsed_files
+    // for protection. Records retain their source identity so a formatting
+    // literal can remove its own visible pieces without treating the original
+    // `text {placeholder}` template as an external collision.
+    let rust_literals = parsed_files
         .iter()
-        .flat_map(|(_, parsed, _)| {
+        .flat_map(|(path, parsed, _)| {
             parsed
                 .syntax()
                 .descendants_with_tokens()
                 .filter_map(|element| element.into_token())
                 .filter_map(ast::String::cast)
-                .filter_map(|token| syn::parse_str::<syn::LitStr>(token.text()).ok())
-                .map(|literal| literal.value())
+                .filter_map(|token| {
+                    let literal = syn::parse_str::<syn::LitStr>(token.text()).ok()?;
+                    let range = token.syntax().text_range();
+                    Some(RustLiteralRecord {
+                        id: LiteralId {
+                            file: path.clone(),
+                            start: u32::from(range.start()),
+                            end: u32::from(range.end()),
+                        },
+                        value: literal.value(),
+                    })
+                })
         })
-        .collect::<BTreeSet<_>>();
+        .collect::<Vec<_>>();
 
+    let shadowed_format_macros = collect_shadowed_format_macros(&parsed_files);
     let mut by_value: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
+    let mut format_templates = BTreeMap::new();
 
-    for (path, parsed, source) in parsed_files {
-        let Some(krate) = crate_for_file(req.graph, &path) else {
+    for (path, parsed, source) in &parsed_files {
+        let Some(krate) = crate_for_file(req.graph, path) else {
             continue;
         };
         if !is_root_like(req.graph, &krate.name)
@@ -138,6 +203,37 @@ pub fn run(
         }
         out.files_scanned += 1;
 
+        // A format macro requires a compile-time literal, so replacing the
+        // whole expression is invalid Rust. For macro shapes whose format
+        // argument position is known, split the literal output from the
+        // placeholders and register each visible fragment independently.
+        for (template, safe) in
+            discover_format_templates(parsed, path, source, &shadowed_format_macros)
+        {
+            for part in &template.parts {
+                let FormatPart::Literal { fragment, value } = part else {
+                    continue;
+                };
+                if classify(value.as_str(), req.plan).is_none()
+                    || collides_with_reserved_protocol(value.as_str(), req.reserved_protocol_values)
+                {
+                    continue;
+                }
+                by_value.entry(value.clone()).or_default().push(Occurrence {
+                    file: path.clone(),
+                    source: source.clone(),
+                    start: template.literal_start,
+                    end: template.literal_end,
+                    safe,
+                    kind: OccurrenceKind::Format {
+                        template: template.id.clone(),
+                        fragment: *fragment,
+                    },
+                });
+            }
+            format_templates.insert(template.id.clone(), template);
+        }
+
         for token in parsed
             .syntax()
             .descendants_with_tokens()
@@ -149,6 +245,18 @@ pub fn run(
                 continue;
             };
             let value = lit.value();
+            let range = token.syntax().text_range();
+            let id = LiteralId {
+                file: path.clone(),
+                start: u32::from(range.start()),
+                end: u32::from(range.end()),
+            };
+            // Proven format literals are represented by their visible pieces
+            // above. Treating the complete string as an ordinary unsafe token
+            // would pin every one of those pieces forever.
+            if format_templates.contains_key(&id) {
+                continue;
+            }
             if classify(&value, req.plan).is_none() {
                 continue;
             }
@@ -159,7 +267,6 @@ pub fn run(
                 continue;
             }
 
-            let range = token.syntax().text_range();
             let start = u32::from(range.start());
             let end = u32::from(range.end());
             let safe = !forbidden_context(token.syntax());
@@ -170,6 +277,7 @@ pub fn run(
                 start,
                 end,
                 safe,
+                kind: OccurrenceKind::Ordinary,
             });
         }
     }
@@ -192,19 +300,40 @@ pub fn run(
         !collision
     });
 
-    // A proper substring in another Rust literal is also a plaintext
-    // collision. This check uses decoded literal values, so raw strings and
-    // escaped source spellings are treated exactly as rustc treats them. Be
-    // conservative even when the containing literal is itself selectable:
-    // values are committed independently, and mapping one must never depend on
-    // a later transaction also succeeding.
-    by_value.retain(|value, _| {
-        let collision = has_rust_literal_collision(value, &rust_literal_values);
-        if collision {
-            out.kept_external_collision += 1;
+    // One unsafe occurrence keeps this plaintext globally. Do this before the
+    // literal collision proof so an exact compile-time occurrence can never be
+    // mistaken for a transformable owner.
+    let unsafe_values = by_value
+        .iter()
+        .filter(|(_, occurrences)| occurrences.iter().any(|occurrence| !occurrence.safe))
+        .map(|(value, _)| value.clone())
+        .collect::<Vec<_>>();
+    for value in unsafe_values {
+        if let Some(occurrences) = by_value.remove(&value) {
+            out.kept_unsafe_context += 1;
+            tracing::debug!(
+                value = %value,
+                occurrences = occurrences.len(),
+                "keeping string because at least one occurrence is compile-time/ambiguous"
+            );
         }
-        !collision
-    });
+    }
+
+    // A proper substring in another retained Rust literal is also a plaintext
+    // collision. Formatting literals are modelled as their runtime literal
+    // pieces plus unchanged placeholders; only an exact selected piece owned
+    // by this value is ignored.
+    let rust_collisions = by_value
+        .iter()
+        .filter(|(value, occurrences)| {
+            has_rust_literal_collision(value, occurrences, &rust_literals, &format_templates)
+        })
+        .map(|(value, _)| value.clone())
+        .collect::<Vec<_>>();
+    for value in rust_collisions {
+        by_value.remove(&value);
+        out.kept_external_collision += 1;
+    }
 
     // Registry/git/external path dependencies are intentionally not copied or
     // rewritten, but Rust literals, byte strings, identifiers, generated JS,
@@ -223,47 +352,101 @@ pub fn run(
         !collision
     });
 
-    for (value, mut occurrences) in by_value {
-        // One unsafe occurrence keeps this plaintext globally. Otherwise
-        // mapping.strings would promise the leak scanner that it disappeared
-        // when it did not.
-        if occurrences.iter().any(|occ| !occ.safe) {
-            out.kept_unsafe_context += 1;
-            tracing::debug!(
-                value = %value,
-                occurrences = occurrences.len(),
-                "keeping string because at least one occurrence is compile-time/ambiguous"
-            );
+    // rust-analyzer's file iteration order is an implementation detail. Sort
+    // before assigning ordinals so identical inputs produce the same
+    // per-occurrence identity on every host.
+    for occurrences in by_value.values_mut() {
+        occurrences.sort_by(occurrence_order);
+    }
+
+    // One macro rewrite owns one literal replacement and one argument-list
+    // insertion. Values sharing that macro must commit together. Connected
+    // components retain a per-value failure boundary for unrelated literals.
+    let mut values_by_template: BTreeMap<LiteralId, BTreeSet<String>> = BTreeMap::new();
+    for (value, occurrences) in &by_value {
+        for occurrence in occurrences {
+            if let OccurrenceKind::Format { template, .. } = &occurrence.kind {
+                values_by_template
+                    .entry(template.clone())
+                    .or_default()
+                    .insert(value.clone());
+            }
+        }
+    }
+
+    let starts = by_value.keys().cloned().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    for start in starts {
+        if visited.contains(&start) {
             continue;
         }
-
-        // rust-analyzer's file iteration order is an implementation detail.
-        // Sort before assigning ordinals so identical inputs produce the same
-        // per-occurrence identity on every host.
-        occurrences.sort_by(|left, right| {
-            left.file
-                .cmp(&right.file)
-                .then_with(|| left.start.cmp(&right.start))
-        });
+        let mut component = BTreeSet::new();
+        let mut queue = VecDeque::from([start]);
+        while let Some(value) = queue.pop_front() {
+            if !visited.insert(value.clone()) {
+                continue;
+            }
+            component.insert(value.clone());
+            for occurrence in &by_value[&value] {
+                let OccurrenceKind::Format { template, .. } = &occurrence.kind else {
+                    continue;
+                };
+                if let Some(neighbours) = values_by_template.get(template) {
+                    queue.extend(neighbours.iter().cloned());
+                }
+            }
+        }
 
         let mut contributions_by_file: BTreeMap<PathBuf, (String, Vec<ra_ap_ide::Indel>)> =
             BTreeMap::new();
-        let mut occurrence_ordinals: BTreeMap<String, u64> = BTreeMap::new();
+        let mut prepared_formats: BTreeMap<LiteralId, BTreeMap<usize, PreparedFormatFragment>> =
+            BTreeMap::new();
+        let mut protected_occurrences = 0;
 
-        for occ in &occurrences {
-            let file_identity = relative_file_identity(req.input_root, &occ.file);
-            let ordinal = occurrence_ordinals
-                .entry(file_identity.clone())
-                .or_default();
-            let stream_seed = derive_stream_seed(req.seed, &file_identity, &value, *ordinal);
-            *ordinal += 1;
-            let encoded = encode(value.as_bytes(), stream_seed);
-            let replacement = protected_expression(&encoded, stream_seed);
+        for value in &component {
+            let mut occurrence_ordinals: BTreeMap<String, u64> = BTreeMap::new();
+            for occurrence in &by_value[value] {
+                let file_identity = relative_file_identity(req.input_root, &occurrence.file);
+                let ordinal = occurrence_ordinals
+                    .entry(file_identity.clone())
+                    .or_default();
+                let stream_seed = derive_stream_seed(req.seed, &file_identity, value, *ordinal);
+                *ordinal += 1;
+                let encoded = encode(value.as_bytes(), stream_seed);
+                let expression = protected_expression(&encoded, stream_seed);
+                protected_occurrences += 1;
 
+                match &occurrence.kind {
+                    OccurrenceKind::Ordinary => {
+                        let entry = contributions_by_file
+                            .entry(occurrence.file.clone())
+                            .or_insert_with(|| (occurrence.source.clone(), Vec::new()));
+                        entry
+                            .1
+                            .push(replace(occurrence.start, occurrence.end, expression));
+                    }
+                    OccurrenceKind::Format { template, fragment } => {
+                        prepared_formats
+                            .entry(template.clone())
+                            .or_default()
+                            .insert(
+                                *fragment,
+                                PreparedFormatFragment {
+                                    expression,
+                                    stream_seed,
+                                },
+                            );
+                    }
+                }
+            }
+        }
+
+        for (id, selected) in prepared_formats {
+            let template = &format_templates[&id];
             let entry = contributions_by_file
-                .entry(occ.file.clone())
-                .or_insert_with(|| (occ.source.clone(), Vec::new()));
-            entry.1.push(replace(occ.start, occ.end, replacement));
+                .entry(template.file.clone())
+                .or_insert_with(|| (template.source.clone(), Vec::new()));
+            entry.1.extend(format_template_edits(template, &selected));
         }
 
         let contributions: Vec<Contribution<'_>> = contributions_by_file
@@ -272,16 +455,18 @@ pub fn run(
             .collect();
 
         match edits.stage_transaction(contributions) {
-            Ok(applied) => {
-                out.values_protected += 1;
-                out.occurrences_protected += applied;
+            Ok(_) => {
+                out.values_protected += component.len();
+                out.occurrences_protected += protected_occurrences;
                 out.files_edited
                     .extend(contributions_by_file.keys().cloned());
-                out.mapping
-                    .insert(value, "runtime-xorshift64star".to_string());
+                for value in component {
+                    out.mapping
+                        .insert(value, "runtime-xorshift64star".to_string());
+                }
             }
             Err(error) => {
-                out.kept_conflict += 1;
+                out.kept_conflict += component.len();
                 tracing::debug!(%error, "keeping string because its edit transaction conflicted");
             }
         }
@@ -319,10 +504,486 @@ fn copied_non_rust_texts(req: &StringRequest<'_>) -> Vec<String> {
         .collect()
 }
 
-fn has_rust_literal_collision(value: &str, literals: &BTreeSet<String>) -> bool {
-    literals
+fn collect_shadowed_format_macros(
+    parsed_files: &[(PathBuf, ast::SourceFile, String)],
+) -> HashSet<String> {
+    let mut shadowed = HashSet::new();
+    for (_, parsed, _) in parsed_files {
+        for definition in parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::MacroRules::cast)
+        {
+            if let Some(name) = definition.name() {
+                let text = name.text().to_string();
+                if is_known_runtime_macro_name(&text) {
+                    shadowed.insert(text);
+                }
+            }
+        }
+
+        // Macro imports share the macro namespace with prelude macros. It is
+        // intentionally conservative to skip even `use std::format`: a
+        // qualified `std::format!` remains provable, while guessing what an
+        // unqualified import resolves to could append arguments to an opaque
+        // macro DSL.
+        for import in parsed.syntax().descendants().filter_map(ast::UseTree::cast) {
+            if import.use_tree_list().is_some() || import.star_token().is_some() {
+                continue;
+            }
+            let imported = import
+                .rename()
+                .and_then(|rename| rename.name())
+                .map(|name| name.text().to_string())
+                .or_else(|| {
+                    import
+                        .path()?
+                        .segment()?
+                        .name_ref()
+                        .map(|name| name.text().to_string())
+                });
+            if imported.as_deref().is_some_and(is_known_runtime_macro_name) {
+                shadowed.insert(imported.expect("the imported name was checked"));
+            }
+        }
+    }
+    shadowed
+}
+
+fn is_supported_unqualified_format_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "format"
+            | "format_args"
+            | "format_args_nl"
+            | "print"
+            | "println"
+            | "eprint"
+            | "eprintln"
+            | "write"
+            | "writeln"
+    )
+}
+
+fn is_known_runtime_macro_name(name: &str) -> bool {
+    is_supported_unqualified_format_macro(name) || matches!(name, "vec" | "dbg" | "matches")
+}
+
+fn format_macro_argument_path(path: &str, shadowed: &HashSet<String>) -> Option<(usize, bool)> {
+    let compact = path.replace(' ', "");
+    let parts = compact
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let name = *parts.last()?;
+
+    let standard = match name {
+        "format" | "format_args" | "format_args_nl" | "print" | "println" | "eprint"
+        | "eprintln" => Some(0),
+        "write" | "writeln" => Some(1),
+        _ => None,
+    };
+    if let Some(index) = standard {
+        let proven_path = (parts.len() == 1 && !shadowed.contains(name))
+            || (parts.len() == 2 && matches!(parts[0], "std" | "core" | "alloc"));
+        return proven_path.then_some((index, false));
+    }
+
+    let log_index = match name {
+        "error" | "warn" | "info" | "debug" | "trace" => Some(0),
+        "log" => Some(1),
+        _ => None,
+    };
+    (parts.len() == 2 && parts[0] == "log").then_some((log_index?, true))
+}
+
+fn discover_format_templates(
+    parsed: &ast::SourceFile,
+    path: &Path,
+    source: &str,
+    shadowed: &HashSet<String>,
+) -> Vec<(FormatTemplate, bool)> {
+    let mut templates = Vec::new();
+    for call in parsed
+        .syntax()
+        .descendants()
+        .filter_map(ast::MacroCall::cast)
+    {
+        let safe = !forbidden_format_context(&call, shadowed);
+        if let Some(template) = format_template(&call, path, source, shadowed) {
+            templates.push((template, safe));
+        }
+        if transparent_runtime_macro(&call, shadowed) {
+            if let Some(token_tree) = call.token_tree() {
+                discover_nested_format_templates(
+                    &token_tree,
+                    path,
+                    source,
+                    shadowed,
+                    safe,
+                    &mut templates,
+                );
+            }
+        }
+    }
+    templates
+}
+
+fn discover_nested_format_templates(
+    token_tree: &ast::TokenTree,
+    path: &Path,
+    source: &str,
+    shadowed: &HashSet<String>,
+    safe: bool,
+    templates: &mut Vec<(FormatTemplate, bool)>,
+) {
+    let elements = token_tree
+        .syntax()
+        .children_with_tokens()
+        .filter(|element| !element.kind().is_trivia())
+        .collect::<Vec<_>>();
+    for (index, element) in elements.iter().enumerate() {
+        let Some(nested) = element
+            .as_node()
+            .and_then(|node| ast::TokenTree::cast(node.clone()))
+        else {
+            continue;
+        };
+        if let Some(macro_path) = nested_macro_path(&elements, index) {
+            if let Some(template) =
+                format_template_from_tree(&macro_path, &nested, path, source, shadowed)
+            {
+                templates.push((template, safe));
+            }
+            // An opaque macro owns the grammar of its complete token tree. Do
+            // not discover format-looking tokens inside it. Proven expression
+            // containers retain ordinary Rust expression semantics and may be
+            // traversed recursively.
+            if transparent_runtime_macro_path(&macro_path, shadowed) {
+                discover_nested_format_templates(&nested, path, source, shadowed, safe, templates);
+            }
+        } else {
+            // Parentheses/brackets/braces used only for grouping inside a
+            // transparent macro do not introduce a new macro grammar.
+            discover_nested_format_templates(&nested, path, source, shadowed, safe, templates);
+        }
+    }
+}
+
+fn nested_macro_path(
+    elements: &[ra_ap_syntax::SyntaxElement],
+    token_tree_index: usize,
+) -> Option<String> {
+    if token_tree_index < 2 || elements[token_tree_index - 1].to_string() != "!" {
+        return None;
+    }
+    let name = elements[token_tree_index - 2].as_token()?;
+    if name.kind() != SyntaxKind::IDENT {
+        return None;
+    }
+    if token_tree_index >= 4 && elements[token_tree_index - 3].to_string() == "::" {
+        let prefix = elements[token_tree_index - 4].as_token()?;
+        if prefix.kind() == SyntaxKind::IDENT {
+            return Some(format!("{}::{}", prefix.text(), name.text()));
+        }
+    }
+    Some(name.text().to_string())
+}
+
+fn format_template(
+    call: &ast::MacroCall,
+    path: &Path,
+    source: &str,
+    shadowed: &HashSet<String>,
+) -> Option<FormatTemplate> {
+    let macro_path = call.path()?.syntax().text().to_string();
+    let token_tree = call.token_tree()?;
+    format_template_from_tree(&macro_path, &token_tree, path, source, shadowed)
+}
+
+fn format_template_from_tree(
+    macro_path: &str,
+    token_tree: &ast::TokenTree,
+    path: &Path,
+    source: &str,
+    shadowed: &HashSet<String>,
+) -> Option<FormatTemplate> {
+    let (mut format_index, log_macro) = format_macro_argument_path(macro_path, shadowed)?;
+    let tree_range = token_tree.syntax().text_range();
+    let inner = token_tree
+        .syntax()
+        .children_with_tokens()
+        .filter(|element| {
+            !element.kind().is_trivia()
+                && element.text_range().start() > tree_range.start()
+                && element.text_range().end() < tree_range.end()
+        })
+        .collect::<Vec<_>>();
+    let trailing_comma = inner
+        .last()
+        .is_some_and(|element| element.kind() == SyntaxKind::COMMA);
+    let mut arguments = vec![Vec::new()];
+    for element in inner {
+        if element.kind() == SyntaxKind::COMMA {
+            arguments.push(Vec::new());
+        } else {
+            arguments.last_mut()?.push(element);
+        }
+    }
+
+    // `log::info!(target: "name", "...")` and
+    // `log::log!(target: "name", level, "...")` carry a metadata argument
+    // in front of the ordinary format position.
+    if log_macro
+        && arguments.first().is_some_and(|argument| {
+            argument.len() >= 2
+                && argument[0].kind() == SyntaxKind::IDENT
+                && argument[0].to_string() == "target"
+                && argument[1].kind() == SyntaxKind::COLON
+        })
+    {
+        format_index += 1;
+    }
+
+    let argument = arguments.get(format_index)?;
+    if argument.len() != 1 {
+        return None;
+    }
+    let token = argument[0]
+        .as_token()
+        .cloned()
+        .and_then(ast::String::cast)?;
+    let literal = syn::parse_str::<syn::LitStr>(token.text()).ok()?;
+    let parts = split_format_literal(&literal.value())?;
+    let range = token.syntax().text_range();
+    let id = LiteralId {
+        file: path.to_path_buf(),
+        start: u32::from(range.start()),
+        end: u32::from(range.end()),
+    };
+    let insert_at = u32::from(token_tree.syntax().last_token()?.text_range().start());
+    let used_identifiers = token_tree
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| token.kind() == SyntaxKind::IDENT)
+        .map(|token| token.text().to_string())
+        .collect();
+
+    Some(FormatTemplate {
+        id,
+        file: path.to_path_buf(),
+        source: source.to_string(),
+        literal_start: u32::from(range.start()),
+        literal_end: u32::from(range.end()),
+        insert_at,
+        trailing_comma,
+        parts,
+        used_identifiers,
+    })
+}
+
+fn split_format_literal(value: &str) -> Option<Vec<FormatPart>> {
+    use rustc_parse_format::{ParseMode, Parser, Piece};
+
+    // rustc's parser is the grammar authority. The small scanner below exists
+    // only to retain the exact decoded `{...}` spelling for reconstruction.
+    let mut parser = Parser::new(value, None, None, false, ParseMode::Format);
+    let expected_arguments = parser
+        .by_ref()
+        .filter(|piece| matches!(piece, Piece::NextArgument(_)))
+        .count();
+    if !parser.errors.is_empty() {
+        return None;
+    }
+
+    let bytes = value.as_bytes();
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut cursor = 0;
+    let mut fragment = 0;
+    let mut arguments = 0;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'{' if bytes.get(cursor + 1) == Some(&b'{') => {
+                literal.push('{');
+                cursor += 2;
+            }
+            b'}' if bytes.get(cursor + 1) == Some(&b'}') => {
+                literal.push('}');
+                cursor += 2;
+            }
+            b'{' => {
+                if !literal.is_empty() {
+                    parts.push(FormatPart::Literal {
+                        fragment,
+                        value: std::mem::take(&mut literal),
+                    });
+                    fragment += 1;
+                }
+                let close = value[cursor + 1..].find('}')? + cursor + 1;
+                if value[cursor + 1..close].contains('{') {
+                    return None;
+                }
+                parts.push(FormatPart::Argument(value[cursor..=close].to_string()));
+                arguments += 1;
+                cursor = close + 1;
+            }
+            b'}' => return None,
+            _ => {
+                let character = value[cursor..].chars().next()?;
+                literal.push(character);
+                cursor += character.len_utf8();
+            }
+        }
+    }
+    if !literal.is_empty() {
+        parts.push(FormatPart::Literal {
+            fragment,
+            value: literal,
+        });
+    }
+    (arguments == expected_arguments).then_some(parts)
+}
+
+fn append_format_literal(value: &str, output: &mut String) {
+    for character in value.chars() {
+        match character {
+            '{' => output.push_str("{{"),
+            '}' => output.push_str("}}"),
+            _ => output.push(character),
+        }
+    }
+}
+
+fn format_template_edits(
+    template: &FormatTemplate,
+    selected: &BTreeMap<usize, PreparedFormatFragment>,
+) -> Vec<ra_ap_ide::Indel> {
+    let mut skeleton = String::new();
+    let mut generated = Vec::new();
+    let mut used = template.used_identifiers.clone();
+    for part in &template.parts {
+        match part {
+            FormatPart::Literal { fragment, value } => {
+                if let Some(prepared) = selected.get(fragment) {
+                    let name =
+                        unique_format_argument_name(prepared.stream_seed, *fragment, &mut used);
+                    skeleton.push('{');
+                    skeleton.push_str(&name);
+                    skeleton.push('}');
+                    generated.push((name, prepared.expression.clone()));
+                } else {
+                    append_format_literal(value, &mut skeleton);
+                }
+            }
+            FormatPart::Argument(argument) => skeleton.push_str(argument),
+        }
+    }
+
+    let literal = format!("{skeleton:?}");
+    debug_assert!(syn::parse_str::<syn::LitStr>(&literal).is_ok());
+    let arguments = generated
+        .into_iter()
+        .map(|(name, expression)| format!("{name}={expression}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let insertion = if template.trailing_comma {
+        format!(" {arguments}")
+    } else {
+        format!(",{arguments}")
+    };
+    vec![
+        replace(template.literal_start, template.literal_end, literal),
+        replace(template.insert_at, template.insert_at, insertion),
+    ]
+}
+
+fn unique_format_argument_name(
+    stream_seed: u64,
+    fragment: usize,
+    used: &mut BTreeSet<String>,
+) -> String {
+    let base = format!("__sv_fmt_{stream_seed:016x}_{fragment:x}");
+    if used.insert(base.clone()) {
+        return base;
+    }
+    for nonce in 1u64.. {
+        let candidate = format!("{base}_{nonce:x}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("the generated format argument namespace is finite")
+}
+
+fn occurrence_order(left: &Occurrence, right: &Occurrence) -> std::cmp::Ordering {
+    left.file
+        .cmp(&right.file)
+        .then_with(|| left.start.cmp(&right.start))
+        .then_with(|| left.end.cmp(&right.end))
+        .then_with(|| match (&left.kind, &right.kind) {
+            (OccurrenceKind::Ordinary, OccurrenceKind::Ordinary) => std::cmp::Ordering::Equal,
+            (OccurrenceKind::Ordinary, OccurrenceKind::Format { .. }) => std::cmp::Ordering::Less,
+            (OccurrenceKind::Format { .. }, OccurrenceKind::Ordinary) => {
+                std::cmp::Ordering::Greater
+            }
+            (
+                OccurrenceKind::Format {
+                    template: left_template,
+                    fragment: left_fragment,
+                },
+                OccurrenceKind::Format {
+                    template: right_template,
+                    fragment: right_fragment,
+                },
+            ) => left_template
+                .cmp(right_template)
+                .then_with(|| left_fragment.cmp(right_fragment)),
+        })
+}
+
+fn has_rust_literal_collision(
+    value: &str,
+    occurrences: &[Occurrence],
+    literals: &[RustLiteralRecord],
+    templates: &BTreeMap<LiteralId, FormatTemplate>,
+) -> bool {
+    let ordinary_sites = occurrences
         .iter()
-        .any(|literal| literal != value && literal.contains(value))
+        .filter(|occurrence| matches!(occurrence.kind, OccurrenceKind::Ordinary))
+        .map(|occurrence| LiteralId {
+            file: occurrence.file.clone(),
+            start: occurrence.start,
+            end: occurrence.end,
+        })
+        .collect::<BTreeSet<_>>();
+    let format_sites = occurrences
+        .iter()
+        .filter_map(|occurrence| match &occurrence.kind {
+            OccurrenceKind::Format { template, fragment } => Some((template.clone(), *fragment)),
+            OccurrenceKind::Ordinary => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    literals.iter().any(|literal| {
+        if let Some(template) = templates.get(&literal.id) {
+            return template.parts.iter().any(|part| match part {
+                FormatPart::Literal {
+                    fragment,
+                    value: literal_piece,
+                } => {
+                    literal_piece.contains(value)
+                        && !(literal_piece == value
+                            && format_sites.contains(&(literal.id.clone(), *fragment)))
+                }
+                FormatPart::Argument(argument) => argument.contains(value),
+            });
+        }
+
+        literal.value.contains(value)
+            && !(literal.value == value && ordinary_sites.contains(&literal.id))
+    })
 }
 
 fn collides_with_reserved_protocol(value: &str, reserved: &HashSet<String>) -> bool {
@@ -658,14 +1319,41 @@ fn classify(value: &str, plan: &StringsPlan) -> Option<&'static str> {
 /// change whether the source is const-evaluable, pattern syntax, ABI syntax, or
 /// macro/attribute input.
 fn forbidden_context(token: &ra_ap_syntax::SyntaxToken) -> bool {
-    let mut current = token.parent();
+    forbidden_ancestors(token.parent(), None)
+}
+
+/// A supported format literal necessarily lives in its own `TOKEN_TREE`.
+/// Start above the macro call so that owning tree is allowed, while an outer
+/// opaque macro, attribute, const item, or const function still rejects the
+/// runtime decoder. A small set of proven expression-container macros may
+/// surround it; their input grammar accepts the rewritten inner macro call.
+fn forbidden_format_context(call: &ast::MacroCall, shadowed: &HashSet<String>) -> bool {
+    forbidden_ancestors(call.syntax().parent(), Some(shadowed))
+}
+
+fn forbidden_ancestors(
+    mut current: Option<ra_ap_syntax::SyntaxNode>,
+    transparent_macros: Option<&HashSet<String>>,
+) -> bool {
     while let Some(node) = current {
         let kind = format!("{:?}", node.kind());
+
+        if kind == "TOKEN_TREE" {
+            if let Some(shadowed) = transparent_macros {
+                let outer = node.parent().and_then(ast::MacroCall::cast);
+                if let Some(outer) =
+                    outer.filter(|outer| transparent_runtime_macro(outer, shadowed))
+                {
+                    current = outer.syntax().parent();
+                    continue;
+                }
+            }
+            return true;
+        }
 
         if matches!(
             kind.as_str(),
             "ATTR"
-                | "TOKEN_TREE"
                 | "CONST"
                 | "STATIC"
                 | "ABI"
@@ -703,6 +1391,32 @@ fn forbidden_context(token: &ra_ap_syntax::SyntaxToken) -> bool {
         current = node.parent();
     }
     false
+}
+
+fn transparent_runtime_macro(call: &ast::MacroCall, shadowed: &HashSet<String>) -> bool {
+    let Some(path) = call.path() else {
+        return false;
+    };
+    transparent_runtime_macro_path(&path.syntax().text().to_string(), shadowed)
+}
+
+fn transparent_runtime_macro_path(path: &str, shadowed: &HashSet<String>) -> bool {
+    if format_macro_argument_path(path, shadowed).is_some() {
+        return true;
+    }
+    let compact = path.replace(' ', "");
+    let parts = compact
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(name) = parts.last().copied() else {
+        return false;
+    };
+    if matches!(name, "vec" | "dbg" | "matches") {
+        return (parts.len() == 1 && !shadowed.contains(name))
+            || (parts.len() == 2 && matches!(parts[0], "std" | "core" | "alloc"));
+    }
+    parts == ["serde_json", "json"]
 }
 
 fn derive_stream_seed(build_seed: u64, file_identity: &str, value: &str, ordinal: u64) -> u64 {
@@ -878,10 +1592,6 @@ mod tests {
                 "inline-const-protocol",
             ),
             (
-                "fn f() { format_args!(\"format-protocol\"); }",
-                "format-protocol",
-            ),
-            (
                 "fn f() { include_bytes!(\"include-protocol\"); }",
                 "include-protocol",
             ),
@@ -943,6 +1653,150 @@ mod tests {
         assert_eq!(classify("Download complete", &plan), Some("ui"));
     }
 
+    fn one_format_template(source: &str) -> Option<FormatTemplate> {
+        let parsed =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        let call = parsed
+            .syntax()
+            .descendants()
+            .find_map(ast::MacroCall::cast)?;
+        format_template(
+            &call,
+            Path::new("/input/src/main.rs"),
+            source,
+            &HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn format_parser_preserves_placeholders_and_decodes_literal_braces() {
+        let parts = split_format_literal(
+            "Cookie 无效: {0:>8}; {name}; {value:width$.precision$}; {{label}}",
+        )
+        .unwrap();
+        let rendered = parts
+            .iter()
+            .map(|part| match part {
+                FormatPart::Literal { value, .. } => format!("L:{value}"),
+                FormatPart::Argument(value) => format!("A:{value}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            [
+                "L:Cookie 无效: ",
+                "A:{0:>8}",
+                "L:; ",
+                "A:{name}",
+                "L:; ",
+                "A:{value:width$.precision$}",
+                "L:; {label}",
+            ]
+        );
+    }
+
+    #[test]
+    fn format_macro_rewrite_keeps_the_compile_time_skeleton() {
+        let source = r###"fn f(error: u32, name: &str, width: usize, precision: usize) {
+    let _ = format!(r#"Cookie 无效: {}; indexed {0:>8}; {name}; {{label}} {error:width$.precision$}"#, error);
+}"###;
+        let template = one_format_template(source).unwrap();
+        let selected = template
+            .parts
+            .iter()
+            .filter_map(|part| {
+                let FormatPart::Literal { fragment, value } = part else {
+                    return None;
+                };
+                let seed = 100 + *fragment as u64;
+                Some((
+                    *fragment,
+                    PreparedFormatFragment {
+                        expression: protected_expression(&encode(value.as_bytes(), seed), seed),
+                        stream_seed: seed,
+                    },
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let rewritten =
+            crate::edits::apply_indels(source, &format_template_edits(&template, &selected))
+                .unwrap();
+
+        assert!(!rewritten.contains("Cookie 无效"));
+        for placeholder in ["{}", "{0:>8}", "{name}", "{error:width$.precision$}"] {
+            assert!(rewritten.contains(placeholder), "lost {placeholder:?}");
+        }
+        assert!(rewritten.contains("OnceLock"));
+        assert!(rewritten.contains("__sv_fmt_"));
+    }
+
+    #[test]
+    fn shadowed_format_macro_is_not_rewritten() {
+        let source = r#"
+macro_rules! format { ($value:expr) => { $value } }
+fn f() { let _ = format!("Cookie 无效: {}"); }
+"#;
+        let parsed =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        let parsed_files = vec![(
+            PathBuf::from("/input/src/main.rs"),
+            parsed.clone(),
+            source.into(),
+        )];
+        let shadowed = collect_shadowed_format_macros(&parsed_files);
+        let call = parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::MacroCall::cast)
+            .find(|call| {
+                call.path()
+                    .is_some_and(|path| path.syntax().text() == "format")
+            })
+            .unwrap();
+        assert!(
+            format_template(&call, Path::new("/input/src/main.rs"), source, &shadowed,).is_none()
+        );
+    }
+
+    #[test]
+    fn format_macro_inside_vec_is_a_runtime_context() {
+        let source = r#"fn f(error: u32) { let _ = vec![format!("Cookie 无效: {}", error)]; }"#;
+        let parsed =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        let templates = discover_format_templates(
+            &parsed,
+            Path::new("/input/src/main.rs"),
+            source,
+            &HashSet::new(),
+        );
+        assert_eq!(templates.len(), 1);
+        assert!(
+            templates[0].1,
+            "nested format macro was treated as const/opaque"
+        );
+        assert!(templates[0].0.parts.iter().any(|part| matches!(
+            part,
+            FormatPart::Literal { value, .. } if value == "Cookie 无效: "
+        )));
+    }
+
+    #[test]
+    fn format_looking_tokens_inside_an_opaque_macro_are_kept() {
+        let source = r#"
+macro_rules! opaque { ($($token:tt)*) => { () } }
+fn f(error: u32) { opaque!(format!("Cookie 无效: {}", error)); }
+"#;
+        let parsed =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        let templates = discover_format_templates(
+            &parsed,
+            Path::new("/input/src/main.rs"),
+            source,
+            &HashSet::new(),
+        );
+        assert!(templates.is_empty());
+    }
+
     #[test]
     fn generated_expression_contains_no_plaintext() {
         let value = "device-validation";
@@ -990,16 +1844,50 @@ mod tests {
 
     #[test]
     fn a_value_inside_a_larger_rust_literal_is_a_plaintext_collision() {
-        let literals = BTreeSet::from([
-            "aweme_detail".to_string(),
-            "No aweme_detail in response".to_string(),
-            "bytes=0-1048575".to_string(),
-        ]);
+        let path = PathBuf::from("/input/src/main.rs");
+        let literals = [
+            "aweme_detail",
+            "No aweme_detail in response",
+            "bytes=0-1048575",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| RustLiteralRecord {
+            id: LiteralId {
+                file: path.clone(),
+                start: index as u32,
+                end: index as u32 + 1,
+            },
+            value: value.to_string(),
+        })
+        .collect::<Vec<_>>();
+        let exact = Occurrence {
+            file: path,
+            source: String::new(),
+            start: 0,
+            end: 1,
+            safe: true,
+            kind: OccurrenceKind::Ordinary,
+        };
 
-        for value in ["aweme_detail", "bytes=0-"] {
-            assert!(has_rust_literal_collision(value, &literals));
-        }
-        assert!(!has_rust_literal_collision("unrelated", &literals));
+        assert!(has_rust_literal_collision(
+            "aweme_detail",
+            &[exact],
+            &literals,
+            &BTreeMap::new(),
+        ));
+        assert!(has_rust_literal_collision(
+            "bytes=0-",
+            &[],
+            &literals,
+            &BTreeMap::new(),
+        ));
+        assert!(!has_rust_literal_collision(
+            "unrelated",
+            &[],
+            &literals,
+            &BTreeMap::new(),
+        ));
     }
 
     #[test]

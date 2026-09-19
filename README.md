@@ -48,7 +48,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 | Tauri event rename (Rust + TypeScript) | done |
 | serde-safe field / enum-variant rename | done; wire names and Rust paths in documented serde metadata are preserved |
 | proc-macro attribute contracts | `thiserror` named format captures follow field renames |
-| runtime Rust string protection | done for safe runtime expressions; compile-time/macro contexts are kept |
+| runtime Rust string protection | done for safe runtime expressions and proven format-macro literal fragments; compile-time/opaque macro contexts are kept |
 | TypeScript semantic private-binding rename | done — OXC scope-aware; properties/JSON keys/imports/exports are kept |
 | module file rename | done (transactional file/dir moves; enabled by `aggressive`) |
 | dependency boundary policy | done (external, private-obfuscate, obfuscate, wrapper) |
@@ -516,8 +516,19 @@ runtime expression. Each occurrence gets a build-specific HMAC-derived stream
 seed and encoded bytes; the generated expression lazily decodes once into a
 block-local `OnceLock<String>` and still evaluates to `&'static str`.
 
-This is deliberately not applied to attributes, macro token trees, const/static
-initialisers, patterns, ABI strings, const functions or `no_std` crates.
+Format strings are handled without violating Rust's compile-time-literal rule.
+For proven standard formatting macros (`format!`, `format_args!`, the
+`print!`/`write!` families, and explicitly qualified `log::...!` macros), each
+selected literal text fragment becomes a generated named argument that decodes
+at runtime. The original placeholders and their formatting specifications stay
+in the literal unchanged, including explicit positions, named captures,
+dynamic width/precision and escaped braces. The pass also finds these macros
+inside proven expression containers such as `vec!` and `serde_json::json!`.
+Shadowed macros and unknown macro DSLs fail closed.
+
+Protection is deliberately not applied to attributes, opaque macro token
+trees, const/static initialisers, patterns, ABI strings, const functions or
+`no_std` crates.
 Tauri command/event strings remain owned by their dedicated cross-language
 passes. A value is recorded in `mapping.strings` only if every selected
 occurrence can be transformed as one transaction and it is not a substring of

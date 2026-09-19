@@ -22,6 +22,18 @@ fn macro_owned() {
     println!("a larger nested-protocol diagnostic");
 }
 
+fn formatted_runtime() -> Vec<String> {
+    let name = "Ada";
+    let value = 12.3456;
+    let width = 8;
+    let precision = 2;
+    vec![
+        format!("Cookie 无效: {}", 401),
+        format!("indexed {0:>8} named {name}", 7),
+        format!(r#"raw {{label}} {value:>width$.precision$}"#),
+    ]
+}
+
 fn benchmark() {
     let first_start = std::time::Instant::now();
     std::hint::black_box(internal_state());
@@ -51,5 +63,8 @@ fn main() {
     // fixture and the string fixture test independent things.
     let line = format!("{state}:{a}:{b}:{mixed}:{nested}:{compile_time}");
     println!("{line}");
+    for line in formatted_runtime() {
+        println!("{line}");
+    }
     macro_owned();
 }
