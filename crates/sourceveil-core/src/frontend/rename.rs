@@ -4,8 +4,9 @@
 //! gives us the binding and every resolved identifier reference; we rewrite
 //! only those spans. Member properties (`object.name`), object keys, JSON
 //! fields and React props are never identifier references and therefore never
-//! enter the edit set. When the syntax makes that distinction ambiguous — for
-//! example an object shorthand property — the complete binding is kept.
+//! enter the edit set. Object/binding shorthand is expanded (`{ value }` to
+//! `{ value: hidden }`) so the property contract stays intact while the
+//! lexical binding is still renamed.
 //!
 //! The pass is fail-closed around module boundaries as well. Imports and
 //! exports are API surface, not private locals. A top-level binding is eligible
@@ -19,7 +20,10 @@ use crate::names::{NameCase, NameDeriver, SeedDomain};
 use crate::report::FrontendStats;
 use anyhow::Result;
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{BindingIdentifier, IdentifierName, IdentifierReference};
+use oxc_ast::ast::{
+    BindingIdentifier, BindingProperty, IdentifierName, IdentifierReference, ObjectProperty,
+    TSTypePredicate, TSTypePredicateName,
+};
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Semantic, SemanticBuilder, SymbolFlags, SymbolId};
@@ -98,6 +102,8 @@ pub fn run(
             continue;
         }
         let semantic = built.semantic;
+        let mut contracts = SyntaxContractCollector::default();
+        contracts.visit_program(program);
         let ids: Vec<SymbolId> = semantic.scoping().symbol_ids().collect();
 
         let dynamic_scope = contains_dynamic_scope(&file.text);
@@ -130,16 +136,6 @@ pub fn run(
                 Some("exported-binding")
             } else if is_in_unsafe_scope(&semantic, scope) {
                 Some("dynamic-scope")
-            } else if is_object_shorthand(&semantic, declaration.id(), declaration_span)
-                || semantic.symbol_references(symbol_id).any(|reference| {
-                    is_object_shorthand(
-                        &semantic,
-                        reference.node_id(),
-                        semantic.reference_span(reference),
-                    )
-                })
-            {
-                Some("object-shorthand")
             } else {
                 None
             };
@@ -160,17 +156,50 @@ pub fn run(
                 "frontend::{relative}::{old_name}@{}",
                 declaration_span.start
             );
-            let new_name = names.derive(SeedDomain::FrontendSymbol, &identity, NameCase::Snake)?;
+            // JSX decides whether a tag is a component or an intrinsic HTML
+            // element from its first character. Preserve the uppercase class
+            // of component-style bindings or `<Widget />` would silently turn
+            // into a lookup in `JSX.IntrinsicElements` after obfuscation.
+            let case = if old_name.chars().next().is_some_and(char::is_uppercase) {
+                NameCase::Camel
+            } else {
+                NameCase::Snake
+            };
+            let new_name = names.derive(SeedDomain::FrontendSymbol, &identity, case)?;
 
-            let mut spans = BTreeSet::new();
-            spans.insert((declaration_span.start, declaration_span.end));
+            let mut replacements = std::collections::BTreeMap::new();
+            replacements.insert(
+                (declaration_span.start, declaration_span.end),
+                replacement_for_reference(
+                    declaration_span,
+                    &old_name,
+                    &new_name,
+                    &contracts.shorthand_spans,
+                ),
+            );
             for reference in semantic.symbol_references(symbol_id) {
                 let span = semantic.reference_span(reference);
-                spans.insert((span.start, span.end));
+                replacements.insert(
+                    (span.start, span.end),
+                    replacement_for_reference(
+                        span,
+                        &old_name,
+                        &new_name,
+                        &contracts.shorthand_spans,
+                    ),
+                );
             }
-            let indels = spans
+            let callable = enclosing_callable_span(&semantic, declaration.id());
+            for predicate in contracts
+                .type_predicates
+                .iter()
+                .filter(|predicate| predicate.owner == callable && predicate.name == old_name)
+            {
+                replacements.insert(predicate.span, new_name.clone());
+            }
+            let indels = replacements
                 .into_iter()
-                .map(|(start, end)| replace(start, end, new_name.clone()))
+                .map(|((start, end), replacement)| replace(start, end, replacement))
                 .collect::<Vec<_>>();
 
             let Some(rel) = file.path.strip_prefix(req.input_root).ok() else {
@@ -314,23 +343,106 @@ fn has_property_declaration_ancestor(
     false
 }
 
-fn is_object_shorthand(
+fn replacement_for_reference(
+    span: oxc_span::Span,
+    old_name: &str,
+    new_name: &str,
+    shorthand_spans: &BTreeSet<(u32, u32)>,
+) -> String {
+    // In a shorthand the one token carries two meanings: a stable property
+    // key and a lexical binding/reference. Compare against the key span (not
+    // the whole value span, which includes defaults such as `title = "x"`)
+    // and materialize the two roles before renaming the lexical side. OXC
+    // deliberately normalizes some TypeScript binding properties without
+    // setting `shorthand`, but a shorthand's key and lexical identifier still
+    // occupy the exact same span. Explicit aliases (`{ wire: local }`) do not.
+    if shorthand_spans.contains(&(span.start, span.end)) {
+        format!("{old_name}: {new_name}")
+    } else {
+        new_name.to_owned()
+    }
+}
+
+#[derive(Default)]
+struct SyntaxContractCollector {
+    shorthand_spans: BTreeSet<(u32, u32)>,
+    callable_stack: Vec<(u32, u32)>,
+    type_predicates: Vec<TypePredicateContract>,
+}
+
+struct TypePredicateContract {
+    owner: Option<(u32, u32)>,
+    name: String,
+    span: (u32, u32),
+}
+
+impl<'a> Visit<'a> for SyntaxContractCollector {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        if matches!(
+            kind,
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+        ) {
+            let span = kind.span();
+            self.callable_stack.push((span.start, span.end));
+        }
+    }
+
+    fn leave_node(&mut self, kind: AstKind<'a>) {
+        if matches!(
+            kind,
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+        ) {
+            self.callable_stack.pop();
+        }
+    }
+
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        if property.shorthand {
+            let span = property.key.span();
+            self.shorthand_spans.insert((span.start, span.end));
+        }
+        walk::walk_object_property(self, property);
+    }
+
+    fn visit_binding_property(&mut self, property: &BindingProperty<'a>) {
+        let key = property.key.span();
+        let value = property.value.span();
+        // With a default (`{ title = "x" }`) the value span is wider than the
+        // key, but both start at the same byte. An explicit alias
+        // (`{ title: local }`) necessarily starts the value later.
+        if key.start == value.start {
+            self.shorthand_spans.insert((key.start, key.end));
+        }
+        walk::walk_binding_property(self, property);
+    }
+
+    fn visit_ts_type_predicate(&mut self, predicate: &TSTypePredicate<'a>) {
+        if let TSTypePredicateName::Identifier(identifier) = &predicate.parameter_name {
+            let span = identifier.span();
+            self.type_predicates.push(TypePredicateContract {
+                owner: self.callable_stack.last().copied(),
+                name: identifier.name.to_string(),
+                span: (span.start, span.end),
+            });
+        }
+        walk::walk_ts_type_predicate(self, predicate);
+    }
+}
+
+fn enclosing_callable_span(
     semantic: &Semantic<'_>,
     node_id: oxc_semantic::NodeId,
-    span: oxc_span::Span,
-) -> bool {
-    semantic
-        .nodes()
-        .ancestor_kinds(node_id)
-        .any(|kind| match kind {
-            AstKind::ObjectProperty(property) => {
-                property.shorthand && property.value.span() == span
-            }
-            AstKind::BindingProperty(property) => {
-                property.shorthand && property.value.span() == span
-            }
-            _ => false,
+) -> Option<(u32, u32)> {
+    semantic.nodes().ancestor_kinds(node_id).find_map(|kind| {
+        matches!(
+            kind,
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+        )
+        .then(|| {
+            let span = kind.span();
+            (span.start, span.end)
         })
+    })
 }
 
 #[derive(Default)]
@@ -363,12 +475,17 @@ mod tests {
     use tempfile::tempdir;
 
     fn run_source(source: &str) -> (String, RenameOutcome) {
+        run_source_named(source, "app.ts")
+    }
+
+    fn run_source_named(source: &str, file_name: &str) -> (String, RenameOutcome) {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("frontend/src");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("app.ts");
+        let path = root.join(file_name);
         std::fs::write(&path, source).unwrap();
-        let copied = BTreeSet::from([PathBuf::from("frontend/src/app.ts")]);
+        let relative = PathBuf::from("frontend/src").join(file_name);
+        let copied = BTreeSet::from([relative.clone()]);
         let mut names = NameDeriver::new(7, 5, 9, HashSet::new());
         let mut edits = EditPlan::new();
         let outcome = run(
@@ -383,14 +500,14 @@ mod tests {
         .unwrap();
         let output_root = tmp.path().join("out");
         std::fs::create_dir_all(output_root.join("frontend/src")).unwrap();
-        std::fs::copy(&path, output_root.join("frontend/src/app.ts")).unwrap();
+        std::fs::copy(&path, output_root.join(&relative)).unwrap();
         edits.apply(tmp.path(), &output_root).unwrap();
-        let out = std::fs::read_to_string(output_root.join("frontend/src/app.ts")).unwrap();
+        let out = std::fs::read_to_string(output_root.join(relative)).unwrap();
         (out, outcome)
     }
 
     #[test]
-    fn semantic_parse_rejects_exports_and_shorthand() {
+    fn semantic_parse_keeps_exports_and_expands_shorthand() {
         let (out, outcome) = run_source(
             "export const api = 1; function outer() { const local = 2; return { local }; }",
         );
@@ -399,11 +516,41 @@ mod tests {
             .stats
             .kept_by_reason
             .contains_key("exported-binding"));
-        assert!(outcome
-            .stats
-            .kept_by_reason
-            .contains_key("object-shorthand"));
         assert!(out.contains("export const api = 1"));
+        assert!(!out.contains("const local"));
+        assert!(out.contains("return { local:"), "{out}");
+    }
+
+    #[test]
+    fn destructured_props_expand_and_component_names_stay_uppercase() {
+        let source = r#"type Props={title?:string,onSelect:()=>void};
+            function Widget({title="x",onSelect}:Props){return <button onClick={onSelect}>{title}</button>}
+            function Page(){const ids=[1,null].filter((id):id is number=>Boolean(id));return <Widget onSelect={()=>void ids}/>}"#;
+        let (out, outcome) = run_source_named(source, "app.tsx");
+        let widget = outcome
+            .mapping
+            .frontend_symbols
+            .iter()
+            .find(|(identity, _)| identity.contains("::Widget@"))
+            .map(|(_, name)| name)
+            .expect("Widget should be renamed");
+        assert!(widget.starts_with(char::is_uppercase), "{widget}");
+        assert!(out.contains(&format!("function {widget}")), "{out}");
+        assert!(out.contains(&format!("<{widget} ")), "{out}");
+        assert!(out.contains("{title: "), "{out}");
+        assert!(out.contains("onSelect: "), "{out}");
+        assert!(!out.contains("{title=\"x\",onSelect}"), "{out}");
+        let predicate_parameter = outcome
+            .mapping
+            .frontend_symbols
+            .iter()
+            .find(|(identity, _)| identity.contains("::id@"))
+            .map(|(_, name)| name)
+            .expect("type predicate parameter should be renamed");
+        assert!(
+            out.contains(&format!("):{predicate_parameter} is number")),
+            "{out}"
+        );
     }
 
     #[test]
