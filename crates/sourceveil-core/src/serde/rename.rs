@@ -20,7 +20,8 @@ use crate::report::{RenameStats, SkipReason, SkippedSymbol};
 use crate::rust::analysis::RustAnalysis;
 use crate::rust::candidates::{self, Candidate, FileContext, Visibility};
 use crate::rust::rename::{
-    crate_for_file, module_prefix_for, propose_rename, resolve_change_edits,
+    crate_for_file, module_prefix_for, propose_rename, reconcile_resolved_edits,
+    remove_already_staged_exact_edits, resolve_change_edits,
 };
 use crate::rust::ItemKind;
 use crate::scanner::{is_root_like, CrateGraph};
@@ -28,7 +29,7 @@ use anyhow::Result;
 use ra_ap_ide::{FileId, Indel};
 use ra_ap_syntax::ast::{self, AstNode, HasName};
 use ra_ap_syntax::{SyntaxKind, SyntaxNode, TextRange};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub struct SerdeRenameRequest<'a> {
@@ -37,12 +38,18 @@ pub struct SerdeRenameRequest<'a> {
     pub plan: &'a Plan,
     pub graph: &'a CrateGraph,
     pub seed: u64,
+    pub allow_unresolved_macro_references: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct SerdeRenameOutcome {
     pub stats: RenameStats,
     pub mapping: Mapping,
+    /// Wire values that remain part of the serialized protocol after a
+    /// successful Rust-side rename. The later string pass must reserve these:
+    /// some values are materialized by this pass and therefore do not exist in
+    /// the immutable analysis snapshot inspected by string protection.
+    pub wire_values: HashSet<String>,
     pub skipped: Vec<SkippedSymbol>,
     pub warnings: Vec<String>,
     pub claimed: HashSet<(PathBuf, TextRange)>,
@@ -52,7 +59,19 @@ pub struct SerdeRenameOutcome {
 struct MemberContext {
     node: SyntaxNode,
     wire: WireNames,
-    needs_materialized_rename: bool,
+    materialize: WireDirections,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WireDirections {
+    serialize: bool,
+    deserialize: bool,
+}
+
+impl WireDirections {
+    fn is_empty(self) -> bool {
+        !self.serialize && !self.deserialize
+    }
 }
 
 pub fn run(
@@ -61,6 +80,7 @@ pub fn run(
     names: &mut NameDeriver,
     edits: &mut EditPlan,
     macro_referenced: &HashSet<String>,
+    macro_references: &HashMap<(PathBuf, TextRange), Vec<(PathBuf, TextRange)>>,
 ) -> Result<SerdeRenameOutcome> {
     let mut outcome = SerdeRenameOutcome {
         mapping: Mapping::new(req.seed),
@@ -86,8 +106,9 @@ pub fn run(
             crate_name: &krate.name,
             module_prefix: &prefix,
         };
+        let collected = candidates::collect(&parsed, &ctx);
         members.extend(
-            candidates::collect(&parsed, &ctx)
+            collected
                 .into_iter()
                 .filter(|c| c.serde_model && matches!(c.kind, ItemKind::Field | ItemKind::Variant))
                 .map(|c| (*file_id, c)),
@@ -119,6 +140,12 @@ pub fn run(
         outcome
             .claimed
             .insert((candidate.file.clone(), candidate.name_range));
+
+        // Even a member that must remain unchanged still contributes an
+        // implicit serde wire value. Reserve the Rust spelling immediately;
+        // unsupported/duplicate models may never reach `member_context`, but
+        // derive-generated names can still be emitted into the final binary.
+        outcome.wire_values.insert(candidate.name.clone());
 
         if let Some((reason, detail)) = common_skip(
             &candidate,
@@ -171,11 +198,9 @@ pub fn run(
             }
         };
 
-        let new_name = names.derive(
-            SeedDomain::RustSymbol,
-            &candidate.path,
-            candidate.kind.name_case(),
-        )?;
+        let name_case = candidate.kind.name_case();
+        let identity = format!("rust-name::{name_case:?}::{}", candidate.name);
+        let new_name = names.derive(SeedDomain::RustSymbol, &identity, name_case)?;
         let change = match propose_rename(analysis, file_id, candidate.name_range, &new_name) {
             Ok(change) => change,
             Err((reason, detail)) => {
@@ -192,6 +217,14 @@ pub fn run(
             }
         };
 
+        reconcile_resolved_edits(
+            &mut by_file,
+            &candidate,
+            macro_references.get(&(candidate.file.clone(), candidate.name_range)),
+            &new_name,
+            &texts,
+        );
+
         if !definition_present(&by_file, &candidate) {
             outcome.skipped.push(skipped(
                 &candidate,
@@ -201,13 +234,14 @@ pub fn run(
             continue;
         }
 
-        if context.needs_materialized_rename {
+        if !context.materialize.is_empty() {
             if let Err(detail) = materialize_wire_name(
                 &mut by_file,
                 source,
                 &candidate,
                 &context.node,
                 &context.wire,
+                context.materialize,
                 &new_name,
             ) {
                 outcome.skipped.push(skipped(
@@ -218,6 +252,8 @@ pub fn run(
                 continue;
             }
         }
+
+        remove_already_staged_exact_edits(&mut by_file, edits);
 
         let mut contributions = Vec::new();
         let mut missing_snapshot = None;
@@ -246,6 +282,7 @@ pub fn run(
                 outcome.stats.edits_applied += applied;
                 outcome.files_edited.extend(by_file.keys().cloned());
                 outcome.mapping.record_symbol(candidate.path, new_name);
+                record_wire_values(&mut outcome.wire_values, &context.wire);
             }
             Err(error) => outcome.skipped.push(skipped(
                 &candidate,
@@ -257,6 +294,11 @@ pub fn run(
 
     outcome.stats.files_edited = outcome.files_edited.len();
     Ok(outcome)
+}
+
+fn record_wire_values(values: &mut HashSet<String>, wire: &WireNames) {
+    values.insert(wire.serialize.clone());
+    values.insert(wire.deserialize.clone());
 }
 
 fn common_skip(
@@ -306,7 +348,7 @@ fn common_skip(
             return Some((SkipReason::ExternallyReachable, None));
         }
     }
-    if macro_referenced.contains(&candidate.name) {
+    if !req.allow_unresolved_macro_references && macro_referenced.contains(&candidate.name) {
         return Some((SkipReason::MacroCallReference, None));
     }
     None
@@ -349,13 +391,6 @@ fn member_context(
         return Err(reason.into());
     }
 
-    // A one-sided explicit rename needs an edit inside the existing nested
-    // metadata rather than a second ambiguous rename declaration. Keep it
-    // until that exact edit is implemented.
-    if member_attrs.rename.serialize.is_some() != member_attrs.rename.deserialize.is_some() {
-        return Err("one-sided serde rename is kept".into());
-    }
-
     let rules = match candidate.kind {
         ItemKind::Variant => {
             RenameAllRules::from(&container_attrs.rename_all).map_err(|e| e.to_string())?
@@ -388,13 +423,41 @@ fn member_context(
         MemberKind::Variant
     };
     let wire = model::wire_names(&candidate.name, kind, &member_attrs, &rules);
-    let needs_materialized_rename =
-        member_attrs.rename.serialize.is_none() && member_attrs.rename.deserialize.is_none();
+    let mut materialize = WireDirections {
+        serialize: member_attrs.rename.serialize.is_none(),
+        deserialize: member_attrs.rename.deserialize.is_none(),
+    };
+
+    // These representations do not use this member's Rust spelling as a wire
+    // key in the indicated direction. Renaming the Rust member is therefore
+    // safe without manufacturing an attribute that would change semantics.
+    if member_attrs.flatten || member_attrs.other || member_attrs.skip {
+        materialize = WireDirections::default();
+    } else {
+        if member_attrs.skip_serializing {
+            materialize.serialize = false;
+        }
+        if member_attrs.skip_deserializing {
+            materialize.deserialize = false;
+        }
+        if candidate.kind == ItemKind::Field && container_attrs.transparent {
+            materialize = WireDirections::default();
+        }
+        if candidate.kind == ItemKind::Variant && container_attrs.untagged {
+            materialize = WireDirections::default();
+        }
+        if container_attrs.into.is_some() {
+            materialize.serialize = false;
+        }
+        if container_attrs.from.is_some() || container_attrs.try_from.is_some() {
+            materialize.deserialize = false;
+        }
+    }
 
     Ok(MemberContext {
         node,
         wire,
-        needs_materialized_rename,
+        materialize,
     })
 }
 
@@ -428,33 +491,12 @@ fn unsupported_container(attrs: &SerdeAttrs) -> Option<&'static str> {
     if !attrs.unknown.is_empty() {
         return Some("unknown serde container metadata");
     }
-    if attrs.remote.is_some() {
-        return Some("serde remote container");
-    }
-    if attrs.transparent {
-        return Some("serde transparent container");
-    }
-    if attrs.untagged {
-        return Some("serde untagged enum");
-    }
-    if attrs.has_conversion() {
-        return Some("serde conversion container");
-    }
     None
 }
 
 fn unsupported_member(attrs: &SerdeAttrs) -> Option<&'static str> {
     if !attrs.unknown.is_empty() {
         return Some("unknown serde member metadata");
-    }
-    if attrs.flatten {
-        return Some("serde flatten member");
-    }
-    if attrs.other {
-        return Some("serde other variant");
-    }
-    if attrs.is_skipped() {
-        return Some("serde skipped member");
     }
     None
 }
@@ -496,6 +538,7 @@ fn merge_attrs(dst: &mut SerdeAttrs, src: SerdeAttrs) -> std::result::Result<(),
         src.rename_all_fields,
         "rename_all_fields",
     )?;
+    merge_directional(&mut dst.bound, src.bound, "bound")?;
     dst.aliases.extend(src.aliases);
 
     merge_option(&mut dst.tag, src.tag, "tag")?;
@@ -505,6 +548,16 @@ fn merge_attrs(dst: &mut SerdeAttrs, src: SerdeAttrs) -> std::result::Result<(),
     merge_option(&mut dst.try_from, src.try_from, "try_from")?;
     merge_option(&mut dst.into, src.into, "into")?;
     merge_option(&mut dst.with, src.with, "with")?;
+    merge_option(
+        &mut dst.skip_serializing_if,
+        src.skip_serializing_if,
+        "skip_serializing_if",
+    )?;
+    merge_option(&mut dst.default_path, src.default_path, "default")?;
+    merge_option(&mut dst.borrow_lifetimes, src.borrow_lifetimes, "borrow")?;
+    merge_option(&mut dst.getter, src.getter, "getter")?;
+    merge_option(&mut dst.crate_path, src.crate_path, "crate")?;
+    merge_option(&mut dst.expecting, src.expecting, "expecting")?;
     merge_option(
         &mut dst.serialize_with,
         src.serialize_with,
@@ -525,6 +578,9 @@ fn merge_attrs(dst: &mut SerdeAttrs, src: SerdeAttrs) -> std::result::Result<(),
     dst.skip_deserializing |= src.skip_deserializing;
     dst.default |= src.default;
     dst.borrow |= src.borrow;
+    dst.deny_unknown_fields |= src.deny_unknown_fields;
+    dst.field_identifier |= src.field_identifier;
+    dst.variant_identifier |= src.variant_identifier;
     dst.unknown.extend(src.unknown);
     Ok(())
 }
@@ -580,6 +636,7 @@ fn materialize_wire_name(
     candidate: &Candidate,
     node: &SyntaxNode,
     wire: &WireNames,
+    directions: WireDirections,
     new_name: &str,
 ) -> std::result::Result<(), String> {
     let member_start = usize::from(node.text_range().start());
@@ -621,7 +678,7 @@ fn materialize_wire_name(
     };
     let prefix = &source[member_start..name_start];
 
-    let attr = serde_rename_attribute(wire);
+    let attr = serde_rename_attribute(wire, directions);
     let replacement = format!("{attr}\n{indent}{prefix}{new_name}");
     def_edits.push(replace(
         u32::from(node.text_range().start()),
@@ -631,13 +688,18 @@ fn materialize_wire_name(
     Ok(())
 }
 
-fn serde_rename_attribute(wire: &WireNames) -> String {
+fn serde_rename_attribute(wire: &WireNames, directions: WireDirections) -> String {
     let serialize = format!("{:?}", wire.serialize);
     let deserialize = format!("{:?}", wire.deserialize);
-    if wire.are_the_same() {
+    if directions.serialize && directions.deserialize && wire.are_the_same() {
         format!("#[serde(rename = {serialize})]")
-    } else {
+    } else if directions.serialize && directions.deserialize {
         format!("#[serde(rename(serialize = {serialize}, deserialize = {deserialize}))]")
+    } else if directions.serialize {
+        format!("#[serde(rename(serialize = {serialize}))]")
+    } else {
+        debug_assert!(directions.deserialize);
+        format!("#[serde(rename(deserialize = {deserialize}))]")
     }
 }
 
@@ -663,7 +725,13 @@ mod tests {
             deserialize: "userName".into(),
         };
         assert_eq!(
-            serde_rename_attribute(&wire),
+            serde_rename_attribute(
+                &wire,
+                WireDirections {
+                    serialize: true,
+                    deserialize: true,
+                }
+            ),
             "#[serde(rename = \"userName\")]"
         );
     }
@@ -675,8 +743,43 @@ mod tests {
             deserialize: "in_name".into(),
         };
         assert_eq!(
-            serde_rename_attribute(&wire),
+            serde_rename_attribute(
+                &wire,
+                WireDirections {
+                    serialize: true,
+                    deserialize: true,
+                }
+            ),
             "#[serde(rename(serialize = \"outName\", deserialize = \"in_name\"))]"
         );
+    }
+
+    #[test]
+    fn one_sided_materialization_only_adds_the_missing_contract() {
+        let wire = WireNames {
+            serialize: "already_explicit".into(),
+            deserialize: "legacy_input".into(),
+        };
+        assert_eq!(
+            serde_rename_attribute(
+                &wire,
+                WireDirections {
+                    serialize: false,
+                    deserialize: true,
+                }
+            ),
+            "#[serde(rename(deserialize = \"legacy_input\"))]"
+        );
+    }
+
+    #[test]
+    fn successful_serde_rename_reserves_both_wire_directions() {
+        let wire = WireNames {
+            serialize: "outName".into(),
+            deserialize: "in_name".into(),
+        };
+        let mut values = HashSet::new();
+        record_wire_values(&mut values, &wire);
+        assert_eq!(values, HashSet::from(["outName".into(), "in_name".into()]));
     }
 }

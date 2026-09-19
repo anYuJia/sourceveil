@@ -72,9 +72,20 @@ pub struct SerdeAttrs {
     pub skip: bool,
     pub skip_serializing: bool,
     pub skip_deserializing: bool,
+    pub skip_serializing_if: Option<String>,
 
     pub default: bool,
+    pub default_path: Option<String>,
     pub borrow: bool,
+    pub borrow_lifetimes: Option<String>,
+
+    pub bound: Directional<String>,
+    pub getter: Option<String>,
+    pub crate_path: Option<String>,
+    pub expecting: Option<String>,
+    pub deny_unknown_fields: bool,
+    pub field_identifier: bool,
+    pub variant_identifier: bool,
 
     pub remote: Option<String>,
     pub from: Option<String>,
@@ -211,9 +222,28 @@ fn read_item(
         "skip" => out.skip = true,
         "skip_serializing" => out.skip_serializing = true,
         "skip_deserializing" => out.skip_deserializing = true,
+        "skip_serializing_if" => out.skip_serializing_if = Some(string_value(item)?),
 
-        "default" => out.default = true,
-        "borrow" => out.borrow = true,
+        "default" => {
+            out.default = true;
+            if item.input.peek(syn::Token![=]) {
+                out.default_path = Some(string_value(item)?);
+            }
+        }
+        "borrow" => {
+            out.borrow = true;
+            if item.input.peek(syn::Token![=]) {
+                out.borrow_lifetimes = Some(string_value(item)?);
+            }
+        }
+
+        "bound" => out.bound = directional(item, &key, &mut string_value)?,
+        "getter" => out.getter = Some(string_value(item)?),
+        "crate" => out.crate_path = Some(string_value(item)?),
+        "expecting" => out.expecting = Some(string_value(item)?),
+        "deny_unknown_fields" => out.deny_unknown_fields = true,
+        "field_identifier" => out.field_identifier = true,
+        "variant_identifier" => out.variant_identifier = true,
 
         "remote" => out.remote = Some(string_value(item)?),
         "from" => out.from = Some(string_value(item)?),
@@ -417,6 +447,35 @@ mod tests {
         let a = attrs(r#"#[serde(serialize_with = "ser", deserialize_with = "de")]"#);
         assert_eq!(a.serialize_with.as_deref(), Some("ser"));
         assert_eq!(a.deserialize_with.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn official_path_and_value_metadata_is_fully_consumed() {
+        let a = attrs(
+            r#"#[serde(
+                default = "make_default",
+                skip_serializing_if = "Option::is_none",
+                bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>"),
+                borrow = "'a + 'b",
+                getter = "Remote::value",
+                crate = "serde_alias",
+                expecting = "a model",
+                deny_unknown_fields,
+                field_identifier,
+                variant_identifier
+            )]"#,
+        );
+        assert!(a.default && a.borrow && a.deny_unknown_fields);
+        assert_eq!(a.default_path.as_deref(), Some("make_default"));
+        assert_eq!(a.borrow_lifetimes.as_deref(), Some("'a + 'b"));
+        assert_eq!(a.skip_serializing_if.as_deref(), Some("Option::is_none"));
+        assert_eq!(a.bound.serialize.as_deref(), Some("T: Serialize"));
+        assert_eq!(a.bound.deserialize.as_deref(), Some("T: Deserialize<'de>"));
+        assert_eq!(a.getter.as_deref(), Some("Remote::value"));
+        assert_eq!(a.crate_path.as_deref(), Some("serde_alias"));
+        assert_eq!(a.expecting.as_deref(), Some("a model"));
+        assert!(a.field_identifier && a.variant_identifier);
+        assert!(a.unknown.is_empty());
     }
 
     /// The shape that a text-matching parser gets wrong.
