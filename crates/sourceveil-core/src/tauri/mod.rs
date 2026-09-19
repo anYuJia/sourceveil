@@ -101,6 +101,9 @@ pub enum CommandKeepReason {
     AmbiguousFrontendLiteral,
     /// The name appears as a Rust string this pass cannot classify.
     AmbiguousRustLiteral,
+    /// The original bytes also occur outside the exact protocol edits. The
+    /// final binary scanner cannot distinguish that occurrence by provenance.
+    PlaintextCollision,
     /// Not listed in any handler list this pass could read.
     MissingHandlerEntry,
     /// A handler list that could not be parsed completely.
@@ -120,6 +123,7 @@ impl CommandKeepReason {
             CommandKeepReason::DynamicFrontendReference => "dynamic-frontend-command-reference",
             CommandKeepReason::AmbiguousFrontendLiteral => "unresolved-frontend-reference",
             CommandKeepReason::AmbiguousRustLiteral => "ambiguous-rust-literal",
+            CommandKeepReason::PlaintextCollision => "plaintext-substring-collision",
             CommandKeepReason::MissingHandlerEntry => "unresolved-command-handler",
             CommandKeepReason::UnparseableHandlerList => "unparseable-handler-list",
             CommandKeepReason::UnresolvedAttribute => "unresolved-command-attribute",
@@ -266,6 +270,11 @@ pub fn run(
     }
 
     let command_names: BTreeSet<String> = commands.iter().map(|c| c.name.clone()).collect();
+    let external_plaintext_collisions = crate::strings::external_dependency_plaintext_collisions(
+        req.graph,
+        req.input_root,
+        &command_names,
+    )?;
     let mut rust_literals = literals::LiteralScan::default();
     for file in &files {
         let Some((parsed, _)) = analysis.parse(file.file_id) else {
@@ -301,6 +310,7 @@ pub fn run(
             &ipc,
             &handlers,
             &rust_literals,
+            &external_plaintext_collisions,
             req.input_root,
             req.copied,
         ) {
@@ -343,9 +353,22 @@ fn decide(
     ipc: &IpcAnalysis,
     handlers: &[HandlerRef],
     rust_literals: &literals::LiteralScan,
+    external_plaintext_collisions: &BTreeSet<String>,
     input_root: &Path,
     copied: &BTreeSet<PathBuf>,
 ) -> std::result::Result<(), (CommandKeepReason, Option<String>)> {
+    if external_plaintext_collisions.contains(&command.name) {
+        return Err((
+            CommandKeepReason::PlaintextCollision,
+            Some(
+                "the original command bytes also occur in an external dependency source or \
+                 bundled asset; renaming this protocol would make the strict final-binary \
+                 scan unverifiable"
+                    .into(),
+            ),
+        ));
+    }
+
     // The frontend must reach this command only through literals we can edit.
     let editable: HashSet<Span> = ipc
         .static_refs
@@ -503,6 +526,18 @@ fn rename_command(
         pending.push((path, indels));
     }
 
+    let collisions = uncovered_plaintext_occurrences(&command.name, texts, &pending);
+    if !collisions.is_empty() {
+        return Err((
+            CommandKeepReason::PlaintextCollision,
+            Some(format!(
+                "the original command bytes also occur outside the exact protocol edits; \
+                 the strict final-binary scan could not establish provenance: {}",
+                collisions.join(", ")
+            )),
+        ));
+    }
+
     // Every file in the transaction must have a snapshot. A file we never read
     // cannot be edited against.
     let mut contributions = Vec::with_capacity(pending.len());
@@ -533,6 +568,49 @@ fn rename_command(
         Ok(_) => Ok(new_name),
         Err(e) => Err((CommandKeepReason::EditConflict, Some(e.to_string()))),
     }
+}
+
+fn uncovered_plaintext_occurrences(
+    value: &str,
+    texts: &BTreeMap<PathBuf, String>,
+    pending: &[(PathBuf, Vec<ra_ap_ide::Indel>)],
+) -> Vec<String> {
+    const MAX_EXAMPLES: usize = 8;
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    let mut edits_by_path: BTreeMap<&Path, Vec<TextRange>> = BTreeMap::new();
+    for (path, edits) in pending {
+        edits_by_path
+            .entry(path.as_path())
+            .or_default()
+            .extend(edits.iter().map(|edit| edit.delete));
+    }
+
+    let mut collisions = Vec::new();
+    for (path, text) in texts {
+        let edits = edits_by_path.get(path.as_path());
+        let mut cursor = 0;
+        while let Some(relative) = text[cursor..].find(value) {
+            let start = cursor + relative;
+            let end = start + value.len();
+            let covered = edits.is_some_and(|edits| {
+                edits.iter().any(|range| {
+                    usize::from(range.start()) <= start && usize::from(range.end()) >= end
+                })
+            });
+            if !covered {
+                let line = 1 + text[..start].matches('\n').count();
+                collisions.push(format!("{}:{line}", path.display()));
+                if collisions.len() == MAX_EXAMPLES {
+                    return collisions;
+                }
+            }
+            cursor = start + 1;
+        }
+    }
+    collisions
 }
 
 /// Multiline description of every dynamic invoke argument, for the report.
@@ -872,6 +950,26 @@ mod tests {
             Path::new("/work/app/tauri-ipc-static/src/commands.rs"),
             root
         ));
+    }
+
+    #[test]
+    fn plaintext_collision_detection_ignores_only_exact_edited_spans() {
+        let path = PathBuf::from("src/lib.rs");
+        let text = "fn verify_cookie() {}\nfn verify_cookie_simple() {}\n".to_string();
+        let definition_start = text.find("verify_cookie").unwrap() as u32;
+        let definition_end = definition_start + "verify_cookie".len() as u32;
+        let texts = BTreeMap::from([(path.clone(), text)]);
+        let pending = vec![(
+            path,
+            vec![crate::edits::replace(
+                definition_start,
+                definition_end,
+                "renamed_cookie",
+            )],
+        )];
+
+        let collisions = uncovered_plaintext_occurrences("verify_cookie", &texts, &pending);
+        assert_eq!(collisions, vec!["src/lib.rs:2"]);
     }
 
     #[test]

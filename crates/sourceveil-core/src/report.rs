@@ -501,7 +501,7 @@ impl Report {
             let _ = writeln!(w, "  kept unsafe context:        {}", s.kept_unsafe_context);
             let _ = writeln!(
                 w,
-                "  kept copied-file collision:  {}",
+                "  kept plaintext collision:    {}",
                 s.kept_external_collision
             );
             let _ = writeln!(w, "  kept edit conflict:         {}", s.kept_conflict);

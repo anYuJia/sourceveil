@@ -20,7 +20,8 @@ use crate::edits::{replace, Contribution, EditPlan};
 use crate::plan::{DependenciesPlan, StringsPlan};
 use crate::rust::analysis::RustAnalysis;
 use crate::rust::rename::crate_for_file;
-use crate::scanner::{is_root_like, CrateGraph};
+use crate::scanner::{is_root_like, path_starts_with, CrateGraph};
+use aho_corasick::AhoCorasick;
 use anyhow::Result;
 use hmac::{Hmac, Mac};
 use ra_ap_syntax::ast::{self, AstNode, AstToken, HasAttrs};
@@ -100,6 +101,24 @@ pub fn run(
         parsed_files.push((path, parsed, source));
     }
 
+    // Keep every decoded Rust literal, including values that are not selected
+    // for protection. The binary scanner is deliberately a raw byte scanner:
+    // protecting `token-name` cannot be claimed as complete when an unrelated
+    // literal such as `missing token-name in response` will compile the same
+    // bytes back into the artifact.
+    let rust_literal_values = parsed_files
+        .iter()
+        .flat_map(|(_, parsed, _)| {
+            parsed
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|element| element.into_token())
+                .filter_map(ast::String::cast)
+                .filter_map(|token| syn::parse_str::<syn::LitStr>(token.text()).ok())
+                .map(|literal| literal.value())
+        })
+        .collect::<BTreeSet<_>>();
+
     let mut by_value: BTreeMap<String, Vec<Occurrence>> = BTreeMap::new();
 
     for (path, parsed, source) in parsed_files {
@@ -164,6 +183,37 @@ pub fn run(
     let copied_texts = copied_non_rust_texts(req);
     by_value.retain(|value, _| {
         let collision = copied_texts.iter().any(|text| text.contains(value));
+        if collision {
+            out.kept_external_collision += 1;
+        }
+        !collision
+    });
+
+    // A proper substring in another Rust literal is also a plaintext
+    // collision. This check uses decoded literal values, so raw strings and
+    // escaped source spellings are treated exactly as rustc treats them. Be
+    // conservative even when the containing literal is itself selectable:
+    // values are committed independently, and mapping one must never depend on
+    // a later transaction also succeeding.
+    by_value.retain(|value, _| {
+        let collision = has_rust_literal_collision(value, &rust_literal_values);
+        if collision {
+            out.kept_external_collision += 1;
+        }
+        !collision
+    });
+
+    // Registry/git/external path dependencies are intentionally not copied or
+    // rewritten, but Rust literals, byte strings, identifiers, generated JS,
+    // and bundled assets from those packages can all reach the same final
+    // artifact. Scan their raw source bytes before promising that a plaintext
+    // is absent. This intentionally prefers a conservative keep over a mapping
+    // entry that the final raw-byte scanner cannot verify.
+    let candidate_values = by_value.keys().cloned().collect::<BTreeSet<_>>();
+    let dependency_collisions =
+        external_dependency_plaintext_collisions(req.graph, req.input_root, &candidate_values)?;
+    by_value.retain(|value, _| {
+        let collision = dependency_collisions.contains(value);
         if collision {
             out.kept_external_collision += 1;
         }
@@ -264,6 +314,62 @@ fn copied_non_rust_texts(req: &StringRequest<'_>) -> Vec<String> {
         })
         .filter_map(|relative| std::fs::read_to_string(req.input_root.join(relative)).ok())
         .collect()
+}
+
+fn has_rust_literal_collision(value: &str, literals: &BTreeSet<String>) -> bool {
+    literals
+        .iter()
+        .any(|literal| literal != value && literal.contains(value))
+}
+
+pub(crate) fn external_dependency_plaintext_collisions(
+    graph: &CrateGraph,
+    input_root: &Path,
+    candidates: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    if candidates.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let patterns = candidates.iter().cloned().collect::<Vec<_>>();
+    let matcher = AhoCorasick::new(&patterns)?;
+    let mut roots = BTreeSet::new();
+    for root in graph
+        .dependency_source_dirs
+        .iter()
+        .chain(graph.dependency_manifest_dirs.values())
+    {
+        if !path_starts_with(root, input_root) {
+            roots.insert(root.clone());
+        }
+    }
+
+    let mut collisions = BTreeSet::new();
+    for root in roots {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|entry| {
+                !entry.file_type().is_dir()
+                    || !matches!(
+                        entry.file_name().to_string_lossy().as_ref(),
+                        "target" | ".git" | ".hg" | ".svn"
+                    )
+            })
+            .filter_map(|entry| entry.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            for found in matcher.find_overlapping_iter(&bytes) {
+                collisions.insert(patterns[found.pattern().as_usize()].clone());
+            }
+        }
+    }
+
+    Ok(collisions)
 }
 
 fn has_no_std_attribute(parsed: &ast::SourceFile) -> bool {
@@ -652,5 +758,73 @@ mod tests {
             .iter()
             .any(|text| text.contains("shared-runtime-name")));
         assert!(!texts.iter().any(|text| text.contains("documentation only")));
+    }
+
+    #[test]
+    fn a_value_inside_a_larger_rust_literal_is_a_plaintext_collision() {
+        let literals = BTreeSet::from([
+            "aweme_detail".to_string(),
+            "No aweme_detail in response".to_string(),
+            "bytes=0-1048575".to_string(),
+        ]);
+
+        for value in ["aweme_detail", "bytes=0-"] {
+            assert!(has_rust_literal_collision(value, &literals));
+        }
+        assert!(!has_rust_literal_collision("unrelated", &literals));
+    }
+
+    #[test]
+    fn external_dependency_sources_are_plaintext_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let dependency = tmp.path().join("registry-dependency");
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::write(
+            dependency.join("src/lib.rs"),
+            r#"pub const MIME: &str = "application/octet-stream";"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dependency.join("guest-js")).unwrap();
+        std::fs::write(
+            dependency.join("guest-js/index.ts"),
+            "this.downloadedBytes = undefined;",
+        )
+        .unwrap();
+
+        let mut graph = CrateGraph::default();
+        graph.dependency_source_dirs.insert(dependency);
+        let strings = balanced_strings();
+        let dependencies = DependenciesPlan::default();
+        let copied = BTreeSet::new();
+        let reserved = HashSet::new();
+        let request = StringRequest {
+            input_root: &input,
+            copied: &copied,
+            graph: &graph,
+            plan: &strings,
+            dependencies: &dependencies,
+            seed: 7,
+            reserved_protocol_values: &reserved,
+        };
+        let candidates = BTreeSet::from([
+            ".downloaded".to_string(),
+            "application/octet-stream".to_string(),
+            "private-runtime-token".to_string(),
+        ]);
+
+        let collisions = external_dependency_plaintext_collisions(
+            request.graph,
+            request.input_root,
+            &candidates,
+        )
+        .unwrap();
+        assert_eq!(
+            collisions,
+            BTreeSet::from([
+                ".downloaded".to_string(),
+                "application/octet-stream".to_string()
+            ])
+        );
     }
 }

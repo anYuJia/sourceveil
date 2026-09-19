@@ -52,6 +52,12 @@ pub struct CrateGraph {
     /// crates loaded by rust-analyzer. Used to prove a wrapper path resolves to
     /// the intended dependency rather than a same-named local module.
     pub dependency_manifest_dirs: BTreeMap<String, PathBuf>,
+    /// Every dependency package directory, without collapsing multiple
+    /// resolved versions that share a package name. Consumers that inspect
+    /// linked source (for example plaintext-collision detection) need the full
+    /// set, while semantic name resolution above intentionally stays keyed by
+    /// package name.
+    pub dependency_source_dirs: BTreeSet<PathBuf>,
     /// Workspace members that something outside the workspace depends on.
     /// Their public API is a contract and must not be renamed.
     pub boundary: BTreeSet<String>,
@@ -403,6 +409,7 @@ fn fold_metadata(metadata: &Metadata) -> Result<CrateGraph> {
         graph
             .dependency_manifest_dirs
             .insert(name.clone(), manifest_dir.clone());
+        graph.dependency_source_dirs.insert(manifest_dir.clone());
 
         // Registry/git dependencies are analyzed by rust-analyzer but are
         // never part of the copied source tree. Local path dependencies are

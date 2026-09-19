@@ -165,6 +165,7 @@ they are changed as one transaction, and any doubt keeps the command whole:
 | `invoke(commandName)` | **every command is kept**, with the file and line reported |
 | `#[command]` that resolves to clap | kept |
 | a name that also appears as a Rust string outside a recognised context | kept |
+| original bytes also occur in a retained source/dependency substring | kept and reported; a raw final-binary scan could not prove provenance |
 
 The `generate_handler!` list is parsed by hand, because rust-analyzer's
 reference search does not reach inside a macro token tree. Only the spans of the
@@ -514,8 +515,12 @@ This is deliberately not applied to attributes, macro token trees, const/static
 initialisers, patterns, ABI strings, const functions or `no_std` crates.
 Tauri command/event strings remain owned by their dedicated cross-language
 passes. A value is recorded in `mapping.strings` only if every selected
-occurrence can be transformed as one transaction, so source/binary leak scans
-can safely treat the original plaintext as fatal evidence.
+occurrence can be transformed as one transaction and it is not a substring of
+another retained Rust/frontend/config literal. That conservative substring
+check matters because the final binary scanner operates on raw bytes, not
+source-level literal boundaries. Source/binary leak scans can therefore treat
+the original plaintext as fatal evidence without a known same-project
+collision.
 
 The encoding is obfuscation, not a secret store: the client ships both encoded
 bytes and a decoder. The goal is to remove the static `strings -> XREF`

@@ -795,6 +795,14 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
         mapping(&out)["strings"].get("mixed-protocol").is_none(),
         "a mixed safe/unsafe value must not be advertised as protected"
     );
+    assert!(
+        source.contains("nested-protocol"),
+        "the larger diagnostic still requires the nested plaintext"
+    );
+    assert!(
+        mapping(&out)["strings"].get("nested-protocol").is_none(),
+        "a value nested inside another literal must not be advertised as protected"
+    );
 
     let string_report = &report(&out)["strings"];
     assert!(
@@ -804,6 +812,13 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
     assert!(
         string_report["kept_unsafe_context"].as_u64().unwrap_or(0) >= 2,
         "report did not expose compile-time/macro keeps: {string_report}"
+    );
+    assert!(
+        string_report["kept_external_collision"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "report did not expose nested plaintext collisions: {string_report}"
     );
 }
 
