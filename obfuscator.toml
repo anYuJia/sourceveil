@@ -13,7 +13,8 @@ version = 1
 # `safe`       symbol rename, build diversification, release string behaviour.
 #              Near-zero runtime cost, maximum build compatibility.
 # `balanced`   adds private field rename, including serde-safe members where the wire contract can be proven, and internal-string protection.
-# `aggressive` reserved for V3 transforms; currently resolves to `balanced`.
+# `aggressive` adds local/parameter rename and physical module-file/directory
+#              moves on top of the balanced transforms.
 profile = "safe"
 
 [project]
@@ -47,14 +48,14 @@ module_files = false
 # crate, so it stays opt-in.
 macros = false
 
-# Fields are off under `safe`. `balanced` turns them on. Serde model
-# members are handled by a dedicated pass that preserves their original
-# serialize/deserialize names with explicit attributes; unsupported serde
-# representations remain pinned.
+# Fields are off under `safe`. `balanced` turns them on. Serde model members are
+# handled by a dedicated pass that preserves original serialize/deserialize
+# names with explicit attributes and rewrites Rust paths embedded in serde
+# metadata. Unknown future metadata remains pinned and is reported.
 fields = false
 
-# Rust local bindings and parameters remain off here; frontend lexical bindings
-# are controlled independently by [frontend].
+# Rust local bindings and parameters are off under `safe`/`balanced` and are
+# enabled by `aggressive`; frontend lexical bindings are controlled separately.
 locals = false
 params = false
 
@@ -74,6 +75,11 @@ errors = false
 internal = false
 ui = false
 endpoints = false
+
+[comments]
+# Run after semantic renames. Removes source/doc comments from supported
+# languages; strings are untouched. License notices move to a separate file.
+strip = false
 
 [tauri]
 # Rename `#[tauri::command]` handlers together with every frontend

@@ -23,9 +23,9 @@ naming different from the last while keeping any single release reproducible.
   fails loudly instead of handing you a tree that does not compile.
 - **Anything that cannot be proven safe is kept, and reported.** Every skipped
   symbol is recorded with a reason. Nothing is skipped silently.
-- **Renames are resolved, not pattern-matched.** Each one goes through
-  rust-analyzer's name resolution, which is what makes `obj.foo`, `"foo"`,
-  `#[serde(rename = "foo")]` and `macro_rules! foo` different things.
+- **Renames are syntax/scope-aware, not text replacements.** Item renames use
+  rust-analyzer; local/closure bindings use a lexical scope pass that also
+  tracks supported standard macros and implicit format-string captures.
 - **Reproducible.** Same source plus same seed produces byte-identical output.
 
 ## Status
@@ -37,16 +37,20 @@ V1, at the prototype stage the design calls for. What is implemented:
 | project discovery via `cargo metadata` | done |
 | output workspace copier | done |
 | semantic symbol rename (fn, type, trait, enum, variant, const, static, module) | done |
+| Rust local-binding and parameter rename | done; enabled by `aggressive` |
+| Closure binding rename | ordinary, move/async, nested, destructured and shadowed bindings; supported standard macros and format captures |
+| Comment removal | opt-in `--strip-comments` / `[comments] strip = true` |
 | keep rules: config, globs, attributes, inline comments, FFI/ABI | done |
 | deterministic and keyed build seeds | done |
 | `mapping.json` / `report.json` | done |
 | verification pipeline | done |
 | Tauri command rename (Rust + TypeScript + allow-lists) | done |
 | Tauri event rename (Rust + TypeScript) | done |
-| serde-safe field / enum-variant rename | implemented for the supported subset; unsupported serde representations are kept |
+| serde-safe field / enum-variant rename | done; wire names and Rust paths in documented serde metadata are preserved |
+| proc-macro attribute contracts | `thiserror` named format captures follow field renames |
 | runtime Rust string protection | done for safe runtime expressions; compile-time/macro contexts are kept |
 | TypeScript semantic private-binding rename | done — OXC scope-aware; properties/JSON keys/imports/exports are kept |
-| module file rename | done (opt-in transactional file/dir moves) |
+| module file rename | done (transactional file/dir moves; enabled by `aggressive`) |
 | dependency boundary policy | done (external, private-obfuscate, obfuscate, wrapper) |
 | reproducible build/size benchmark | done (cargo-obfuscator benchmark) |
 | final binary leak scanner | done — raw UTF-8/UTF-16LE scan for original protocol values |
@@ -57,20 +61,29 @@ where their absence would break something, the affected symbols are pinned:
 - An event that reaches outside the workspace in either direction is
   **kept** — see below.
 - Serde fields and variants are owned by a dedicated pass. Under `safe` they
-  are kept. Under `balanced`, supported members are renamed only when the old
-  serialize/deserialize names can be materialised explicitly; unsupported
-  representations are kept and reported. Details below.
+  are kept. Under `balanced`/`aggressive`, members are renamed while their old
+  serialize/deserialize names are materialised explicitly. Every documented
+  serde container, variant and field attribute is parsed; Rust paths embedded
+  in attribute strings are updated after item rename. Unknown future metadata
+  is kept and reported instead of guessed at. Details below.
 - Module *identifiers* are renamed by default. Physical module-file and
-  directory moves are opt-in ([rename] module_files = true) and are staged
-  transactionally with the declaration edits; a failed move aborts the plan.
+  directory moves are opt-in under `safe`/`balanced` and enabled by
+  `aggressive`; they are staged transactionally with declaration edits, so a
+  failed move aborts the plan.
+- `aggressive` additionally renames Rust local bindings and parameters. Names
+  required by traits, external APIs, macros, duplicate field spellings, or
+  wire/framework protocols stay pinned and are listed in `report.json`.
 - Dependencies are closed-world by explicit policy. external leaves a
   dependency untouched, private-obfuscate transforms only private items in a
   copied path dependency, obfuscate permits the full private dependency pass,
   and wrapper generates a private crate::sv_* boundary for semantically
   resolved calls without editing registry sources.
 - Frontend binding renames use OXC's semantic graph. Private functions, classes,
-  parameters and module-local constants may move; member properties, object
-  shorthand, imports/exports and dynamic `eval`/`with` scopes are kept.
+  parameters and module-local constants may move. Object and destructuring
+  shorthand is expanded so stable keys/React props stay unchanged while the
+  lexical value is renamed; JSX component casing and TypeScript type-predicate
+  parameter contracts are preserved. Member properties, imports/exports and
+  dynamic `eval`/`with` scopes are kept.
 
 ### Serde-safe member renaming
 
@@ -107,10 +120,19 @@ directional contract such as
 
 is never collapsed to one string.
 
-The implementation is deliberately conservative. `flatten`, `transparent`,
-`remote`, `untagged`, `serde(other)`, conversion containers,
-`skip*`, unknown metadata, one-sided explicit renames, external Rust API
-members and macro-token-tree references are kept rather than guessed at.
+The pass models the full documented serde attribute surface, including
+`flatten`, `transparent`, `remote`, `untagged`, `other`, conversion containers,
+all `skip*` forms, directional renames and bounds, `default = "path"`,
+`with`/`serialize_with`/`deserialize_with`, `getter`, `crate`, `borrow`, and
+identifier representations. Attributes that embed Rust paths are rewritten to
+the generated names while wire strings remain unchanged. Only an unknown
+future serde key, an unprovable non-serde derive, an external API boundary, or
+an ambiguous compiler identity causes a member to be kept.
+
+The same post-rename contract layer updates named field captures in proven
+`thiserror::Error` attributes, so `#[error("{code}: {message}")]` continues to
+refer to the renamed fields. Explicit custom format arguments are distinguished
+from implicit field captures and remain unchanged.
 
 `tests/fixtures/serde-safety` is an executable protocol corpus. The end-to-end
 tests run the original and transformed crates, compare actual serde output byte
@@ -284,6 +306,48 @@ default = "external"
 helper-lib = "wrapper"
 ```
 
+### Closures and comments
+
+`aggressive` enables `[rename] locals = true` and `params = true`. The binding
+pass handles all parsed Rust closures, not a list of variable names: parameters,
+locals, captures, nested scopes, tuple/record/reference/array patterns, `move`
+and `async` closures. Standard formatting macros (including `{name}`,
+`{name:width$.precision$}`), `vec!`, `dbg!`, `matches!` (including guards), `log`/`anyhow` formatting macros,
+and `serde_json::json!` values are traversed too. Unknown or shadowed macros are
+opaque syntax. With the normal `cargo-check` verification stage enabled, exact
+missing field/method/path references are completed from rustc diagnostics only
+when the mapping is unambiguous; without that stage, affected names are
+retained. Macro-generated identifiers that do not exist in source remain
+outside the rename surface.
+Attribute-driven function parameters such as Tauri command arguments retain
+their protocol names; closures inside those functions are still processed.
+
+To remove comments from the generated directory:
+
+```bash
+cargo obfuscator transform --input ./project --output ./obfuscated --config ./obfuscator.toml --strip-comments
+```
+
+Or configure it persistently (off by default):
+
+```toml
+[comments]
+strip = true
+```
+
+Supported files: Rust (including doc comments), JS/JSX/TS/TSX, CSS, HTML (also
+inline JS/CSS), TOML (including Cargo.lock) and JSONC. Strings, URLs, regex literals and executable
+shebangs are preserved. TypeScript triple-slash compiler references are
+preserved because they are build directives rather than removable prose.
+`target`, `node_modules`, `.git`, and `.obfuscator` are
+excluded; unsupported comment-bearing formats are reported as warnings.
+Keep markers are consumed before cleaning. Removal runs again after each
+verification stage to clean generated assets; report file counters count visits
+across those passes. Removing tool-directive comments (for example `@ts-ignore`)
+can change build behavior, so verify the output. License/attribution comments
+are moved to `SOURCEVEIL_NOTICES.txt`; license files are retained. Input files
+are never modified.
+
 ### Keeping things
 
 Four mechanisms, checked in this order:
@@ -337,7 +401,12 @@ Source-level verification is necessary but not sufficient: the optimizer,
 framework glue or generated code can still leave protocol values in the final
 artifact. `scan-binary` searches the shipped bytes directly for every original
 Tauri command/event/protected-string value in `mapping.json`, in both UTF-8
-and UTF-16LE. Those hits are fatal. Original Rust symbol names are weaker
+and UTF-16LE. Those hits fail the strict scan, even when a dependency or an
+unrelated substring contains the same spelling (for example, `open_file` in a
+dependency source path). A raw match does not establish provenance; inspect
+the offsets and surrounding bytes instead of treating it as proof that a
+particular call site was missed. Hits are never silently excluded.
+Original Rust symbol names are weaker
 evidence and are reported only as notes, because the same word can survive
 legitimately in third-party code, comments embedded in debug data or unrelated
 APIs.
@@ -469,8 +538,9 @@ Being explicit, because a threat model that overclaims is worse than none:
 
 This is the part worth reading before trusting the tool.
 
-rust-analyzer's reference search **does not reach identifiers inside a macro
-token tree**. Measured against `ra_ap_*` 0.0.352:
+rust-analyzer's reference search does not reach every identifier inside a macro
+token tree or an inactive target-specific `#[cfg]` branch. Measured against
+`ra_ap_*` 0.0.352, the raw semantic rename behaves like this:
 
 | call site in the source | rewritten by a rename? |
 | --- | --- |
@@ -483,28 +553,28 @@ token tree**. Measured against `ra_ap_*` 0.0.352:
 | `target_fn()` inside a `#[cfg(feature = "off")]` block | **no** |
 
 `Analysis::find_all_refs` reports the same set as `Analysis::rename`, so there
-is no second API to fall back on. The information is not available.
+is no second rust-analyzer API to fall back on. SourceVeil closes those gaps in
+layers rather than using global replacement:
 
-This is not a missed optimisation — it is a broken build waiting to happen.
-Renaming `target_fn` while `format!("{}", target_fn())` stays put produces
-source that does not compile.
+1. Its syntax pass rewrites bindings and references in supported standard
+   macro grammars, nested token trees, implicit format captures, and module
+   paths. Tokens are classified by role, so a field named `downloader` is not
+   confused with a module of the same name.
+2. Items that exist only below a direct `#[cfg(...)]` are handled by a
+   kind-shaped, conflict-checked fallback confined to cfg syntax. Same-spelled
+   identifiers in active code are not touched.
+3. When `cargo-check` verification is selected, the generated tree is compiled
+   in a bounded feedback loop. Only rustc's primary spans for missing
+   field/method/path diagnostics can be repaired, and only when one exact old
+   identifier maps to one generated identifier. Every repair is followed by a
+   fresh compiler run; at most six passes are attempted.
+4. Without compiler verification, opaque macro references are kept and
+   reported as `macro-call-reference`. With verification, an unrepaired or
+   ambiguous reference still fails the transform rather than being guessed at.
 
-Two defences:
-
-1. Any symbol whose name occurs inside a macro token tree is **kept**, and
-   reported as `macro-call-reference`. This over-keeps — `apply_ident!(target_fn)`
-   would in fact have been renamed correctly — and that is the intended trade.
-   Detection walks outwards through *nested* token trees, because a macro's
-   arguments are themselves token trees: in `println!("{}", Foo::Bar { baz: 1 })`
-   the `{ baz: 1 }` opens a second one, and a check that stopped at the first
-   would classify `baz` as ordinary code. That case is pinned by
-   `macro_token_tree_detection`.
-2. The verification pipeline compiles the generated tree, so anything the above
-   misses is caught before you ship it.
-
-The practical cost of (1) is real: on the fixture in this repository, 4 of 14
-candidates are kept for this reason. A future pass can rewrite macro token trees
-directly and recover them.
+This covers ordinary macro shells and proc-macro-generated wrapper access while
+preserving the central invariant: SourceVeil never performs an unrestricted
+project-wide identifier replacement.
 
 ## Verification
 

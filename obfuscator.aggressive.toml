@@ -1,0 +1,31 @@
+# Full semantic preset for a generated source tree. Protocol and ABI names are
+# still preserved where changing them would alter runtime behaviour.
+version = 1
+profile = "aggressive"
+
+[rename]
+macros = true
+name_len_min = 10
+name_len_max = 16
+
+[strings]
+enabled = true
+internal = true
+ui = true
+endpoints = true
+
+[comments]
+strip = true
+
+[frontend]
+enabled = true
+rename_private_identifiers = true
+
+[build]
+verify = true
+verify_stages = ["cargo-metadata", "cargo-check", "cargo-test", "leak-scan"]
+analyze = "input"
+load_out_dirs = true
+write_mapping = true
+mapping_dir = ".obfuscator"
+strict = false
