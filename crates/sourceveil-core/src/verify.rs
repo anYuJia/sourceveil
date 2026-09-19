@@ -12,10 +12,11 @@
 //! removed.
 
 use crate::config::VerifyStage;
+use crate::edits::{apply_indels, replace};
 use crate::mapping::Mapping;
 use crate::report::StageResult;
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -34,6 +35,13 @@ pub struct VerifyContext<'a> {
 
 pub struct VerifyReport {
     pub stages: Vec<StageResult>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceRepairOutcome {
+    pub passes: usize,
+    pub references_repaired: usize,
+    pub check_passed: bool,
 }
 
 impl VerifyReport {
@@ -59,6 +67,174 @@ pub fn run(ctx: &VerifyContext<'_>, stages: &[VerifyStage]) -> VerifyReport {
         }
     }
     VerifyReport { stages: out }
+}
+
+/// Complete reference edits that the IDE analysis could not prove but rustc's
+/// fully expanded type checker can. This is intentionally a narrow feedback
+/// loop: only primary spans from missing field/method/path diagnostics are
+/// eligible, the span must still contain one exact original identifier, and
+/// that identifier must have one unambiguous replacement in the mapping.
+///
+/// This covers proc-macro-generated `Deref` wrappers (for example
+/// `tauri::State<T>.field`) and inference that rust-analyzer omits, without
+/// falling back to global text replacement. Every batch is followed by a new
+/// compiler run; the ordinary verification stage still runs afterward.
+pub fn repair_rust_references(
+    rust_root: &Path,
+    mapping: &Mapping,
+    max_passes: usize,
+) -> Result<ReferenceRepairOutcome> {
+    let replacements = unambiguous_symbol_names(mapping);
+    if replacements.is_empty() || max_passes == 0 {
+        return Ok(ReferenceRepairOutcome::default());
+    }
+
+    let canonical_root = rust_root
+        .canonicalize()
+        .with_context(|| format!("resolving {}", rust_root.display()))?;
+    let mut outcome = ReferenceRepairOutcome::default();
+
+    for _ in 0..max_passes {
+        outcome.passes += 1;
+        let mut cmd = Command::new("cargo");
+        cmd.args(["check", "--all-targets", "--message-format=json"])
+            .current_dir(rust_root);
+        if rust_root.join("Cargo.lock").is_file() {
+            cmd.arg("--locked");
+        }
+        let output = cmd
+            .output()
+            .context("spawning cargo for compiler-guided reference repair")?;
+        if output.status.success() {
+            outcome.check_passed = true;
+            break;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut by_file: BTreeMap<PathBuf, Vec<ra_ap_ide::Indel>> = BTreeMap::new();
+        for line in stdout.lines() {
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if message.get("reason").and_then(|value| value.as_str()) != Some("compiler-message")
+                || message
+                    .pointer("/message/level")
+                    .and_then(|value| value.as_str())
+                    != Some("error")
+            {
+                continue;
+            }
+            let code = message
+                .pointer("/message/code/code")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if !matches!(
+                code,
+                "E0412"
+                    | "E0422"
+                    | "E0425"
+                    | "E0433"
+                    | "E0531"
+                    | "E0532"
+                    | "E0559"
+                    | "E0560"
+                    | "E0599"
+                    | "E0609"
+            ) {
+                continue;
+            }
+            let Some(spans) = message
+                .pointer("/message/spans")
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            for span in spans {
+                if span.get("is_primary").and_then(|value| value.as_bool()) != Some(true) {
+                    continue;
+                }
+                let Some(relative) = span.get("file_name").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let path = rust_root.join(relative);
+                let Ok(canonical_path) = path.canonicalize() else {
+                    continue;
+                };
+                if !canonical_path.starts_with(&canonical_root) {
+                    continue;
+                }
+                let Some(start) = span.get("byte_start").and_then(|value| value.as_u64()) else {
+                    continue;
+                };
+                let Some(end) = span.get("byte_end").and_then(|value| value.as_u64()) else {
+                    continue;
+                };
+                let Ok(source) = std::fs::read_to_string(&canonical_path) else {
+                    continue;
+                };
+                let (start, end) = (start as usize, end as usize);
+                let Some(original) = source.get(start..end) else {
+                    continue;
+                };
+                let logical = original.strip_prefix("r#").unwrap_or(original);
+                let Some(replacement) = replacements.get(logical) else {
+                    continue;
+                };
+                by_file.entry(canonical_path).or_default().push(replace(
+                    start as u32,
+                    end as u32,
+                    replacement.clone(),
+                ));
+            }
+        }
+
+        let mut repaired_this_pass = 0usize;
+        for (path, edits) in &mut by_file {
+            edits.sort_by_key(|edit| (edit.delete.start(), edit.delete.end()));
+            edits
+                .dedup_by(|left, right| left.delete == right.delete && left.insert == right.insert);
+            let source = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {} for reference repair", path.display()))?;
+            let rewritten = apply_indels(&source, edits)
+                .with_context(|| format!("repairing references in {}", path.display()))?;
+            std::fs::write(path, rewritten)
+                .with_context(|| format!("writing repaired {}", path.display()))?;
+            repaired_this_pass += edits.len();
+        }
+        outcome.references_repaired += repaired_this_pass;
+        if repaired_this_pass == 0 {
+            break;
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn unambiguous_symbol_names(mapping: &Mapping) -> HashMap<String, String> {
+    let mut names: HashMap<String, Option<String>> = HashMap::new();
+    for (path, replacement) in &mapping.symbols {
+        let Some(leaf) = path.rsplit("::").next() else {
+            continue;
+        };
+        if leaf.contains('@') {
+            continue;
+        }
+        let logical = leaf.strip_prefix("r#").unwrap_or(leaf).to_string();
+        match names.entry(logical) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(replacement.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(replacement) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    names
+        .into_iter()
+        .filter_map(|(name, replacement)| replacement.map(|replacement| (name, replacement)))
+        .collect()
 }
 
 fn run_one(ctx: &VerifyContext<'_>, stage: VerifyStage) -> StageResult {
@@ -320,7 +496,11 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
         }
 
         for needle in &protocol {
-            if contains_quoted(&text, needle) {
+            let allow_backtick = matches!(
+                ext.as_str(),
+                "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "html" | "vue" | "svelte"
+            );
+            if contains_quoted(&text, needle, allow_backtick) {
                 fatal.push(format!("{needle:?} found in {rel}"));
             }
         }
@@ -381,11 +561,15 @@ fn leak_scan(ctx: &VerifyContext<'_>) -> Result<Option<String>> {
 /// word instead would also fire on an unrelated identifier that happens to
 /// share the name, which is common: a frontend helper named `ping` beside a
 /// command named `ping` is not a leak.
-fn contains_quoted(haystack: &str, needle: &str) -> bool {
+fn contains_quoted(haystack: &str, needle: &str, allow_backtick: bool) -> bool {
     if needle.is_empty() {
         return false;
     }
-    ['"', '\'', '`']
+    let mut quotes = vec!['"', '\''];
+    if allow_backtick {
+        quotes.push('`');
+    }
+    quotes
         .iter()
         .any(|quote| haystack.contains(&format!("{quote}{needle}{quote}")))
 }
@@ -436,14 +620,24 @@ mod tests {
     /// A command name beside an unrelated identifier of the same name.
     #[test]
     fn a_bare_identifier_sharing_a_protocol_value_is_not_a_leak() {
-        assert!(contains_quoted(r#"invoke("ping")"#, "ping"));
+        assert!(contains_quoted(r#"invoke("ping")"#, "ping", true));
         assert!(!contains_quoted(
             "export function ping() { return 1; }",
-            "ping"
+            "ping",
+            true,
         ));
-        assert!(!contains_quoted("#[tauri::command] fn ping() {}", "ping"));
-        assert!(contains_quoted("const ALLOWED = ['ping'];", "ping"));
-        assert!(contains_quoted("const s = `ping`;", "ping"));
+        assert!(!contains_quoted(
+            "#[tauri::command] fn ping() {}",
+            "ping",
+            false,
+        ));
+        assert!(contains_quoted("const ALLOWED = ['ping'];", "ping", true));
+        assert!(contains_quoted("const s = `ping`;", "ping", true));
+        assert!(!contains_quoted(
+            "/// Reads the hidden `.downloaded` marker.",
+            ".downloaded",
+            false,
+        ));
     }
 
     #[test]
@@ -555,5 +749,60 @@ mod tests {
         };
         // Two-character names match too much to be evidence.
         assert!(leak_scan(&ctx).unwrap().is_some());
+    }
+
+    #[test]
+    fn rustc_diagnostics_complete_only_exact_mapped_member_spans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='repair_fixture'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "struct Item { x_hidden:i32 }\nimpl Item { fn run_hidden(&self){} }\nfn main(){let item=Item{x:1};let _=item.x;item.run();}\n",
+        )
+        .unwrap();
+        let mut mapping = Mapping::new(1);
+        mapping.record_symbol("repair_fixture::Item::x", "x_hidden");
+        mapping.record_symbol("repair_fixture::Item::run", "run_hidden");
+
+        let repaired = repair_rust_references(root, &mapping, 4).unwrap();
+        assert!(repaired.check_passed, "{repaired:?}");
+        assert_eq!(repaired.references_repaired, 3);
+        let source = std::fs::read_to_string(root.join("src/main.rs")).unwrap();
+        assert!(source.contains("Item{x_hidden:1}"));
+        assert!(source.contains("item.x_hidden"));
+        assert!(source.contains("item.run_hidden()"));
+    }
+
+    #[test]
+    fn rustc_diagnostics_complete_enum_variant_record_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='repair_enum_fixture'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "enum Event { Changed { task_hidden:String, state_hidden:u8 } }\nfn main(){let _=Event::Changed{task:String::new(),state:1};}\n",
+        )
+        .unwrap();
+        let mut mapping = Mapping::new(1);
+        mapping.record_symbol("repair_enum_fixture::Event::Changed::task", "task_hidden");
+        mapping.record_symbol("repair_enum_fixture::Event::Changed::state", "state_hidden");
+
+        let repaired = repair_rust_references(root, &mapping, 4).unwrap();
+        assert!(repaired.check_passed, "{repaired:?}");
+        assert_eq!(repaired.references_repaired, 2);
+        let source = std::fs::read_to_string(root.join("src/main.rs")).unwrap();
+        assert!(source.contains("task_hidden:String::new()"));
+        assert!(source.contains("state_hidden:1"));
     }
 }

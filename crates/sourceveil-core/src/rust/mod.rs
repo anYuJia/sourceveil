@@ -59,23 +59,31 @@
 //! there is no second API to fall back on — the information is not available,
 //! not merely unused.
 //!
-//! The consequence is not a missed opportunity but a broken build: renaming
-//! `target_fn` while `format!("{}", target_fn())` stays put produces source
-//! that does not compile. Two defences apply:
+//! Renaming `target_fn` while one of those references stays put would be a
+//! broken build, so SourceVeil closes the gap without falling back to global
+//! text replacement:
 //!
-//! - Any symbol whose name occurs inside a macro token tree is **kept**, and
-//!   reported under [`crate::report::SkipReason::MacroCallReference`]. This
-//!   over-keeps: `apply_ident!(target_fn)` would in fact have been renamed
-//!   correctly. Erring that way is the whole point of the priority order.
-//! - The `test` cfg is enabled when loading, so test modules are analysed
-//!   rather than silently left out.
+//! - Supported macro grammars and nested token trees are traversed by the
+//!   syntax/scope pass. Module-path positions are classified separately from
+//!   same-spelled values and fields.
+//! - A candidate defined below a direct `#[cfg(...)]` can use a constrained,
+//!   kind-shaped fallback whose edits remain inside cfg syntax.
+//! - With `cargo-check` verification selected, rustc's primary missing
+//!   field/method/path spans drive a bounded exact-reference completion loop.
+//!   An old leaf name is eligible only when it has one unambiguous generated
+//!   spelling in the mapping, and every edit batch is compiled again.
+//! - Without compiler verification, unresolved macro-token references are
+//!   kept and reported under
+//!   [`crate::report::SkipReason::MacroCallReference`].
 //!
-//! What remains uncovered — a reference inside a `#[cfg(feature = "…")]` block
-//! whose feature is off, for instance — is caught by the verification
-//! pipeline, which compiles the generated tree before anyone can ship it.
+//! The ordinary verification pipeline remains the final gate. An ambiguous or
+//! unsupported reference is never guessed at: it is either kept before edits
+//! or causes the generated build to fail.
 
 pub mod analysis;
+pub mod bindings;
 pub mod candidates;
+pub mod contracts;
 pub mod rename;
 
 /// What kind of item a candidate is. Drives both which config toggle applies
@@ -96,6 +104,10 @@ pub enum ItemKind {
     Variant,
     /// A named struct or union field.
     Field,
+    /// A local pattern binding (`let`, `match`, `for`, or closure binding).
+    Local,
+    /// A function parameter binding.
+    Param,
     Other,
 }
 
@@ -106,7 +118,11 @@ impl ItemKind {
         use crate::names::NameCase;
         match self {
             // Value namespace, snake_case.
-            ItemKind::Function | ItemKind::Module | ItemKind::Field => NameCase::Snake,
+            ItemKind::Function
+            | ItemKind::Module
+            | ItemKind::Field
+            | ItemKind::Local
+            | ItemKind::Param => NameCase::Snake,
             // Type namespace, CamelCase.
             ItemKind::Struct
             | ItemKind::Enum
@@ -137,6 +153,8 @@ impl ItemKind {
             ItemKind::Macro => "macro_rules",
             ItemKind::Variant => "variant",
             ItemKind::Field => "field",
+            ItemKind::Local => "local",
+            ItemKind::Param => "param",
             ItemKind::Other => "item",
         }
     }
@@ -153,6 +171,8 @@ impl ItemKind {
             ItemKind::Module => plan.modules,
             ItemKind::Macro => plan.macros,
             ItemKind::Field => plan.fields,
+            ItemKind::Local => plan.locals,
+            ItemKind::Param => plan.params,
             ItemKind::Other => false,
         }
     }

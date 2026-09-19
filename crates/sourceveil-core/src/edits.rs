@@ -224,6 +224,13 @@ impl EditPlan {
         self.edits.keys().map(PathBuf::as_path)
     }
 
+    /// Edits already staged for a file, expressed against its original
+    /// snapshot. Rename passes use this to coordinate shorthand struct-field
+    /// rewrites with a simultaneous local-binding rename.
+    pub fn pending_edits(&self, path: &Path) -> Option<&[Indel]> {
+        self.edits.get(path).map(Vec::as_slice)
+    }
+
     /// Record the text a file had when the edits were computed.
     pub fn note_source(&mut self, path: &Path, text: &str) {
         self.sources
@@ -361,10 +368,13 @@ impl EditPlan {
         Ok(staged)
     }
 
-    /// Validate and stage a file-system move. A source may only be moved once,
-    /// a destination may only be claimed once, and moves may not overlap an
-    /// already-staged move. The caller performs the input/output boundary
-    /// checks before reaching this method.
+    /// Validate and stage a file-system move. A source may only be moved once
+    /// and a destination may only be claimed once. Nested module moves are
+    /// allowed when the child stays inside the parent's source directory: the
+    /// apply step commits those deepest-first, so `a/b.rs -> a/c.rs` followed
+    /// by `a -> d` naturally produces `d/c.rs`. Other overlaps remain errors.
+    /// The caller performs the input/output boundary checks before reaching
+    /// this method.
     pub fn validate_move(&self, incoming: &FileMove) -> std::result::Result<(), String> {
         if incoming.source == incoming.destination {
             return Err(format!(
@@ -387,13 +397,15 @@ impl EditPlan {
                     incoming.destination.display()
                 ));
             }
-            let source_overlap = existing.directory
-                && incoming.source.starts_with(&existing.source)
-                || incoming.directory && existing.source.starts_with(&incoming.source);
-            let destination_overlap = existing.directory
-                && incoming.destination.starts_with(&existing.destination)
-                || incoming.directory && existing.destination.starts_with(&incoming.destination);
-            if source_overlap || destination_overlap {
+            let source_overlap = (existing.directory
+                && incoming.source.starts_with(&existing.source))
+                || (incoming.directory && existing.source.starts_with(&incoming.source));
+            let destination_overlap = (existing.directory
+                && incoming.destination.starts_with(&existing.destination))
+                || (incoming.directory && existing.destination.starts_with(&incoming.destination));
+            let composable_nested_move = nested_move_is_composable(existing, incoming)
+                || nested_move_is_composable(incoming, existing);
+            if (source_overlap || destination_overlap) && !composable_nested_move {
                 return Err(format!(
                     "file moves {} -> {} and {} -> {} overlap",
                     existing.source.display(),
@@ -443,7 +455,10 @@ impl EditPlan {
                 );
             }
         }
-        for file_move in &self.moves {
+        let mut ordered_moves: Vec<&FileMove> = self.moves.iter().collect();
+        ordered_moves
+            .sort_by_key(|file_move| std::cmp::Reverse(file_move.source.components().count()));
+        for file_move in ordered_moves {
             let source_rel =
                 strip_prefix_path(&file_move.source, input_root).with_context(|| {
                     format!("{} is not under the input root", file_move.source.display())
@@ -544,7 +559,10 @@ impl EditPlan {
         // the original paths rust-analyzer loaded. Every move was prevalidated
         // by `stage_move`, so a fresh generated tree cannot contain a target
         // collision here.
-        for file_move in &self.moves {
+        let mut ordered_moves: Vec<&FileMove> = self.moves.iter().collect();
+        ordered_moves
+            .sort_by_key(|file_move| std::cmp::Reverse(file_move.source.components().count()));
+        for file_move in ordered_moves {
             let source_rel =
                 strip_prefix_path(&file_move.source, input_root).with_context(|| {
                     format!("{} is not under the input root", file_move.source.display())
@@ -585,6 +603,17 @@ impl EditPlan {
 
         Ok(outcome)
     }
+}
+
+/// Return true when `parent` can safely contain `child` in one move
+/// transaction. Both child paths must use the parent's original source tree;
+/// committing the child first means the subsequent directory move carries its
+/// renamed result to the parent's final destination.
+fn nested_move_is_composable(parent: &FileMove, child: &FileMove) -> bool {
+    parent.directory
+        && child.source != parent.source
+        && child.source.starts_with(&parent.source)
+        && child.destination.starts_with(&parent.source)
 }
 
 fn overlaps(a: &Indel, b: &Indel) -> bool {
@@ -1031,5 +1060,64 @@ mod tests {
 
         assert_eq!(staged, 1);
         assert_eq!(plan.edited_files().count(), 1);
+    }
+
+    #[test]
+    fn nested_module_moves_commit_deepest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("in");
+        let output = tmp.path().join("out");
+        std::fs::create_dir_all(input.join("src/auth")).unwrap();
+        std::fs::create_dir_all(output.join("src/auth")).unwrap();
+        std::fs::write(input.join("src/auth/token.rs"), "pub fn token() {}").unwrap();
+        std::fs::copy(
+            input.join("src/auth/token.rs"),
+            output.join("src/auth/token.rs"),
+        )
+        .unwrap();
+
+        let mut plan = EditPlan::new();
+        // Deliberately stage the parent first: commit ordering must not depend
+        // on candidate discovery order.
+        plan.stage_move(FileMove {
+            source: input.join("src/auth"),
+            destination: input.join("src/new_auth"),
+            directory: true,
+        })
+        .unwrap();
+        plan.stage_move(FileMove {
+            source: input.join("src/auth/token.rs"),
+            destination: input.join("src/auth/new_token.rs"),
+            directory: false,
+        })
+        .unwrap();
+
+        plan.apply(&input, &output).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output.join("src/new_auth/new_token.rs")).unwrap(),
+            "pub fn token() {}"
+        );
+        assert!(!output.join("src/auth").exists());
+    }
+
+    #[test]
+    fn nested_move_cannot_escape_the_parent_source_tree() {
+        let root = Path::new("/workspace");
+        let mut plan = EditPlan::new();
+        plan.stage_move(FileMove {
+            source: root.join("src/auth"),
+            destination: root.join("src/new_auth"),
+            directory: true,
+        })
+        .unwrap();
+
+        let error = plan
+            .stage_move(FileMove {
+                source: root.join("src/auth/token.rs"),
+                destination: root.join("src/elsewhere/token.rs"),
+                directory: false,
+            })
+            .unwrap_err();
+        assert!(error.contains("overlap"), "{error}");
     }
 }

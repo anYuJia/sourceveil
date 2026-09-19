@@ -19,23 +19,26 @@
 //!    span. A collision means an assumption is wrong, and the second rename is
 //!    dropped and reported rather than applied on top of the first.
 
-use super::analysis::RustAnalysis;
+use super::analysis::{LoadOptions, RustAnalysis};
 use super::candidates::{self, Candidate, FileContext, Visibility};
 use crate::edits::{Contribution, EditPlan, FileMove};
 use crate::mapping::Mapping;
-use crate::names::{NameDeriver, SeedDomain};
+use crate::names::{NameCase, NameDeriver, SeedDomain};
 use crate::plan::Plan;
 use crate::report::{RenameStats, SkipReason, SkippedSymbol};
 use crate::rust::ItemKind;
 use crate::scanner::{
     is_root_like, path_eq, path_starts_with, strip_prefix_path, CrateGraph, CrateInfo,
 };
-use anyhow::Result;
-use ra_ap_ide::{FileId, FilePosition, Indel, RenameConfig, SourceChange, TextSize};
+use anyhow::{Context, Result};
+use ra_ap_ide::{
+    Analysis, FileId, FilePosition, GotoDefinitionConfig, Indel, RenameConfig, SourceChange,
+    TextSize,
+};
 use ra_ap_ide_db::source_change::FileSystemEdit;
-use ra_ap_syntax::ast::AstNode;
-use ra_ap_syntax::TextRange;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use ra_ap_syntax::ast::{self, AstNode, HasName};
+use ra_ap_syntax::{Edition, SourceFile, TextRange};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// State shared with the other passes.
@@ -52,6 +55,12 @@ pub struct Shared<'a> {
     /// Identifiers occurring inside a macro token tree, collected once by the
     /// pipeline because both passes need them.
     pub macro_referenced: HashSet<String>,
+    /// Unresolved implicit captures in format strings. These live in Rust's
+    /// value namespace: they may denote locals/parameters (handled by the
+    /// lexical binding pass) or constants/statics, but never fields or types.
+    pub macro_format_referenced: HashSet<String>,
+    /// Exact macro call-site references keyed by their semantic definition.
+    pub macro_references: HashMap<(PathBuf, TextRange), Vec<(PathBuf, TextRange)>>,
 }
 
 pub struct RenameRequest<'a> {
@@ -63,6 +72,10 @@ pub struct RenameRequest<'a> {
     pub plan: &'a Plan,
     pub graph: &'a CrateGraph,
     pub seed: u64,
+    /// A later rustc feedback pass can distinguish real unresolved macro
+    /// references from unrelated DSL labels, so a name-level macro hit need
+    /// not conservatively pin every same-spelled definition.
+    pub allow_unresolved_macro_references: bool,
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +101,8 @@ pub fn run(
         plan,
         claimed,
         macro_referenced,
+        macro_format_referenced,
+        macro_references,
     } = shared;
     let mut outcome = RenameOutcome {
         mapping: Mapping::new(req.seed),
@@ -143,9 +158,20 @@ pub fn run(
 
     let mut skipped: Vec<SkippedSymbol> = Vec::new();
 
-    let keep = KeepRules::new(req.plan, macro_referenced);
+    let keep = KeepRules::new(
+        req.plan,
+        macro_referenced,
+        macro_format_referenced,
+        req.allow_unresolved_macro_references,
+    );
 
     for (file_id, candidate) in &all_candidates {
+        // Bindings are rewritten in a dedicated scope-aware post-pass, after
+        // field/shorthand and module edits have settled. A workspace-wide
+        // macro-name blacklist must not pin unrelated closure parameters.
+        if matches!(candidate.kind, ItemKind::Local | ItemKind::Param) {
+            continue;
+        }
         // Another pass owns this one. It has already been renamed, from the
         // same snapshot, and renaming it again here would produce a second
         // name for the same symbol.
@@ -158,29 +184,58 @@ pub fn run(
             continue;
         }
 
-        let new_name = names.derive(
-            SeedDomain::RustSymbol,
-            &candidate.path,
-            candidate.kind.name_case(),
-        )?;
+        let name_case = if matches!(candidate.kind, ItemKind::Local | ItemKind::Param)
+            && candidate.name.starts_with('_')
+        {
+            NameCase::HiddenSnake
+        } else {
+            candidate.kind.name_case()
+        };
+        // Every workspace symbol with the same spelling and casing receives
+        // one replacement. Semantic edits still decide each reference; the
+        // shared target makes macro expansions, generated serde paths, and
+        // duplicate field groups composable without a textual search/replace.
+        let identity = format!("rust-name::{name_case:?}::{}", candidate.name);
+        let new_name = names.derive(SeedDomain::RustSymbol, &identity, name_case)?;
 
         let change = match propose_rename(analysis, *file_id, candidate.name_range, &new_name) {
             Ok(change) => change,
             Err(reason) => {
+                if reason.0 == SkipReason::Unresolvable
+                    && candidate
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute == "cfg")
+                {
+                    if let Ok((applied, files)) =
+                        stage_cfg_inactive_change(candidate, &new_name, &analyzed_text, plan)
+                    {
+                        outcome.stats.bump(candidate.kind);
+                        outcome.stats.edits_applied += applied;
+                        outcome.files_edited.extend(files);
+                        outcome
+                            .mapping
+                            .record_symbol(candidate.path.clone(), new_name.clone());
+                        continue;
+                    }
+                }
                 skipped.push(skipped_for(candidate, reason.0, reason.1));
                 continue;
             }
         };
 
-        let allow_file_moves = candidate.kind == ItemKind::Module && req.plan.rename.module_files;
-        match stage_change(
+        let stage = StageChangeContext {
             analysis,
+            req,
+            analyzed_text: &analyzed_text,
+        };
+        match stage_change(
+            &stage,
             change,
             candidate,
-            req,
-            &analyzed_text,
+            &new_name,
             plan,
-            allow_file_moves,
+            macro_references.get(&(candidate.file.clone(), candidate.name_range)),
         ) {
             Ok((applied, files)) => {
                 outcome.stats.bump(candidate.kind);
@@ -200,6 +255,117 @@ pub fn run(
     outcome.stats.files_edited = outcome.files_edited.len();
     outcome.skipped = skipped;
     Ok(outcome)
+}
+
+/// Rename an item that is syntactically present but inactive for the host
+/// target. rust-analyzer quite correctly has no definition graph for it. The
+/// fallback is constrained to identifiers under `#[cfg(...)]`, uses only
+/// candidate-shaped syntax, and stages through the same conflict-checked edit
+/// transaction as semantic renames.
+fn stage_cfg_inactive_change(
+    candidate: &Candidate,
+    new_name: &str,
+    analyzed_text: &BTreeMap<PathBuf, String>,
+    plan: &mut EditPlan,
+) -> std::result::Result<(usize, Vec<PathBuf>), Skip> {
+    let mut by_file: BTreeMap<PathBuf, Vec<Indel>> = BTreeMap::new();
+    for (path, source) in analyzed_text {
+        let parsed = SourceFile::parse(source, Edition::Edition2024).tree();
+        for token in parsed
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+        {
+            if token.kind() != ra_ap_syntax::SyntaxKind::IDENT || token.text() != candidate.name {
+                continue;
+            }
+            let range = token.text_range();
+            let definition = *path == candidate.file && range == candidate.name_range;
+            if !definition && !token_is_under_cfg(&token) {
+                continue;
+            }
+            if !definition && !cfg_reference_shape(candidate.kind, &token) {
+                continue;
+            }
+            let edit =
+                field_shorthand_edit(source, range, candidate, new_name).unwrap_or_else(|| Indel {
+                    delete: range,
+                    insert: new_name.to_string(),
+                });
+            by_file.entry(path.clone()).or_default().push(edit);
+        }
+    }
+
+    if !by_file.get(&candidate.file).is_some_and(|edits| {
+        edits
+            .iter()
+            .any(|edit| edit.delete.contains_range(candidate.name_range))
+    }) {
+        return Err((
+            SkipReason::Unresolvable,
+            Some("cfg fallback did not find the definition".into()),
+        ));
+    }
+    for edits in by_file.values_mut() {
+        edits.sort_by_key(|edit| (edit.delete.start(), edit.delete.end()));
+        edits.dedup_by(|left, right| left.delete == right.delete && left.insert == right.insert);
+    }
+    remove_already_staged_exact_edits(&mut by_file, plan);
+    let applied = by_file.values().map(Vec::len).sum();
+    let files: Vec<_> = by_file
+        .iter()
+        .filter(|(_, edits)| !edits.is_empty())
+        .map(|(path, _)| path.clone())
+        .collect();
+    let contributions = by_file
+        .iter()
+        .map(|(path, edits)| Contribution::new(path, &analyzed_text[path], edits.clone()));
+    plan.stage_transaction(contributions)
+        .map_err(|error| (SkipReason::EditConflict, Some(error.to_string())))?;
+    Ok((applied, files))
+}
+
+fn token_is_under_cfg(token: &ra_ap_syntax::SyntaxToken) -> bool {
+    token.parent().is_some_and(|parent| {
+        parent.ancestors().any(|node| {
+            candidates::attribute_names(&node)
+                .iter()
+                .any(|name| name == "cfg")
+        })
+    })
+}
+
+fn cfg_reference_shape(kind: ItemKind, token: &ra_ap_syntax::SyntaxToken) -> bool {
+    let previous = previous_non_trivia_token(token.prev_token());
+    let next = next_non_trivia_token(token.next_token());
+    match kind {
+        ItemKind::Function => {
+            next.as_ref().is_some_and(|next| next.text() == "(")
+                || previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.text() == ".")
+                || token_ends_path_separator(previous)
+        }
+        ItemKind::Module => {
+            token_ends_path_separator(previous) || token_begins_path_separator(next)
+        }
+        ItemKind::Field => {
+            previous
+                .as_ref()
+                .is_some_and(|previous| previous.text() == ".")
+                || next.as_ref().is_some_and(|next| next.text() == ":")
+                || token.parent().is_some_and(|parent| {
+                    parent.ancestors().any(|node| {
+                        matches!(
+                            node.kind(),
+                            ra_ap_syntax::SyntaxKind::RECORD_EXPR_FIELD
+                                | ra_ap_syntax::SyntaxKind::RECORD_PAT_FIELD
+                        )
+                    })
+                })
+        }
+        _ => true,
+    }
 }
 
 pub(crate) type Skip = (SkipReason, Option<String>);
@@ -284,17 +450,29 @@ pub(crate) fn resolve_change_edits(
     Ok(by_file)
 }
 
+struct StageChangeContext<'a, 'request> {
+    analysis: &'a RustAnalysis,
+    req: &'a RenameRequest<'request>,
+    analyzed_text: &'a BTreeMap<PathBuf, String>,
+}
+
 fn stage_change(
-    analysis: &RustAnalysis,
+    context: &StageChangeContext<'_, '_>,
     change: SourceChange,
     candidate: &Candidate,
-    req: &RenameRequest<'_>,
-    analyzed_text: &BTreeMap<PathBuf, String>,
+    new_name: &str,
     plan: &mut EditPlan,
-    allow_file_moves: bool,
+    macro_references: Option<&Vec<(PathBuf, TextRange)>>,
 ) -> std::result::Result<(usize, Vec<PathBuf>), Skip> {
-    let (by_file, file_moves) = if allow_file_moves {
-        if analyzed_text
+    // Inline modules have no backing path to move. rust-analyzer expresses a
+    // file-backed module rename with filesystem edits; only that concrete
+    // signal opts into the move transaction.
+    let allow_file_moves = candidate.kind == ItemKind::Module
+        && context.req.plan.rename.module_files
+        && !change.file_system_edits.is_empty();
+    let (mut by_file, file_moves) = if allow_file_moves {
+        if context
+            .analyzed_text
             .values()
             .any(|text| text.contains("include!("))
         {
@@ -307,13 +485,31 @@ fn stage_change(
                 ),
             ));
         }
-        resolve_change_edits_with_file_moves(analysis, req.input_root, req.copied, &change)?
+        resolve_change_edits_with_file_moves(
+            context.analysis,
+            context.req.input_root,
+            context.req.copied,
+            &change,
+        )?
     } else {
         (
-            resolve_change_edits(analysis, req.input_root, req.copied, &change)?,
+            resolve_change_edits(
+                context.analysis,
+                context.req.input_root,
+                context.req.copied,
+                &change,
+            )?,
             Vec::new(),
         )
     };
+
+    reconcile_resolved_edits(
+        &mut by_file,
+        candidate,
+        macro_references,
+        new_name,
+        context.analyzed_text,
+    );
 
     // Verify the definition site is among the edits. If rust-analyzer resolved
     // the position to something other than the item we think we are renaming,
@@ -337,8 +533,13 @@ fn stage_change(
         ));
     }
 
+    remove_already_staged_exact_edits(&mut by_file, plan);
     let staged = by_file.values().map(Vec::len).sum();
-    let touched: Vec<PathBuf> = by_file.keys().cloned().collect();
+    let touched: Vec<PathBuf> = by_file
+        .iter()
+        .filter(|(_, edits)| !edits.is_empty())
+        .map(|(path, _)| path.clone())
+        .collect();
     let mut contributions = Vec::with_capacity(by_file.len());
     for (path, indels) in &by_file {
         for indel in indels {
@@ -351,7 +552,7 @@ fn stage_change(
                 "staged edit"
             );
         }
-        let Some(text) = analyzed_text.get(path) else {
+        let Some(text) = context.analyzed_text.get(path) else {
             return Err((
                 SkipReason::EditOutsideOutput,
                 Some(format!(
@@ -378,6 +579,178 @@ fn stage_change(
     *plan = trial;
 
     Ok((staged, touched))
+}
+
+/// Turn a rename into a definition-indexed edit set.
+///
+/// rust-analyzer's high-level rename result is useful for validating the
+/// definition and for module filesystem moves, but on large macro-heavy crates
+/// it can omit inferred field/method references and occasionally include a
+/// same-spelled shadowed local. `collect_syntax_facts` independently resolves
+/// every candidate-shaped token with goto-definition. We therefore retain the
+/// definition edit from `rename` and reconstruct all reference edits from that
+/// exact graph. This is semantic filtering, not a textual fallback.
+pub(crate) fn reconcile_resolved_edits(
+    by_file: &mut BTreeMap<PathBuf, Vec<Indel>>,
+    candidate: &Candidate,
+    references: Option<&Vec<(PathBuf, TextRange)>>,
+    new_name: &str,
+    analyzed_text: &BTreeMap<PathBuf, String>,
+) {
+    // Retain only the definition from rust-analyzer's high-level rename. Its
+    // search can include a same-spelled shadowed binding in macro-heavy code;
+    // references are rebuilt from the exact definition index below. Module
+    // navigation targets are canonicalized to their `mod` declaration while
+    // collecting that index, so file-backed modules follow the same rule.
+    for (path, edits) in by_file.iter_mut() {
+        edits.retain(|edit| {
+            *path == candidate.file && edit.delete.contains_range(candidate.name_range)
+        });
+    }
+    by_file.retain(|_, edits| !edits.is_empty());
+
+    for (path, range) in references.into_iter().flatten() {
+        if *path == candidate.file && range.contains_range(candidate.name_range) {
+            continue;
+        }
+        if candidate.kind == ItemKind::Module
+            && analyzed_text
+                .get(path)
+                .is_none_or(|source| !is_module_path_reference(source, *range))
+        {
+            continue;
+        }
+        let edits = by_file.entry(path.clone()).or_default();
+        if edits.iter().any(|edit| edit.delete == *range) {
+            continue;
+        }
+        let edit = analyzed_text
+            .get(path)
+            .and_then(|source| field_shorthand_edit(source, *range, candidate, new_name))
+            .unwrap_or_else(|| Indel {
+                delete: *range,
+                insert: new_name.to_string(),
+            });
+        if !edits
+            .iter()
+            .any(|existing| existing.delete == edit.delete && existing.insert == edit.insert)
+        {
+            edits.push(edit);
+        }
+    }
+}
+
+/// rust-analyzer can occasionally resolve a value expression to a same-named
+/// module after a large proc-macro expansion. A module is only usable through
+/// a Rust path, so require `::` adjacency or a `use` item before accepting the
+/// reference. This rejects `cookie.clone()` when a `cookie` module also exists
+/// while retaining `cookie::parse()` and `use cookie as cookies`.
+fn is_module_path_reference(source: &str, range: TextRange) -> bool {
+    let parsed = SourceFile::parse(source, Edition::Edition2024).tree();
+    let Some(token) = parsed
+        .syntax()
+        .token_at_offset(range.start())
+        .find(|token| token.text_range() == range)
+    else {
+        return false;
+    };
+    let previous = previous_non_trivia_token(token.prev_token());
+    let next = next_non_trivia_token(token.next_token());
+    token_ends_path_separator(previous)
+        || token_begins_path_separator(next)
+        || token.parent().is_some_and(|parent| {
+            parent
+                .ancestors()
+                .any(|node| node.kind() == ra_ap_syntax::SyntaxKind::USE)
+        })
+}
+
+fn previous_non_trivia_token(
+    mut token: Option<ra_ap_syntax::SyntaxToken>,
+) -> Option<ra_ap_syntax::SyntaxToken> {
+    while token.as_ref().is_some_and(|token| token.kind().is_trivia()) {
+        token = token.and_then(|token| token.prev_token());
+    }
+    token
+}
+
+fn next_non_trivia_token(
+    mut token: Option<ra_ap_syntax::SyntaxToken>,
+) -> Option<ra_ap_syntax::SyntaxToken> {
+    while token.as_ref().is_some_and(|token| token.kind().is_trivia()) {
+        token = token.and_then(|token| token.next_token());
+    }
+    token
+}
+
+fn token_begins_path_separator(token: Option<ra_ap_syntax::SyntaxToken>) -> bool {
+    token.is_some_and(|token| {
+        token.kind() == ra_ap_syntax::SyntaxKind::COLON2
+            || (token.text() == ":"
+                && next_non_trivia_token(token.next_token()).is_some_and(|next| next.text() == ":"))
+    })
+}
+
+fn token_ends_path_separator(token: Option<ra_ap_syntax::SyntaxToken>) -> bool {
+    token.is_some_and(|token| {
+        token.kind() == ra_ap_syntax::SyntaxKind::COLON2
+            || (token.text() == ":"
+                && previous_non_trivia_token(token.prev_token())
+                    .is_some_and(|previous| previous.text() == ":"))
+    })
+}
+
+fn field_shorthand_edit(
+    source: &str,
+    range: TextRange,
+    candidate: &Candidate,
+    new_name: &str,
+) -> Option<Indel> {
+    if candidate.kind != ItemKind::Field {
+        return None;
+    }
+    let parsed = SourceFile::parse(source, Edition::Edition2024).tree();
+    let token = parsed
+        .syntax()
+        .token_at_offset(range.start())
+        .find(|token| token.text_range() == range)?;
+    let record = token.parent()?.ancestors().find(|node| {
+        matches!(
+            node.kind(),
+            ra_ap_syntax::SyntaxKind::RECORD_EXPR_FIELD
+                | ra_ap_syntax::SyntaxKind::RECORD_PAT_FIELD
+        )
+    })?;
+    if record
+        .children_with_tokens()
+        .any(|element| element.kind() == ra_ap_syntax::SyntaxKind::COLON)
+    {
+        return None;
+    }
+    Some(Indel {
+        delete: TextRange::empty(record.text_range().start()),
+        insert: format!("{new_name}: "),
+    })
+}
+
+/// Same-spelled field definitions deliberately share a generated spelling.
+/// Their semantic edit sets can therefore contain the same call-site edit.
+/// Treat an already-staged byte-for-byte identical edit as fulfilled, while a
+/// different edit on the same span remains a hard conflict in `EditPlan`.
+pub(crate) fn remove_already_staged_exact_edits(
+    by_file: &mut BTreeMap<PathBuf, Vec<Indel>>,
+    plan: &EditPlan,
+) {
+    for (path, edits) in by_file {
+        let Some(staged) = plan.pending_edits(path) else {
+            continue;
+        };
+        edits.retain(|incoming| {
+            !staged.iter().any(|existing| {
+                existing.delete == incoming.delete && existing.insert == incoming.insert
+            })
+        });
+    }
 }
 
 type ResolvedFileMoves = (BTreeMap<PathBuf, Vec<Indel>>, Vec<FileMove>);
@@ -645,8 +1018,68 @@ pub struct SyntaxFacts {
     /// Every identifier in workspace source, used to keep generated names from
     /// colliding with, or shadowing, one that already exists.
     pub identifiers: HashSet<String>,
-    /// Identifiers appearing inside a macro token tree.
+    /// Identifiers in macro DSL positions whose definition cannot be proven.
+    /// Resolved macro references are recorded separately and rewritten at
+    /// their exact source ranges.
     pub macro_referenced: HashSet<String>,
+    /// Implicit named format captures which rust-analyzer could not resolve.
+    /// Kept separate so a local `{value}` never pins every field called
+    /// `value`; only const/static candidates use this conservative fallback.
+    pub macro_format_referenced: HashSet<String>,
+    /// Macro call-site spans grouped by the exact definition they resolve to.
+    /// This is the semantic bridge that lets fields/functions referenced from
+    /// `assert!`, `format!`, `json!`, and similar macros move without global
+    /// textual replacement.
+    pub macro_references: HashMap<(PathBuf, TextRange), Vec<(PathBuf, TextRange)>>,
+}
+
+/// Keeps the generated copy byte-for-byte recoverable while a second
+/// rust-analyzer snapshot reads same-length standard-macro shells. Restoration
+/// happens explicitly on the success path and again from `Drop` on every
+/// early-return/error path.
+#[derive(Default)]
+struct FileRestore {
+    files: Vec<(PathBuf, String)>,
+    restored: bool,
+}
+
+impl FileRestore {
+    fn replace(&mut self, path: &Path, replacement: &str) -> Result<()> {
+        let original =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        if original.len() != replacement.len() {
+            anyhow::bail!(
+                "macro analysis shell for {} changed byte length ({} -> {})",
+                path.display(),
+                original.len(),
+                replacement.len()
+            );
+        }
+        std::fs::write(path, replacement)
+            .with_context(|| format!("writing macro analysis shell {}", path.display()))?;
+        self.files.push((path.to_path_buf(), original));
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        for (path, original) in &self.files {
+            std::fs::write(path, original)
+                .with_context(|| format!("restoring {}", path.display()))?;
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for FileRestore {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        for (path, original) in &self.files {
+            let _ = std::fs::write(path, original);
+        }
+    }
 }
 
 /// Collect both identifier sets in a single walk.
@@ -654,29 +1087,343 @@ pub fn collect_syntax_facts(
     analysis: &RustAnalysis,
     files: &[(FileId, PathBuf)],
     graph: &CrateGraph,
-) -> SyntaxFacts {
+    input_root: &Path,
+    output_root: &Path,
+    macro_analysis_root: &Path,
+) -> Result<SyntaxFacts> {
     let mut facts = SyntaxFacts::default();
+    let mut shadowed_macros = HashSet::new();
+    let mut candidate_names = HashSet::new();
+    let mut module_candidates = Vec::new();
+    for (file_id, path) in files {
+        let Some(krate) = crate_for_file(graph, path) else {
+            continue;
+        };
+        let Some((parsed, source)) = analysis.parse(*file_id) else {
+            continue;
+        };
+        let prefix = module_prefix_for(krate, path);
+        let context = FileContext {
+            path,
+            text: &source,
+            crate_name: &krate.name,
+            module_prefix: &prefix,
+        };
+        for candidate in candidates::collect(&parsed, &context) {
+            candidate_names.insert(candidate.name.clone());
+            if candidate.kind == ItemKind::Module {
+                module_candidates.push((candidate.file, candidate.name_range));
+            }
+        }
+        for definition in parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::MacroRules::cast)
+        {
+            if let Some(name) = definition.name() {
+                shadowed_macros.insert(name.text().to_string());
+            }
+        }
+    }
+
+    let mut macro_sources = HashMap::new();
+    let mut source_texts = HashMap::new();
+    let mut restore = FileRestore::default();
     for (file_id, path) in files {
         if crate_for_file(graph, path).is_none() {
             continue;
         }
-        let Some((parsed, _)) = analysis.parse(*file_id) else {
+        let Some((_, source)) = analysis.parse(*file_id) else {
             continue;
         };
+        source_texts.insert(*file_id, source.clone());
+        if let Ok(expanded) = super::bindings::macro_analysis_source(&source, &shadowed_macros) {
+            if let Some(relative) = strip_prefix_path(path, input_root) {
+                let output_path = output_root.join(relative);
+                if output_path.is_file() {
+                    restore
+                        .replace(&output_path, &expanded.text)
+                        .with_context(|| {
+                            format!("preparing macro analysis for {}", output_path.display())
+                        })?;
+                }
+            }
+            macro_sources.insert(*file_id, expanded);
+        }
+    }
+    let source_handle = analysis.analysis();
+    let macro_analysis_result = RustAnalysis::load(
+        macro_analysis_root,
+        &LoadOptions {
+            load_out_dirs_from_check: false,
+            proc_macros: true,
+        },
+    );
+    restore
+        .restore()
+        .context("restoring macro analysis shells")?;
+    let macro_analysis = macro_analysis_result.context("loading standard-macro analysis shell")?;
+    let macro_handle = macro_analysis.analysis();
+    let source_file_ids: HashMap<PathBuf, FileId> =
+        files.iter().map(|(id, path)| (path.clone(), *id)).collect();
+    let mut definition_aliases: HashMap<(PathBuf, TextRange), Vec<(PathBuf, TextRange)>> =
+        HashMap::new();
+    for (file, range) in module_candidates {
+        let canonical = (file.clone(), range);
+        definition_aliases
+            .entry(canonical.clone())
+            .or_default()
+            .push(canonical.clone());
+        let Some(file_id) = source_file_ids.get(&file) else {
+            continue;
+        };
+        // Module navigation intentionally targets the backing file, whereas
+        // rename is anchored at the `mod name` declaration. Record both as
+        // one semantic identity so references inside macro token trees are
+        // joined to the declaration candidate as well.
+        for target in semantic_definition_targets(
+            &source_handle,
+            analysis,
+            input_root,
+            input_root,
+            *file_id,
+            range,
+        ) {
+            definition_aliases
+                .entry(target)
+                .or_default()
+                .push(canonical.clone());
+        }
+    }
+    for aliases in definition_aliases.values_mut() {
+        aliases.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then(left.1.start().cmp(&right.1.start()))
+                .then(left.1.end().cmp(&right.1.end()))
+        });
+        aliases.dedup();
+    }
+    let mut macro_file_ids = HashMap::new();
+    for (macro_file_id, macro_path) in macro_analysis.rust_files() {
+        let Some(relative) = strip_prefix_path(&macro_path, output_root) else {
+            continue;
+        };
+        macro_file_ids.insert(input_root.join(relative), macro_file_id);
+    }
+
+    for (file_id, path) in files {
+        if crate_for_file(graph, path).is_none() {
+            continue;
+        }
+        let Some(source) = source_texts.get(file_id) else {
+            continue;
+        };
+        let parsed = SourceFile::parse(source, Edition::Edition2024).tree();
+        let labels =
+            super::bindings::macro_label_ranges(source, &shadowed_macros).unwrap_or_default();
         for token in parsed
             .syntax()
             .descendants_with_tokens()
             .filter_map(|el| el.into_token())
-            .filter(|t| t.kind() == ra_ap_syntax::SyntaxKind::IDENT)
         {
-            let text = token.text().to_string();
-            if is_inside_macro_token_tree(&token) {
-                facts.macro_referenced.insert(text.clone());
+            if token.kind() == ra_ap_syntax::SyntaxKind::IDENT {
+                let text = token.text().to_string();
+                if is_inside_macro_token_tree(&token) && !labels.contains(&token.text_range()) {
+                    let analysis_range = macro_sources
+                        .get(file_id)
+                        .map(|expanded| expanded.analysis_range(token.text_range()))
+                        .unwrap_or_else(|| token.text_range());
+                    let definitions = macro_file_ids
+                        .get(path)
+                        .map(|macro_file_id| {
+                            semantic_definition_targets(
+                                &macro_handle,
+                                &macro_analysis,
+                                input_root,
+                                output_root,
+                                *macro_file_id,
+                                analysis_range,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let definitions =
+                        canonical_definition_targets(definitions, &definition_aliases);
+                    record_resolved_macro_reference(
+                        path,
+                        token.text_range(),
+                        &text,
+                        definitions,
+                        &mut facts,
+                    );
+                } else if candidate_names.contains(&text) {
+                    // `rename` in rust-analyzer is intentionally conservative
+                    // for inferred fields/methods and can also return a
+                    // same-spelled, shadowed local in an incomplete edit set.
+                    // Index every ordinary reference independently with
+                    // goto-definition. The rename pass later intersects the
+                    // proposed edits with this exact definition graph and
+                    // fills any reference `rename` omitted.
+                    let definitions = semantic_definition_targets(
+                        &source_handle,
+                        analysis,
+                        input_root,
+                        input_root,
+                        *file_id,
+                        token.text_range(),
+                    );
+                    let definitions =
+                        canonical_definition_targets(definitions, &definition_aliases);
+                    for definition in definitions {
+                        facts
+                            .macro_references
+                            .entry(definition)
+                            .or_default()
+                            .push((path.clone(), token.text_range()));
+                    }
+                }
+                facts.identifiers.insert(text);
             }
-            facts.identifiers.insert(text);
+        }
+        for (name, range) in
+            super::bindings::macro_format_references(source, &shadowed_macros).unwrap_or_default()
+        {
+            let analysis_range = macro_sources
+                .get(file_id)
+                .map(|expanded| expanded.analysis_range(range))
+                .unwrap_or(range);
+            // rust-analyzer understands implicit format captures in the real
+            // macro invocation even though rename does not always return an
+            // edit for the identifier inside the string. Resolve there first;
+            // the same-length shell is the fallback for ordinary macro tokens.
+            // This distinction matters for a common spelling such as `value`:
+            // an unresolved local capture must not pin every unrelated field
+            // named `value` in the workspace.
+            let mut definitions = semantic_definition_targets(
+                &source_handle,
+                analysis,
+                input_root,
+                input_root,
+                *file_id,
+                range,
+            );
+            if definitions.is_empty() {
+                definitions = macro_file_ids
+                    .get(path)
+                    .map(|macro_file_id| {
+                        semantic_definition_targets(
+                            &macro_handle,
+                            &macro_analysis,
+                            input_root,
+                            output_root,
+                            *macro_file_id,
+                            analysis_range,
+                        )
+                    })
+                    .unwrap_or_default();
+            }
+            definitions = canonical_definition_targets(definitions, &definition_aliases);
+            if definitions.is_empty() {
+                facts.macro_format_referenced.insert(name);
+            } else {
+                record_resolved_macro_reference(path, range, &name, definitions, &mut facts);
+            }
         }
     }
-    facts
+    for references in facts.macro_references.values_mut() {
+        references.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then(left.1.start().cmp(&right.1.start()))
+                .then(left.1.end().cmp(&right.1.end()))
+        });
+        references.dedup();
+    }
+    Ok(facts)
+}
+
+fn canonical_definition_targets(
+    definitions: Vec<(PathBuf, TextRange)>,
+    aliases: &HashMap<(PathBuf, TextRange), Vec<(PathBuf, TextRange)>>,
+) -> Vec<(PathBuf, TextRange)> {
+    let mut canonical = Vec::new();
+    for definition in definitions {
+        if let Some(targets) = aliases.get(&definition) {
+            canonical.extend(targets.iter().cloned());
+        } else {
+            canonical.push(definition);
+        }
+    }
+    canonical.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.start().cmp(&right.1.start()))
+            .then(left.1.end().cmp(&right.1.end()))
+    });
+    canonical.dedup();
+    canonical
+}
+
+fn semantic_definition_targets(
+    semantic: &Analysis,
+    paths: &RustAnalysis,
+    input_root: &Path,
+    output_root: &Path,
+    file_id: FileId,
+    range: TextRange,
+) -> Vec<(PathBuf, TextRange)> {
+    let config = GotoDefinitionConfig {
+        ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
+    };
+    // At the exact start of `.field`, `path::item`, or a token following
+    // whitespace, rust-analyzer may left-bias to the preceding punctuation.
+    // Place the cursor inside the identifier whenever its span permits it.
+    let offset = if range.len() > TextSize::from(1) {
+        range.start() + TextSize::from(1)
+    } else {
+        range.start()
+    };
+    let mut definitions: Vec<_> = semantic
+        .goto_definition(FilePosition { file_id, offset }, &config)
+        .ok()
+        .flatten()
+        .map(|info| info.info)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|target| {
+            let macro_path = paths.file_path(target.file_id)?;
+            let relative = strip_prefix_path(&macro_path, output_root)?;
+            Some((input_root.join(relative), target.focus_or_full_range()))
+        })
+        .collect();
+    definitions.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.start().cmp(&right.1.start()))
+            .then(left.1.end().cmp(&right.1.end()))
+    });
+    definitions.dedup();
+    definitions
+}
+
+fn record_resolved_macro_reference(
+    path: &Path,
+    range: TextRange,
+    name: &str,
+    definitions: Vec<(PathBuf, TextRange)>,
+    facts: &mut SyntaxFacts,
+) {
+    if definitions.is_empty() {
+        facts.macro_referenced.insert(name.to_string());
+        return;
+    }
+    for definition in definitions {
+        facts
+            .macro_references
+            .entry(definition)
+            .or_default()
+            .push((path.to_path_buf(), range));
+    }
 }
 
 /// Is this token inside a macro's token tree rather than in ordinary code?
@@ -736,10 +1483,17 @@ struct KeepRules {
     /// Names occurring inside a macro token tree. See
     /// [`SkipReason::MacroCallReference`].
     macro_referenced: HashSet<String>,
+    macro_format_referenced: HashSet<String>,
+    allow_unresolved_macro_references: bool,
 }
 
 impl KeepRules {
-    fn new(plan: &Plan, macro_referenced: HashSet<String>) -> Self {
+    fn new(
+        plan: &Plan,
+        macro_referenced: HashSet<String>,
+        macro_format_referenced: HashSet<String>,
+        allow_unresolved_macro_references: bool,
+    ) -> Self {
         let mut attributes: HashSet<String> = crate::plan::INTRINSIC_KEEP_ATTRIBUTES
             .iter()
             .map(|s| s.to_string())
@@ -752,11 +1506,6 @@ impl KeepRules {
         // clap's `#[command]`, which is a harmless over-keep.
         attributes.insert("tauri::command".into());
         attributes.insert("command".into());
-        // `#[serde(...)]` on a field is a wire-format contract that the
-        // dedicated serde pass will rewrite deliberately. Until then, pinning
-        // the item is the only safe option.
-        attributes.insert("serde".into());
-
         attributes.extend(plan.keep.attributes.iter().cloned());
 
         let mut symbols: HashSet<String> = plan.keep.symbols.iter().cloned().collect();
@@ -774,6 +1523,8 @@ impl KeepRules {
                 .unwrap_or_else(|_| globset::GlobSet::empty()),
             attributes,
             macro_referenced,
+            macro_format_referenced,
+            allow_unresolved_macro_references,
         }
     }
 
@@ -787,6 +1538,14 @@ impl KeepRules {
         }
 
         if self.symbols.contains(&candidate.name) || self.patterns.is_match(&candidate.name) {
+            return Some(SkipReason::KeepRule);
+        }
+
+        // Trait declarations and implementations are contracts. Inherent
+        // methods—including conventional names such as `new`, `get`, and
+        // `save`—are ordinary workspace symbols and are resolved semantically;
+        // they do not need a spelling blacklist.
+        if candidate.kind == ItemKind::Function && candidate.trait_method {
             return Some(SkipReason::KeepRule);
         }
 
@@ -819,20 +1578,12 @@ impl KeepRules {
             return Some(SkipReason::RequiresFileRename);
         }
 
-        // The wire-format rule.
-        //
-        // `#[derive(Serialize)]` makes every field name a JSON key. Renaming
-        // the field changes what the program writes and what it accepts, and
-        // the compiler cannot tell you: the code still builds, the tests that
-        // do not round-trip still pass, and the breakage shows up against a
-        // real peer. Until the dedicated serde pass exists — the one that
-        // emits `#[serde(rename = "user_name")]` alongside the new identifier —
-        // the only safe amount of field rename inside a serde model is none.
-        //
-        // This covers enum variants too, and not only fields: a variant name is
-        // an externally-tagged representation's key, which is why this rule has
-        // to hold under the `safe` profile as well, where variants are renamed
-        // by default.
+        // Serde members are owned by the earlier dedicated pass, which can
+        // materialise their wire names and update Rust paths inside serde
+        // metadata. A member that reaches this generic pass was deliberately
+        // kept there, so it must not be reconsidered without its protocol
+        // transaction. This covers externally-tagged enum variants as well as
+        // fields.
         if candidate.serde_model
             && matches!(
                 candidate.kind,
@@ -872,20 +1623,20 @@ impl KeepRules {
             }
         }
 
-        // The load-bearing rule. rust-analyzer resolves references through its
-        // own search, and that search does not reach identifiers inside a macro
-        // token tree: it renames `target_fn()` in ordinary code but leaves it
-        // alone inside `format!(..)`, `vec![..]`, `println!(..)` and inside the
-        // body of a `macro_rules!` definition. The reference is real and the
-        // build depends on it, so a rename that cannot rewrite it is not a
-        // rename at all — it is a syntax error that only shows up later.
-        //
-        // This is measured, not assumed: see the module docs in
-        // `super`, and the e2e test `macro_referenced_symbols_are_kept`.
-        //
-        // Checked last so that a symbol pinned for a structural reason — an
-        // ABI boundary, say — reports that reason rather than this one.
-        if self.macro_referenced.contains(&candidate.name) {
+        // rust-analyzer's search misses some identifiers inside macro token
+        // trees. When compiler-guided exact reference completion is enabled,
+        // those candidates may proceed and rustc supplies only the actual
+        // missing spans. Without that safety net they are pinned here. This is
+        // checked last so a structural reason (an ABI boundary, for example)
+        // wins in the report.
+        if !self.allow_unresolved_macro_references
+            && self.macro_referenced.contains(&candidate.name)
+        {
+            return Some(SkipReason::MacroCallReference);
+        }
+        if matches!(candidate.kind, ItemKind::Const | ItemKind::Static)
+            && self.macro_format_referenced.contains(&candidate.name)
+        {
             return Some(SkipReason::MacroCallReference);
         }
 
@@ -1073,7 +1824,7 @@ mod tests {
         use crate::plan::Plan;
 
         let plan = Plan::resolve(&Config::default()).unwrap();
-        let keep = KeepRules::new(&plan, Default::default());
+        let keep = KeepRules::new(&plan, Default::default(), Default::default(), false);
 
         let mut graph = CrateGraph::default();
         graph.workspace.insert(
@@ -1101,6 +1852,9 @@ mod tests {
             is_extern_abi: false,
             // Not a serde model, so this measures the API boundary alone.
             serde_model: false,
+            is_method: false,
+            trait_method: false,
+            scope_range: None,
         };
 
         // Nothing outside depends on it yet, so it is an ordinary internal item.
@@ -1120,5 +1874,90 @@ mod tests {
             keep.reject(&candidate(Visibility::Private), &graph),
             Some(SkipReason::ExternallyReachable)
         );
+    }
+
+    #[test]
+    fn inherent_conventional_methods_are_not_pinned() {
+        use crate::config::{Config, Profile};
+        let source = "struct Session; impl Session { fn new() -> Self { Self } }";
+        let parsed = SourceFile::parse(source, Edition::Edition2021).tree();
+        let ctx = FileContext {
+            path: Path::new("/p/src-tauri/src/lib.rs"),
+            text: source,
+            crate_name: "app",
+            module_prefix: &[],
+        };
+        let method = candidates::collect(&parsed, &ctx)
+            .into_iter()
+            .find(|candidate| candidate.name == "new")
+            .unwrap();
+        for profile in [Profile::Safe, Profile::Balanced, Profile::Aggressive] {
+            let config = Config {
+                profile: Some(profile),
+                ..Config::default()
+            };
+            let plan = Plan::resolve(&config).unwrap();
+            let keep = KeepRules::new(&plan, Default::default(), Default::default(), false);
+            assert_eq!(keep.reject(&method, &probe_graph()), None);
+        }
+    }
+
+    #[test]
+    fn module_reference_filter_rejects_same_named_values() {
+        let source = "mod cookie; use cookie as jar; fn f(cookie: String) { cookie.clone(); cookie::parse(); }";
+        let ranges: Vec<_> = source
+            .match_indices("cookie")
+            .map(|(start, name)| {
+                TextRange::at(
+                    TextSize::from(start as u32),
+                    TextSize::from(name.len() as u32),
+                )
+            })
+            .collect();
+        assert_eq!(ranges.len(), 5);
+        assert!(is_module_path_reference(source, ranges[1]));
+        assert!(!is_module_path_reference(source, ranges[2]));
+        assert!(!is_module_path_reference(source, ranges[3]));
+        assert!(is_module_path_reference(source, ranges[4]));
+
+        let macro_source = r#"fn main() { println!("{}", network::describe()); }"#;
+        let start = macro_source.find("network").unwrap();
+        let range = TextRange::at(TextSize::from(start as u32), TextSize::from(7));
+        assert!(is_module_path_reference(macro_source, range));
+    }
+
+    #[test]
+    fn cfg_fallback_is_confined_to_inactive_item_syntax() {
+        let source = r#"
+#[cfg(windows)]
+fn platform_only() {}
+#[cfg(windows)]
+fn windows_caller() { platform_only(); let platform_only = 1; let _ = platform_only; }
+fn host_code() { #[cfg(windows)] { platform_only(); } platform_only(); }
+"#;
+        let path = PathBuf::from("/workspace/src/lib.rs");
+        let parsed = SourceFile::parse(source, Edition::Edition2024).tree();
+        let context = FileContext {
+            path: &path,
+            text: source,
+            crate_name: "fixture",
+            module_prefix: &[],
+        };
+        let candidate = candidates::collect(&parsed, &context)
+            .into_iter()
+            .find(|candidate| candidate.name == "platform_only")
+            .unwrap();
+        assert!(candidate.attributes.iter().any(|name| name == "cfg"));
+        let texts = BTreeMap::from([(path.clone(), source.to_string())]);
+        let mut plan = EditPlan::new();
+        let (applied, _) =
+            stage_cfg_inactive_change(&candidate, "hidden_platform", &texts, &mut plan).unwrap();
+        assert_eq!(applied, 3);
+        let rewritten =
+            crate::edits::apply_indels(source, plan.pending_edits(&path).unwrap()).unwrap();
+        assert!(rewritten.contains("fn hidden_platform()"));
+        assert!(rewritten.contains("windows_caller() { hidden_platform();"));
+        assert!(rewritten.contains("let platform_only = 1"));
+        assert!(rewritten.contains("#[cfg(windows)] { hidden_platform(); } platform_only();"));
     }
 }

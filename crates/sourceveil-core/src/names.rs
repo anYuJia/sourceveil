@@ -42,7 +42,7 @@ use crate::rng::SplitMix64;
 use anyhow::{bail, Result};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Which namespace a name belongs to.
 ///
@@ -50,7 +50,7 @@ use std::collections::HashSet;
 /// This is what keeps the passes from disturbing one another: adding an event
 /// cannot move a symbol name, because the event's name never consulted the
 /// symbol stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SeedDomain {
     RustSymbol,
     /// A private JavaScript/TypeScript lexical binding. Kept separate from
@@ -75,10 +75,13 @@ impl SeedDomain {
 }
 
 /// Casing class a replacement name must satisfy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NameCase {
     /// `snake_case`: functions, modules, locals, fields, parameters.
     Snake,
+    /// `_snake_case`: an intentionally-unused local or parameter. Keeping the
+    /// leading underscore preserves Rust's unused-binding lint semantics.
+    HiddenSnake,
     /// `CamelCase`: structs, enums, unions, traits, type aliases, variants,
     /// generic type parameters.
     Camel,
@@ -117,6 +120,10 @@ pub struct NameDeriver {
     reserved: HashSet<String>,
     /// Names already handed out. Used only to *report* a collision.
     issued: HashSet<String>,
+    /// Repeated requests for one logical identity must return one spelling.
+    /// Field groups and same-spelled items use this to make syntax-only macro
+    /// references unambiguous without depending on traversal order.
+    assigned: HashMap<(SeedDomain, String, NameCase), String>,
 }
 
 impl NameDeriver {
@@ -130,6 +137,7 @@ impl NameDeriver {
             len_max,
             reserved,
             issued: HashSet::new(),
+            assigned: HashMap::new(),
         }
     }
 
@@ -149,6 +157,10 @@ impl NameDeriver {
     /// Not on how many names were derived before it, not on traversal order,
     /// not on what else exists in the project.
     pub fn derive(&mut self, domain: SeedDomain, identity: &str, case: NameCase) -> Result<String> {
+        let key = (domain, identity.to_owned(), case);
+        if let Some(name) = self.assigned.get(&key) {
+            return Ok(name.clone());
+        }
         // The only reason to redraw is landing on an identifier the source
         // already uses, and `reserved` is a fixed set, so this loop cannot make
         // the result depend on order.
@@ -170,6 +182,7 @@ impl NameDeriver {
                 continue;
             }
             self.issued.insert(name.clone());
+            self.assigned.insert(key, name.clone());
             return Ok(name);
         }
         bail!(
@@ -201,29 +214,40 @@ impl NameDeriver {
 }
 
 fn random_name(rng: &mut SplitMix64, case: NameCase, len: usize) -> String {
+    let hidden = case == NameCase::HiddenSnake;
+    let body_len = if hidden {
+        // `_` alone is a discard pattern, not an identifier. A configured
+        // one-character minimum therefore still needs one generated letter.
+        len.saturating_sub(1).max(1)
+    } else {
+        len
+    };
     // First character is always a letter; digits may follow. This is what
     // keeps `Q8KAP` a legal identifier rather than a numeric literal prefix.
     let first_alphabet: &[u8] = match case {
-        NameCase::Snake => LOWER,
+        NameCase::Snake | NameCase::HiddenSnake => LOWER,
         NameCase::Camel | NameCase::Screaming => UPPER,
         NameCase::Channel => &[LOWER, UPPER].concat(),
     };
     let tail_alphabet: &[u8] = match case {
-        NameCase::Snake => LOWER,
+        NameCase::Snake | NameCase::HiddenSnake => LOWER,
         NameCase::Camel => LOWER,
         NameCase::Screaming => UPPER,
         NameCase::Channel => &[LOWER, UPPER].concat(),
     };
 
-    let mut out = String::with_capacity(len);
+    let mut out = String::with_capacity(body_len + usize::from(hidden));
+    if hidden {
+        out.push('_');
+    }
     out.push(*rng.pick(first_alphabet) as char);
-    for position in 1..len {
+    for position in 1..body_len {
         // The last character is always a letter. A tail of nothing but digits
         // draws from 10^4 possibilities instead of 36^4, and that one corner is
         // where the birthday bound actually bites: it is the difference between
         // a collision being impossible at any real project size and being
         // merely unlikely.
-        let letter_only = position == len - 1 || rng.below(4) != 0;
+        let letter_only = position == body_len - 1 || rng.below(4) != 0;
         let c = if letter_only {
             *rng.pick(tail_alphabet)
         } else {
@@ -254,6 +278,18 @@ mod tests {
                     .unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn repeated_request_for_one_identity_reuses_the_name() {
+        let mut names = deriver(9);
+        let first = names
+            .derive(SeedDomain::RustSymbol, "field::url", NameCase::Snake)
+            .unwrap();
+        let second = names
+            .derive(SeedDomain::RustSymbol, "field::url", NameCase::Snake)
+            .unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -354,6 +390,19 @@ mod tests {
                 "{snake}"
             );
             assert!(!snake.contains('_'), "{snake}");
+
+            let hidden = d
+                .derive(
+                    SeedDomain::RustSymbol,
+                    &format!("hidden::{index}"),
+                    NameCase::HiddenSnake,
+                )
+                .unwrap();
+            assert!(hidden.starts_with('_'), "{hidden}");
+            assert!(
+                hidden[1..].starts_with(|c: char| c.is_ascii_lowercase()),
+                "{hidden}"
+            );
 
             let camel = d
                 .derive(

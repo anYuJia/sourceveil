@@ -62,6 +62,20 @@ pub struct Candidate {
     /// reads or writes, which is precisely the class of failure this tool
     /// exists to avoid.
     pub serde_model: bool,
+    /// A function declared in an `impl` block. Method references are more
+    /// difficult for rust-analyzer to resolve when a project uses generated
+    /// receivers, so the rename pass can apply a token-safe fallback for
+    /// these candidates.
+    pub is_method: bool,
+    /// A method implementing a trait contract. These names are kept when the
+    /// contract is part of the language/framework (for example
+    /// `Default::default`) because changing them changes the implementation,
+    /// not just the local symbol.
+    pub trait_method: bool,
+    /// Enclosing function/closure range for a local or parameter binding.
+    /// Used only by the token-safe fallback when semantic references are
+    /// incomplete.
+    pub scope_range: Option<TextRange>,
 }
 
 /// Everything the walker needs that is constant for one file.
@@ -123,8 +137,50 @@ fn walk(
                             inline_keep: has_inline_keep(&child, ctx.text),
                             is_extern_abi: has_extern_abi(&child),
                             serde_model,
+                            is_method: kind == ItemKind::Function
+                                && child.ancestors().any(|a| a.kind() == SyntaxKind::IMPL),
+                            trait_method: kind == ItemKind::Function
+                                && (child.ancestors().any(|a| a.kind() == SyntaxKind::TRAIT)
+                                    || child
+                                        .ancestors()
+                                        .find(|a| a.kind() == SyntaxKind::IMPL)
+                                        .and_then(ast::Impl::cast)
+                                        .and_then(|i| i.trait_())
+                                        .is_some()),
+                            scope_range: None,
                         });
                     }
+                }
+            }
+        }
+
+        // `IdentPat` is the syntax node used for every ordinary binding in a
+        // parameter or a local pattern (`let`, `match`, `for`, and closures).
+        // It is deliberately collected separately from item declarations so
+        // a name such as `value` can be renamed without treating a string,
+        // field, or path segment with the same spelling as the binding.
+        if let Some(kind) = binding_kind(&child) {
+            if let Some(name_node) = ast::IdentPat::cast(child.clone()).and_then(|p| p.name()) {
+                let name = name_node.syntax().text().to_string();
+                if !name.is_empty() && name != "self" && name != "_" {
+                    let offset = u32::from(name_node.syntax().text_range().start());
+                    let scope = binding_scope_name(&child).unwrap_or_else(|| "scope".into());
+                    out.push(Candidate {
+                        kind,
+                        path: format!("{}::{}::{}@{}", stack.join("::"), scope, name, offset),
+                        name,
+                        name_range: name_node.syntax().text_range(),
+                        file: ctx.path.to_path_buf(),
+                        line: lines.line_of(usize::from(child.text_range().start())),
+                        visibility: Visibility::Private,
+                        attributes: Vec::new(),
+                        inline_keep: has_inline_keep(&child, ctx.text),
+                        is_extern_abi: false,
+                        serde_model,
+                        is_method: false,
+                        trait_method: false,
+                        scope_range: binding_scope_range(&child),
+                    });
                 }
             }
         }
@@ -284,6 +340,52 @@ fn item_name(node: &SyntaxNode) -> Option<ast::Name> {
         SyntaxKind::RECORD_FIELD => ast::RecordField::cast(node.clone())?.name(),
         _ => None,
     }
+}
+
+/// Classify an identifier pattern as a parameter or local binding.
+///
+/// `IdentPat` is only produced for bindings (paths such as `Foo::Bar` use a
+/// different syntax node), so walking every such node is both more complete
+/// and less error-prone than trying to enumerate each expression form.
+fn binding_kind(node: &SyntaxNode) -> Option<ItemKind> {
+    if node.kind() != SyntaxKind::IDENT_PAT {
+        return None;
+    }
+    // Parameters in `extern "C" { fn foreign(x: T); }` are part of the ABI
+    // declaration rather than local Rust bindings.
+    if node
+        .ancestors()
+        .any(|ancestor| is_foreign_declaration(&ancestor))
+    {
+        return None;
+    }
+    if node.ancestors().any(|a| a.kind() == SyntaxKind::PARAM) {
+        Some(ItemKind::Param)
+    } else {
+        Some(ItemKind::Local)
+    }
+}
+
+/// Include the enclosing function/closure in a binding's mapping path. The
+/// byte offset remains part of the path so shadowed bindings are distinct.
+fn binding_scope_name(node: &SyntaxNode) -> Option<String> {
+    for ancestor in node.ancestors() {
+        if ancestor.kind() == SyntaxKind::FN {
+            return ast::Fn::cast(ancestor)
+                .and_then(|f| f.name())
+                .map(|n| n.syntax().text().to_string());
+        }
+        if ancestor.kind() == SyntaxKind::CLOSURE_EXPR {
+            return Some("closure".into());
+        }
+    }
+    None
+}
+
+fn binding_scope_range(node: &SyntaxNode) -> Option<TextRange> {
+    node.ancestors()
+        .find(|ancestor| matches!(ancestor.kind(), SyntaxKind::FN | SyntaxKind::CLOSURE_EXPR))
+        .map(|ancestor| ancestor.text_range())
 }
 
 /// Name segment introduced by a node, for path building.
@@ -713,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn local_bindings_and_strings_are_not_candidates() {
+    fn local_bindings_and_strings_are_candidates_but_strings_are_not() {
         let cands = collect_src(
             r#"
             fn f() {
@@ -721,8 +823,15 @@ mod tests {
             }
             "#,
         );
-        assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].name, "f");
+        assert!(cands
+            .iter()
+            .any(|c| c.name == "f" && c.kind == ItemKind::Function));
+        assert!(cands
+            .iter()
+            .any(|c| c.name == "some_local" && c.kind == ItemKind::Local));
+        assert!(!cands
+            .iter()
+            .any(|c| c.name == "some_local" && c.kind == ItemKind::Function));
     }
 
     #[test]
