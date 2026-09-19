@@ -507,6 +507,19 @@ fn rename_command(
     // cannot be edited against.
     let mut contributions = Vec::with_capacity(pending.len());
     for (path, indels) in &pending {
+        let relative = crate::scanner::strip_prefix_path(path, req.input_root);
+        if relative
+            .as_ref()
+            .is_none_or(|path| !req.copied.contains(path))
+        {
+            return Err((
+                CommandKeepReason::Unresolvable,
+                Some(format!(
+                    "{} is not part of the generated tree",
+                    path.display()
+                )),
+            ));
+        }
         let Some(text) = texts.get(path).map(String::as_str) else {
             return Err((
                 CommandKeepReason::Unresolvable,
