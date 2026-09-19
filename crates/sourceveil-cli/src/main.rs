@@ -1,6 +1,6 @@
 //! `cargo-obfuscator` — CLI front-end.
 //!
-//! Named so that `cargo obfuscate` resolves to it, and so it can be invoked
+//! Named so that `cargo obfuscator` resolves to it, and so it can be invoked
 //! directly as `cargo-obfuscator`.
 
 use anyhow::{Context, Result};
@@ -69,6 +69,10 @@ struct TransformArgs {
     /// Skip the verification pipeline.
     #[arg(long)]
     no_verify: bool,
+
+    /// Remove Rust/JS/TS/CSS/HTML/TOML/JSONC comments after obfuscation.
+    #[arg(long)]
+    strip_comments: bool,
 
     /// Print more detail about what was and was not transformed.
     #[arg(short, long)]
@@ -176,7 +180,12 @@ impl From<StageArg> for VerifyStage {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Cargo forwards the subcommand name as argv[1] to external subcommands.
+    let mut args: Vec<_> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| arg == "obfuscator") {
+        args.remove(1);
+    }
+    let cli = Cli::parse_from(args);
     let verbose = match &cli.command {
         Command::Transform(a) => a.verbose,
         Command::Scan(a) => a.verbose,
@@ -196,7 +205,10 @@ fn main() -> Result<()> {
 }
 
 fn run_transform(args: TransformArgs) -> Result<()> {
-    let config = load_config(args.config.as_deref())?;
+    let mut config = load_config(args.config.as_deref())?;
+    if args.strip_comments {
+        config.comments.strip = Some(true);
+    }
 
     let request = TransformRequest {
         input: args.input,

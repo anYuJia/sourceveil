@@ -30,8 +30,8 @@ pub enum Profile {
     /// `safe` plus internal-string protection, private field rename and
     /// module-file rename.
     Balanced,
-    /// Reserved for future transforms (function splitting, limited indirect
-    /// dispatch). V1 ships `safe` plus the `balanced` subset.
+    /// Balanced plus local/parameter renaming and physical module-file moves.
+    /// Unimplemented transforms (such as function splitting) remain reported.
     Aggressive,
 }
 
@@ -51,6 +51,8 @@ pub struct Config {
     pub rename: Rename,
     #[serde(default)]
     pub strings: Strings,
+    #[serde(default)]
+    pub comments: Comments,
     #[serde(default)]
     pub tauri: Tauri,
     #[serde(default)]
@@ -127,6 +129,13 @@ pub struct Strings {
     /// User-visible copy. Protected only when explicitly asked for.
     pub ui: Option<bool>,
     pub endpoints: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Comments {
+    /// Strip source comments after all semantic transforms, before verification.
+    pub strip: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

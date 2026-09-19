@@ -61,6 +61,14 @@ pub struct TransformOutcome {
 /// Run the whole pipeline.
 pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     let plan = Plan::resolve(&req.config).context("resolving the configuration")?;
+    let verification_stages = (!req.skip_verify && plan.build.verify).then(|| {
+        req.stages_override
+            .clone()
+            .unwrap_or_else(|| plan.build.verify_stages.clone())
+    });
+    let compiler_repair_enabled = verification_stages
+        .as_ref()
+        .is_some_and(|stages| stages.contains(&VerifyStage::CargoCheck));
 
     let seed_spec = req
         .seed_override
@@ -95,8 +103,20 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     );
 
     // --- 1. copy ---------------------------------------------------------
-    let copy = copier::copy_workspace(&layout.root, &req.output, &plan.project.ignore)
-        .context("copying the workspace")?;
+    let mut preserve_roots = Vec::new();
+    if let Some(root) = &layout.frontend_root {
+        preserve_roots.push(root.clone());
+    }
+    if let Some(source) = &layout.frontend_source {
+        preserve_roots.push(source.clone());
+    }
+    let copy = copier::copy_workspace_preserving(
+        &layout.root,
+        &req.output,
+        &plan.project.ignore,
+        &preserve_roots,
+    )
+    .context("copying the workspace")?;
     report.warnings.extend(copy.warnings.iter().cloned());
     tracing::info!(
         files = copy.stats.files_copied,
@@ -123,7 +143,10 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             .values()
             .any(|mode| *mode == crate::config::DependencyMode::Wrapper);
 
-    if !plan.rename.is_noop()
+    let mut semantic_rename = plan.rename.clone();
+    semantic_rename.locals = false;
+    semantic_rename.params = false;
+    if !semantic_rename.is_noop()
         || plan.tauri.commands
         || plan.tauri.events
         || plan.strings.enabled
@@ -146,7 +169,16 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
         // produce the same first name and collide, so the passes draw from the
         // same one, in a fixed order.
         let files = analysis.rust_files();
-        let facts = rename::collect_syntax_facts(&analysis, &files, &layout.crates);
+        let macro_analysis_root = output_root.join(layout.rust_relative());
+        let facts = rename::collect_syntax_facts(
+            &analysis,
+            &files,
+            &layout.crates,
+            &layout.root,
+            &output_root,
+            &macro_analysis_root,
+        )
+        .context("building semantic macro reference index")?;
         let (len_min, len_max) = plan.rename.name_len;
         let mut names = NameDeriver::new(seed.seed, len_min, len_max, facts.identifiers);
 
@@ -222,6 +254,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
 
         let mut serde_stats = crate::report::RenameStats::default();
         let mut serde_files = std::collections::BTreeSet::new();
+        let mut serde_wire_values = std::collections::HashSet::new();
         if !plan.rename.is_noop() {
             let request = SerdeRenameRequest {
                 input_root: &layout.root,
@@ -229,6 +262,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 plan: &plan,
                 graph: &layout.crates,
                 seed: seed.seed,
+                allow_unresolved_macro_references: compiler_repair_enabled,
             };
             let outcome = serde_rename::run(
                 &analysis,
@@ -236,11 +270,13 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 &mut names,
                 &mut edits,
                 &facts.macro_referenced,
+                &facts.macro_references,
             )
             .context("running the serde rename pass")?;
 
             serde_stats = outcome.stats;
             serde_files = outcome.files_edited;
+            serde_wire_values = outcome.wire_values;
             claimed.extend(outcome.claimed);
             mapping.symbols.extend(outcome.mapping.symbols);
             for skipped in outcome.skipped {
@@ -257,6 +293,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 plan: &plan,
                 graph: &layout.crates,
                 seed: seed.seed,
+                allow_unresolved_macro_references: compiler_repair_enabled,
             };
 
             let outcome = rename::run(
@@ -267,6 +304,8 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                     plan: &mut edits,
                     claimed: &claimed,
                     macro_referenced: facts.macro_referenced,
+                    macro_format_referenced: facts.macro_format_referenced,
+                    macro_references: facts.macro_references,
                 },
             )
             .context("running the rename pass")?;
@@ -303,6 +342,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             protocol_values.extend(mapping.events.keys().cloned());
             protocol_values.extend(command_stats.kept.iter().map(|item| item.name.clone()));
             protocol_values.extend(event_stats.kept.iter().map(|item| item.name.clone()));
+            protocol_values.extend(serde_wire_values);
 
             let request = StringRequest {
                 input_root: &layout.root,
@@ -322,6 +362,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 values_protected: outcome.values_protected,
                 occurrences_protected: outcome.occurrences_protected,
                 kept_unsafe_context: outcome.kept_unsafe_context,
+                kept_external_collision: outcome.kept_external_collision,
                 kept_conflict: outcome.kept_conflict,
             };
             mapping.strings.extend(outcome.mapping);
@@ -360,11 +401,94 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             edits = applied.edits_applied,
             "applied edits"
         );
+
+        // Serde stores Rust paths inside string metadata. They cannot
+        // participate in rust-analyzer's source change, so rewrite those exact
+        // grammar positions after the semantic transaction has landed and
+        // before any build/binding verification sees the generated tree.
+        let contracts = crate::serde::contracts::rewrite_workspace(&output_root, &mapping.symbols)
+            .context("rewriting serde path contracts")?;
+        report.rename.edits_applied += contracts.paths_rewritten;
+        tracing::info!(
+            files = contracts.files_edited,
+            paths = contracts.paths_rewritten,
+            "rewrote serde path contracts"
+        );
+
+        // Proc-macro helper attributes can also contain Rust identifiers in
+        // strings. Handle only structurally proven contracts (currently
+        // thiserror named-field captures) after field renames have landed.
+        let contracts = crate::rust::contracts::rewrite_workspace(&output_root, &mapping.symbols)
+            .context("rewriting Rust attribute contracts")?;
+        report.rename.edits_applied += contracts.captures_rewritten;
+        tracing::info!(
+            files = contracts.files_edited,
+            captures = contracts.captures_rewritten,
+            "rewrote Rust attribute contracts"
+        );
     }
 
     report.commands = command_stats;
     report.events = event_stats;
     report.frontend = frontend_stats;
+
+    if plan.rename.locals || plan.rename.params {
+        let outcome = crate::rust::bindings::run(
+            &output_root,
+            &layout.root,
+            &layout.crates,
+            &plan,
+            seed.seed,
+            &mapping.symbols,
+        )?;
+        report.rename.locals += outcome.stats.locals;
+        report.rename.params += outcome.stats.params;
+        report.rename.edits_applied += outcome.stats.edits_applied;
+        report.rename.binding_files_edited = outcome.stats.files_edited;
+        report.files.rust_scanned = report.files.rust_scanned.max(outcome.files_scanned);
+        mapping.symbols.extend(outcome.mapping);
+        for skipped in outcome.skipped {
+            report.skip(skipped);
+        }
+    }
+
+    // Keep directives and macro references must be read before comments vanish.
+    // Read the generated tree here so moved module paths and generated files
+    // are covered, without invalidating any semantic edit offsets.
+    if plan.strip_comments {
+        let outcome = crate::comments::strip_workspace(&output_root)?;
+        report.comments = outcome.stats;
+        report.warnings.extend(outcome.warnings);
+    }
+
+    let rust_root_out = output_root.join(layout.rust_relative());
+
+    // rust-analyzer intentionally does not model every proc-macro-generated
+    // deref or every inference edge. When cargo-check is part of the requested
+    // proof, use rustc's typed diagnostics to complete only those exact
+    // references whose original identifier has one mapping. This runs before
+    // the recorded verification; that later stage independently proves the
+    // repaired tree.
+    if verification_stages
+        .as_ref()
+        .is_some_and(|stages| stages.contains(&VerifyStage::CargoCheck))
+    {
+        let repaired = verify::repair_rust_references(&rust_root_out, &mapping, 6)
+            .context("completing references from rustc diagnostics")?;
+        report.rename.edits_applied += repaired.references_repaired;
+        if repaired.references_repaired > 0 {
+            report.warnings.push(format!(
+                "compiler-guided reference completion repaired {} exact span(s) in {} pass(es)",
+                repaired.references_repaired, repaired.passes
+            ));
+        }
+        tracing::info!(
+            passes = repaired.passes,
+            references = repaired.references_repaired,
+            passed = repaired.check_passed,
+            "compiler-guided reference completion"
+        );
+    }
 
     // --- 3. mapping ------------------------------------------------------
     let mut mapping_path = None;
@@ -379,13 +503,7 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
     }
 
     // --- 4. verify -------------------------------------------------------
-    if !req.skip_verify && plan.build.verify {
-        let stages = req
-            .stages_override
-            .clone()
-            .unwrap_or_else(|| plan.build.verify_stages.clone());
-
-        let rust_root_out = output_root.join(layout.rust_relative());
+    if let Some(stages) = verification_stages {
         let frontend_out = layout
             .frontend_root
             .as_ref()
@@ -400,8 +518,28 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             mapping: &mapping,
         };
 
-        let results = verify::run(&ctx, &stages);
-        report.verification = results.stages;
+        for stage in stages {
+            let results = verify::run(&ctx, &[stage]);
+            let passed = results.passed();
+            report.verification.extend(results.stages);
+            // Build tools can regenerate commented assets or Cargo.lock.
+            // Clean them before the following stage and before handing off.
+            if plan.strip_comments {
+                let outcome = crate::comments::strip_workspace(&output_root)?;
+                report.comments.files_scanned += outcome.stats.files_scanned;
+                report.comments.files_edited += outcome.stats.files_edited;
+                report.comments.comments_removed += outcome.stats.comments_removed;
+                report.comments.notices_extracted += outcome.stats.notices_extracted;
+                for warning in outcome.warnings {
+                    if !report.warnings.contains(&warning) {
+                        report.warnings.push(warning);
+                    }
+                }
+            }
+            if !passed {
+                break;
+            }
+        }
     }
 
     let report_path = output_root.join(".obfuscator/report.json");

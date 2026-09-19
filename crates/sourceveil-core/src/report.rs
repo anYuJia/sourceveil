@@ -121,11 +121,16 @@ pub struct RenameStats {
     pub modules: usize,
     pub macros: usize,
     pub fields: usize,
+    pub locals: usize,
+    pub params: usize,
     pub other: usize,
     /// Files actually rewritten.
     pub files_edited: usize,
     /// Individual text edits applied.
     pub edits_applied: usize,
+    /// Files rewritten by the final binding pass; may overlap semantic files.
+    #[serde(default)]
+    pub binding_files_edited: usize,
 }
 
 impl RenameStats {
@@ -139,6 +144,8 @@ impl RenameStats {
             + self.modules
             + self.macros
             + self.fields
+            + self.locals
+            + self.params
             + self.other
     }
 
@@ -154,6 +161,8 @@ impl RenameStats {
             K::Module => self.modules += 1,
             K::Macro => self.macros += 1,
             K::Field => self.fields += 1,
+            K::Local => self.locals += 1,
+            K::Param => self.params += 1,
             K::Other => self.other += 1,
         }
     }
@@ -284,6 +293,8 @@ pub struct StringStats {
     pub values_protected: usize,
     pub occurrences_protected: usize,
     pub kept_unsafe_context: usize,
+    #[serde(default)]
+    pub kept_external_collision: usize,
     pub kept_conflict: usize,
 }
 
@@ -324,6 +335,8 @@ pub struct Report {
     pub frontend: FrontendStats,
     #[serde(default)]
     pub dependencies: DependencyStats,
+    #[serde(default)]
+    pub comments: crate::comments::CommentStats,
     /// Count of skipped symbols grouped by reason.
     pub skipped_by_reason: BTreeMap<String, usize>,
     pub skipped: Vec<SkippedSymbol>,
@@ -344,6 +357,7 @@ impl Report {
             strings: StringStats::default(),
             frontend: FrontendStats::default(),
             dependencies: DependencyStats::default(),
+            comments: crate::comments::CommentStats::default(),
             skipped_by_reason: BTreeMap::new(),
             skipped: Vec::new(),
             verification: Vec::new(),
@@ -398,6 +412,13 @@ impl Report {
         let _ = writeln!(w);
 
         let r = &self.rename;
+        if self.comments.enabled {
+            let _ = writeln!(
+                w,
+                "Comments removed:   {} ({} files)",
+                self.comments.comments_removed, self.comments.files_edited
+            );
+        }
         let _ = writeln!(w, "Functions renamed:  {}", r.functions);
         let _ = writeln!(w, "Types renamed:      {}", r.types);
         let _ = writeln!(w, "Traits renamed:     {}", r.traits);
@@ -407,8 +428,11 @@ impl Report {
         let _ = writeln!(w, "Modules renamed:    {}", r.modules);
         let _ = writeln!(w, "Macros renamed:     {}", r.macros);
         let _ = writeln!(w, "Fields renamed:     {}", r.fields);
+        let _ = writeln!(w, "Locals renamed:     {}", r.locals);
+        let _ = writeln!(w, "Params renamed:     {}", r.params);
         let _ = writeln!(w, "  total symbols:    {}", r.total());
         let _ = writeln!(w, "Files edited:       {}", r.files_edited);
+        let _ = writeln!(w, "Binding files edited: {}", r.binding_files_edited);
         let _ = writeln!(w, "Text edits applied: {}", r.edits_applied);
         let _ = writeln!(w);
 
@@ -475,6 +499,11 @@ impl Report {
                 s.occurrences_protected
             );
             let _ = writeln!(w, "  kept unsafe context:        {}", s.kept_unsafe_context);
+            let _ = writeln!(
+                w,
+                "  kept copied-file collision:  {}",
+                s.kept_external_collision
+            );
             let _ = writeln!(w, "  kept edit conflict:         {}", s.kept_conflict);
         }
 

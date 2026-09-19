@@ -14,6 +14,7 @@ pub struct Plan {
     pub project: ProjectPlan,
     pub rename: RenamePlan,
     pub strings: StringsPlan,
+    pub strip_comments: bool,
     pub tauri: TauriPlan,
     pub frontend: FrontendPlan,
     pub dependencies: DependenciesPlan,
@@ -171,9 +172,14 @@ impl Plan {
         let mut unsupported = Vec::new();
 
         if profile == Profile::Aggressive {
+            // The aggressive profile now enables deep identifier and module
+            // renaming. Function splitting/indirect dispatch remains a
+            // separate code-generation feature and is intentionally reported
+            // as informational rather than pretending the profile is only
+            // balanced.
             unsupported.push(
                 "profile `aggressive`: function splitting and indirect dispatch are not \
-                 implemented in this build; falling back to `balanced` behaviour"
+                 enabled; deep semantic renaming is enabled"
                     .to_string(),
             );
         }
@@ -200,23 +206,16 @@ impl Plan {
             consts: r.consts.unwrap_or(true),
             statics: r.statics.unwrap_or(true),
             modules: r.modules.unwrap_or(true),
-            module_files: r.module_files.unwrap_or(false),
+            module_files: r.module_files.unwrap_or(profile == Profile::Aggressive),
             // `macro_rules!` bodies are a token-level protocol. Renaming works
             // when the macro is crate-local and declarative, but the failure
             // mode is a broken build in a dependent crate, so it stays opt-in.
             macros: r.macros.unwrap_or(false),
             fields: r.fields.unwrap_or(balanced),
-            locals: r.locals.unwrap_or(false),
-            params: r.params.unwrap_or(false),
+            locals: r.locals.unwrap_or(profile == Profile::Aggressive),
+            params: r.params.unwrap_or(profile == Profile::Aggressive),
             name_len: (name_len_min, name_len_max),
         };
-
-        if rename.locals || rename.params {
-            unsupported.push(
-                "rename.locals/params: local-binding rename is not implemented in this build"
-                    .to_string(),
-            );
-        }
 
         // -- strings --------------------------------------------------------
         let s = &cfg.strings;
@@ -313,6 +312,7 @@ impl Plan {
             },
             rename,
             strings,
+            strip_comments: cfg.comments.strip.unwrap_or(false),
             tauri,
             frontend,
             dependencies,

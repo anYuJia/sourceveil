@@ -39,6 +39,7 @@
 
 pub mod benchmark;
 pub mod binary_scan;
+pub mod comments;
 pub mod config;
 pub mod copier;
 pub mod dependencies;
