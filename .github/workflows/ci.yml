@@ -10,8 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# A superseded push should not keep burning minutes. Actions on a private
-# repository are billed, so cancelling stale runs is not just tidiness.
+# A superseded push should not keep burning runner minutes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
