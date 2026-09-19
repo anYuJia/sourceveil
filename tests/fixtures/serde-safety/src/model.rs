@@ -1,8 +1,7 @@
 //! Serde protocol fixture.
 //!
-//! Supported members should be renamed under the balanced profile while their
-//! wire names remain byte-for-byte stable. Unsupported representations stay
-//! pinned and are reported.
+//! Every member should be renamed under the balanced profile while its wire
+//! representation remains byte-for-byte stable, including transparent data.
 
 use serde::{Deserialize, Serialize};
 

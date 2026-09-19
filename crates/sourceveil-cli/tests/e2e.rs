@@ -34,13 +34,9 @@ const RENAMED: &[&str] = &[
 /// Must survive, because a rule or a language-level constraint says so.
 const PINNED: &[&str] = &["main", "exported_checksum", "pinned_by_comment"];
 
-/// Must survive, because rust-analyzer cannot rewrite the reference.
-///
-/// Every one of these is reached from inside a `format!` or `println!` call in
-/// the fixture. Renaming the definition while leaving the macro argument alone
-/// would produce source that does not compile — see the module docs on
-/// `sourceveil_core::rust`.
-const PINNED_BY_MACRO_REFERENCE: &[&str] =
+/// Referenced from inside `format!`/`println!`; the standard-macro semantic
+/// shell must resolve and rewrite both definition and call-site token.
+const REFERENCED_BY_STANDARD_MACRO: &[&str] =
     &["describe", "transport_name", "DEFAULT_PORT", "redact"];
 
 // ---------------------------------------------------------------------------
@@ -49,6 +45,152 @@ const PINNED_BY_MACRO_REFERENCE: &[&str] =
 
 fn binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_cargo-obfuscator"))
+}
+
+#[test]
+fn cargo_subcommand_and_direct_entrypoints_expose_comment_flag() {
+    for args in [
+        vec!["transform", "--help"],
+        vec!["obfuscator", "transform", "--help"],
+    ] {
+        let result = Command::new(binary()).args(args).output().unwrap();
+        assert_succeeded(&result);
+        assert!(String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("--strip-comments"));
+    }
+}
+
+#[test]
+fn closure_bindings_and_strip_comments_work_through_the_cli() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("src")).unwrap();
+    std::fs::write(input.join("Cargo.toml"), "# manifest comment\n[package]\nname='closure_fixture'\nversion='0.1.0'\nedition='2024'\n[workspace]\n").unwrap();
+    let source = r#"//! remove doc comment
+struct Cookie { value: String }
+fn main(){
+    // remove local comment
+    let cookies=[Cookie{value:"hello".into()}];
+    let result=cookies.iter().map(|cookie| {let item=&cookie.value;format!("{item}")}).collect::<Vec<_>>();
+    println!("{}",result.join(";"));
+}"#;
+    std::fs::write(input.join("src/main.rs"), source).unwrap();
+    std::fs::write(
+        input.join("web.js"),
+        "/*! Copyright fixture */\nconst url='https://example.com';// remove\n",
+    )
+    .unwrap();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"profile='safe'
+[rename]
+locals=true
+params=true
+functions=false
+types=false
+traits=false
+enums=false
+consts=false
+statics=false
+modules=false
+fields=false
+[build]
+verify=true
+verify_stages=['cargo-check','leak-scan']
+"#,
+    )
+    .unwrap();
+    let output = tmp.path().join("output");
+    let result = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(&input)
+        .arg("--output")
+        .arg(&output)
+        .arg("--config")
+        .arg(&config)
+        .args(["--seed", "43", "--strip-comments"])
+        .output()
+        .unwrap();
+    assert_succeeded(&result);
+    let transformed = read(&output, "src/main.rs");
+    assert!(!transformed.contains("|cookie|"));
+    assert!(!transformed.contains("let item"));
+    assert!(!transformed.contains("remove"));
+    assert!(!transformed.contains("{item}"));
+    assert_eq!(read(&input, "src/main.rs"), source);
+    assert!(read(&output, "web.js").contains("https://example.com"));
+    assert!(read(&output, "SOURCEVEIL_NOTICES.txt").contains("Copyright fixture"));
+    assert!(
+        report(&output)["comments"]["comments_removed"]
+            .as_u64()
+            .unwrap()
+            >= 4
+    );
+    let run = Command::new("cargo")
+        .args(["run", "--quiet", "--offline"])
+        .current_dir(&output)
+        .output()
+        .unwrap();
+    assert_succeeded(&run);
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), "hello\n");
+}
+
+#[test]
+fn inferred_fields_methods_and_shadowed_names_use_definition_indexed_edits() {
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("src")).unwrap();
+    std::fs::write(
+        input.join("Cargo.toml"),
+        "[workspace]\n[package]\nname='semantic_members'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    let source = r#"mod config { pub fn marker()->i32 { 2 } }
+struct Client { config:i32, state:i32 }
+impl Client {
+    fn new(config:i32)->Self { Self { config, state:config+1 } }
+    fn validate(&self)->i32 { self.config+self.state }
+}
+fn main(){
+    let config=3;
+    let client=Client::new(config);
+    println!("{}",client.validate()+client.config+config::marker());
+}"#;
+    std::fs::write(input.join("src/main.rs"), source).unwrap();
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(
+        &config,
+        "version=1\nprofile='aggressive'\n[build]\nverify_stages=['cargo-check']\nload_out_dirs=false\n",
+    )
+    .unwrap();
+    let out = tmp.path().join("output");
+    let transformed = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(&input)
+        .arg("--output")
+        .arg(&out)
+        .arg("--config")
+        .arg(&config)
+        .args(["--seed", "91"])
+        .output()
+        .unwrap();
+    assert_succeeded(&transformed);
+    let generated = all_source(&out);
+    for original in ["Client", "config", "state", "new", "validate", "client"] {
+        assert!(
+            !generated.contains(original),
+            "definition-indexed rename left `{original}` behind:\n{generated}"
+        );
+    }
+    let run = Command::new("cargo")
+        .args(["run", "--quiet", "--offline"])
+        .current_dir(&out)
+        .output()
+        .unwrap();
+    assert_succeeded(&run);
+    assert_eq!(String::from_utf8(run.stdout).unwrap(), "12\n");
 }
 
 fn fixture() -> PathBuf {
@@ -205,40 +347,20 @@ fn transform_renames_symbols_and_the_result_still_compiles() {
     );
 }
 
-/// The rule that keeps the output compilable.
-///
-/// Without it the fixture produces `format!("{} via {} on {}", …, transport_name(..), DEFAULT_PORT)`
-/// with `transport_name` and `DEFAULT_PORT` renamed at their definitions and
-/// not at this call, which does not compile.
 #[test]
-fn macro_referenced_symbols_are_kept_and_reported() {
+fn standard_macro_references_are_semantically_renamed() {
     let out = shared();
     let source = all_source(out);
 
-    for name in PINNED_BY_MACRO_REFERENCE {
+    for name in REFERENCED_BY_STANDARD_MACRO {
         assert!(
-            source.contains(name),
-            "`{name}` is referenced from inside a macro token tree, where \
-             rust-analyzer cannot rewrite it; leaving it renamed would break the build"
+            !source.contains(name),
+            "`{name}` survived even though its standard-macro reference is semantically resolvable"
         );
-    }
-
-    assert!(
-        skipped_count(out, "macro-call-reference") >= PINNED_BY_MACRO_REFERENCE.len() as u64,
-        "the report must say how many symbols the macro rule cost"
-    );
-
-    // And the reason must be attached to the right symbols, not merely counted.
-    let skipped = report(out);
-    for entry in skipped["skipped"].as_array().expect("skipped array") {
-        let path = entry["symbol_path"].as_str().unwrap_or_default();
-        if PINNED_BY_MACRO_REFERENCE.iter().any(|n| path.ends_with(n)) {
-            assert_eq!(
-                entry["reason"].as_str(),
-                Some("macro-call-reference"),
-                "`{path}` was kept, but for the wrong stated reason: {entry}"
-            );
-        }
+        assert!(
+            symbol_mapping_contains(out, name),
+            "`{name}` has no mapping entry"
+        );
     }
 }
 
@@ -309,9 +431,22 @@ verify = false
                 .then(|| new.as_str().expect("module replacement").to_string())
         })
         .expect("auth module should be renamed");
+    let new_child_module = parsed["symbols"]
+        .as_object()
+        .expect("symbols mapping")
+        .iter()
+        .find_map(|(old, new)| {
+            old.ends_with("::auth::token")
+                .then(|| new.as_str().expect("child module replacement").to_string())
+        })
+        .expect("nested token module should be renamed");
     let moved_dir = out.join("src").join(&new_module);
     assert!(moved_dir.join("mod.rs").is_file());
-    assert!(moved_dir.join("token.rs").is_file());
+    assert!(moved_dir.join(format!("{new_child_module}.rs")).is_file());
+    assert!(
+        !moved_dir.join("token.rs").exists(),
+        "old nested module filename survived"
+    );
     assert!(
         !out.join("src/auth").exists(),
         "old module directory survived"
@@ -792,6 +927,13 @@ fn serde_fixture() -> PathBuf {
         .expect("serde fixture directory")
 }
 
+fn serde_transform_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/serde-transform")
+        .canonicalize()
+        .expect("serde transform fixture directory")
+}
+
 fn run_crate(root: &Path) -> String {
     let result = Command::new("cargo")
         .arg("run")
@@ -887,6 +1029,7 @@ fn balanced_renames_supported_serde_members_without_changing_wire_bytes() {
         "value_field",
         "modern_name",
         "r#type",
+        "raw_value",
     ] {
         if member == "AdjacentEvent" {
             // The container type is handled by the ordinary symbol pass, not
@@ -922,13 +1065,21 @@ fn balanced_renames_supported_serde_members_without_changing_wire_bytes() {
         );
     }
 
-    assert!(
-        !symbol_mapping_contains(&out, "raw_value"),
-        "transparent serde representation must remain pinned"
+    assert_eq!(
+        skipped_count(&out, "serde-unsupported"),
+        0,
+        "the supported serde corpus must not fall back to a blanket pin"
     );
-    assert!(
-        skipped_count(&out, "serde-unsupported") >= 1,
-        "unsupported serde semantics should be visible in the report"
+
+    let retry_count_definitions = mapping(&out)["symbols"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|path| path.rsplit("::").next() == Some("retry_count"))
+        .count();
+    assert_eq!(
+        retry_count_definitions, 2,
+        "same-spelled fields in separate structs must both be renamed"
     );
 }
 
@@ -941,6 +1092,59 @@ fn serde_fixture_still_obfuscates_non_serde_fields() {
             "ordinary Rust field {field} should still be renamed"
         );
     }
+}
+
+#[test]
+fn aggressive_handles_the_full_serde_attribute_corpus() {
+    let tmp = TempDir::new().unwrap();
+    let input = serde_transform_fixture();
+    let out = tmp.path().join("generated");
+    let result = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(&input)
+        .arg("--output")
+        .arg(&out)
+        .arg("--config")
+        .arg(input.join("obfuscator.toml"))
+        .args(["--seed", "20240917"])
+        .output()
+        .unwrap();
+    assert_succeeded(&result);
+
+    for symbol in [
+        "PlainStruct",
+        "RenameAllStruct",
+        "TransparentStruct",
+        "UntaggedEnum",
+        "TimestampDef",
+        "Meter",
+        "hex_u32",
+        "serialize",
+        "deserialize",
+        "user_name",
+        "metadata",
+        "ignored",
+        "write_only",
+        "read_only",
+        "millis",
+        "flags",
+    ] {
+        assert!(
+            symbol_mapping_contains(&out, symbol),
+            "full serde corpus did not rename {symbol}"
+        );
+    }
+    assert_eq!(skipped_count(&out, "serde-unsupported"), 0);
+    assert!(report(&out)["verification"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|stage| stage["stage"] == "cargo-check" && stage["passed"] == true));
+    let generated = all_source(&out);
+    assert!(generated.contains("serialize_with ="));
+    assert!(generated.contains("deserialize_with ="));
+    assert!(!generated.contains("//!"));
+    assert!(!generated.contains("// ---"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,10 +1327,13 @@ verify = false
     assert!(!ipc.contains("SYNC_COMMAND"));
     assert!(ipc.contains("export async function getUserInfo"));
     assert!(
-        ipc.contains("{ userId }"),
-        "object shorthand must stay stable"
+        ipc.contains("{ userId:"),
+        "object shorthand key must stay stable while its value is renamed"
     );
-    assert!(ipc.contains("{ key }"), "object shorthand must stay stable");
+    assert!(
+        ipc.contains("{ key:"),
+        "destructuring shorthand key must stay stable while its binding is renamed"
+    );
     assert!(!wrapper.contains("command: string"));
     assert!(!wrapper.contains("args?: Record"));
     assert!(wrapper.contains("invoke<T>("));
@@ -1138,15 +1345,15 @@ verify = false
     assert!(frontend_mapping
         .keys()
         .any(|key| key.contains("SYNC_COMMAND")));
-    assert!(!frontend_mapping.keys().any(|key| key.contains("::userId@")));
+    assert!(frontend_mapping.keys().any(|key| key.contains("::userId@")));
 
     let frontend_report = &report(&out)["frontend"];
     assert!(frontend_report["symbols_renamed"].as_u64().unwrap_or(0) >= 3);
-    assert!(
+    assert_eq!(
         frontend_report["kept_by_reason"]["object-shorthand"]
             .as_u64()
-            .unwrap_or(0)
-            >= 2
+            .unwrap_or(0),
+        0
     );
 }
 

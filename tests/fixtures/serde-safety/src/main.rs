@@ -1,9 +1,7 @@
 //! Real serde corpus.
 //!
-//! Every model reference is evaluated outside the final println! macro. This is
-//! deliberate: rust-analyzer cannot rewrite arbitrary identifiers nested in a
-//! macro token tree, and this fixture is testing serde rather than that known
-//! macro boundary.
+//! Model references are exercised in ordinary code and standard macros so the
+//! semantic macro index and serde contract pass are verified together.
 
 mod model;
 
@@ -89,7 +87,8 @@ fn main() {
     lines.push(serde_json::to_string(&raw).unwrap());
     lines.push(raw_value);
 
-    // Unsupported representation: this field must be claimed and kept.
+    // Transparent models have no field key on the wire, so the Rust field can
+    // be renamed without adding a synthetic serde rename.
     let transparent = TransparentRecord {
         raw_value: "raw".to_string(),
     };

@@ -1,0 +1,10 @@
+version = 1
+profile = "aggressive"
+
+[build]
+verify = true
+verify_stages = ["cargo-check"]
+load_out_dirs = false
+
+[comments]
+strip = true
