@@ -38,6 +38,7 @@ pub struct StringOutcome {
     pub values_protected: usize,
     pub occurrences_protected: usize,
     pub kept_unsafe_context: usize,
+    pub kept_external_collision: usize,
     pub kept_conflict: usize,
     pub files_edited: BTreeSet<PathBuf>,
     /// Original plaintext -> representation marker.
@@ -154,6 +155,21 @@ pub fn run(
     out.values_discovered = by_value.len();
     out.occurrences_discovered = by_value.values().map(Vec::len).sum();
 
+    // The mapping is a promise that a protected plaintext vanished from the
+    // generated tree. A value may be a safe runtime literal in Rust and still
+    // be required verbatim by Cargo metadata, a Tauri config, or frontend
+    // source. Reserve those cross-file collisions before staging any edit;
+    // otherwise source/binary verification would correctly reject a mapping
+    // that could never be satisfied.
+    let copied_texts = copied_non_rust_texts(req);
+    by_value.retain(|value, _| {
+        let collision = copied_texts.iter().any(|text| text.contains(value));
+        if collision {
+            out.kept_external_collision += 1;
+        }
+        !collision
+    });
+
     for (value, mut occurrences) in by_value {
         // One unsafe occurrence keeps this plaintext globally. Otherwise
         // mapping.strings would promise the leak scanner that it disappeared
@@ -231,6 +247,23 @@ pub fn run(
     }
 
     Ok(out)
+}
+
+fn copied_non_rust_texts(req: &StringRequest<'_>) -> Vec<String> {
+    const TEXT_EXTENSIONS: &[&str] = &[
+        "cjs", "css", "html", "js", "json", "jsx", "mjs", "svelte", "toml", "ts", "tsx", "vue",
+    ];
+
+    req.copied
+        .iter()
+        .filter(|relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| TEXT_EXTENSIONS.contains(&extension))
+        })
+        .filter_map(|relative| std::fs::read_to_string(req.input_root.join(relative)).ok())
+        .collect()
 }
 
 fn has_no_std_attribute(parsed: &ast::SourceFile) -> bool {
@@ -381,7 +414,7 @@ fn protected_expression(encoded: &[u8], seed: u64) -> String {
 static __SV: ::std::sync::OnceLock<::std::string::String> = ::std::sync::OnceLock::new();\
 __SV.get_or_init(|| {{\
 let mut __b = ::std::vec![{bytes}];\
-let mut __s: u64 = 0x{seed:016x};\
+let mut __s: u64 = ::std::hint::black_box(0x{seed:016x});\
 for __x in &mut __b {{\
 __s ^= __s >> 12;\
 __s ^= __s << 25;\
@@ -583,5 +616,41 @@ mod tests {
         let expression = protected_expression(&encode(value.as_bytes(), seed), seed);
         assert!(!expression.contains(value));
         assert!(expression.contains("OnceLock"));
+        assert!(expression.contains("black_box"));
+    }
+
+    #[test]
+    fn copied_metadata_is_treated_as_a_plaintext_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"shared-runtime-name\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("README.md"),
+            "shared-runtime-name is documentation only",
+        )
+        .unwrap();
+        let copied = BTreeSet::from([PathBuf::from("Cargo.toml"), PathBuf::from("README.md")]);
+        let graph = CrateGraph::default();
+        let strings = balanced_strings();
+        let dependencies = DependenciesPlan::default();
+        let reserved = HashSet::new();
+        let request = StringRequest {
+            input_root: tmp.path(),
+            copied: &copied,
+            graph: &graph,
+            plan: &strings,
+            dependencies: &dependencies,
+            seed: 7,
+            reserved_protocol_values: &reserved,
+        };
+
+        let texts = copied_non_rust_texts(&request);
+        assert!(texts
+            .iter()
+            .any(|text| text.contains("shared-runtime-name")));
+        assert!(!texts.iter().any(|text| text.contains("documentation only")));
     }
 }
