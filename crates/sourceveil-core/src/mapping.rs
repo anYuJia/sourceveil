@@ -78,9 +78,9 @@ impl Mapping {
     /// Original values from the cross-language protocols: command names,
     /// event channels, and protected strings.
     ///
-    /// These are unambiguous. A command name is a *value* the frontend sends;
-    /// its presence anywhere in the output means a call site was missed, and
-    /// there is no innocent explanation. The leak scan fails the build on one.
+    /// The strict leak gate fails on any match. Raw text/byte matching cannot
+    /// determine provenance: dependencies and unrelated substrings can contain
+    /// the same spelling, so a hit requires review, not an assumed missed call.
     pub fn protocol_originals(&self) -> Vec<&str> {
         self.commands
             .keys()

@@ -4,13 +4,16 @@
 //! Rust/Tauri strings live as bytes in PE, ELF and Mach-O alike, and a raw
 //! byte search also catches sidecar blobs an object parser would ignore.
 //!
-//! Protocol values are strong evidence: if an original Tauri command/event or
-//! protected string survives in the shipped artifact, a rewrite was missed.
+//! Protocol matches fail the strict gate, but raw bytes cannot establish
+//! provenance: dependencies or unrelated substrings can contain the same value.
+//! Preserve those hits for review rather than silently filtering them out.
 //! Rust symbol names are weaker evidence and are reported but not fatal.
 
 use crate::mapping::Mapping;
+use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +31,13 @@ pub struct BinaryScanReport {
     pub symbol_hits: Vec<BinaryLeak>,
 }
 
+#[derive(Debug, Clone)]
+struct ScanTarget {
+    value: String,
+    encoding: &'static str,
+    protocol: bool,
+}
+
 impl BinaryScanReport {
     pub fn passed(&self) -> bool {
         self.protocol_leaks.is_empty()
@@ -42,11 +52,21 @@ pub fn scan_file(path: &Path, mapping: &Mapping) -> Result<BinaryScanReport> {
         ..Default::default()
     };
 
-    // Protocol values are exact cross-language contracts, so even a one- or
-    // two-byte original is fatal evidence. The short-name noise policy below
+    let mut patterns = Vec::new();
+    let mut targets = Vec::new();
+    let mut pattern_indices = BTreeMap::new();
+
+    // Even a one- or two-byte protocol original fails the strict gate.
+    // This is a conservative match, not proof of its origin. The noise policy below
     // applies only to ordinary Rust symbols.
     for value in mapping.protocol_originals() {
-        collect_hits(&bytes, value, &mut report.protocol_leaks);
+        add_value_patterns(
+            value,
+            true,
+            &mut patterns,
+            &mut targets,
+            &mut pattern_indices,
+        );
     }
 
     for value in mapping
@@ -54,7 +74,32 @@ pub fn scan_file(path: &Path, mapping: &Mapping) -> Result<BinaryScanReport> {
         .into_iter()
         .filter(|value| value.len() >= 3)
     {
-        collect_hits(&bytes, value, &mut report.symbol_hits);
+        add_value_patterns(
+            value,
+            false,
+            &mut patterns,
+            &mut targets,
+            &mut pattern_indices,
+        );
+    }
+
+    if !patterns.is_empty() {
+        let matcher = AhoCorasick::new(&patterns).context("building binary scan matcher")?;
+        for found in matcher.find_overlapping_iter(&bytes) {
+            let offset = found.start() as u64;
+            for target in &targets[found.pattern().as_usize()] {
+                let leak = BinaryLeak {
+                    value: target.value.clone(),
+                    encoding: target.encoding.into(),
+                    offset,
+                };
+                if target.protocol {
+                    report.protocol_leaks.push(leak);
+                } else {
+                    report.symbol_hits.push(leak);
+                }
+            }
+        }
     }
 
     report
@@ -73,48 +118,60 @@ pub fn scan_file(path: &Path, mapping: &Mapping) -> Result<BinaryScanReport> {
     Ok(report)
 }
 
-fn collect_hits(bytes: &[u8], value: &str, out: &mut Vec<BinaryLeak>) {
-    let utf8 = value.as_bytes();
-    for offset in find_all(bytes, utf8) {
-        out.push(BinaryLeak {
+fn add_value_patterns(
+    value: &str,
+    protocol: bool,
+    patterns: &mut Vec<Vec<u8>>,
+    targets: &mut Vec<Vec<ScanTarget>>,
+    pattern_indices: &mut BTreeMap<Vec<u8>, usize>,
+) {
+    add_pattern(
+        value.as_bytes().to_vec(),
+        ScanTarget {
             value: value.to_string(),
-            encoding: "utf-8".into(),
-            offset: offset as u64,
-        });
-    }
+            encoding: "utf-8",
+            protocol,
+        },
+        patterns,
+        targets,
+        pattern_indices,
+    );
 
     // Windows-facing strings are often widened before crossing Win32/COM
-    // boundaries. Looking for UTF-16LE costs little and catches those too.
+    // boundaries. Looking for UTF-16LE catches those too.
     let utf16le: Vec<u8> = value.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    if !utf16le.is_empty() {
-        for offset in find_all(bytes, &utf16le) {
-            out.push(BinaryLeak {
-                value: value.to_string(),
-                encoding: "utf-16le".into(),
-                offset: offset as u64,
-            });
-        }
-    }
+    add_pattern(
+        utf16le,
+        ScanTarget {
+            value: value.to_string(),
+            encoding: "utf-16le",
+            protocol,
+        },
+        patterns,
+        targets,
+        pattern_indices,
+    );
 }
 
-fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return Vec::new();
+fn add_pattern(
+    pattern: Vec<u8>,
+    target: ScanTarget,
+    patterns: &mut Vec<Vec<u8>>,
+    targets: &mut Vec<Vec<ScanTarget>>,
+    pattern_indices: &mut BTreeMap<Vec<u8>, usize>,
+) {
+    if pattern.is_empty() {
+        return;
     }
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    while start + needle.len() <= haystack.len() {
-        let Some(rel) = haystack[start..]
-            .windows(needle.len())
-            .position(|window| window == needle)
-        else {
-            break;
-        };
-        let at = start + rel;
-        out.push(at);
-        start = at.saturating_add(1);
+    if let Some(index) = pattern_indices.get(&pattern).copied() {
+        targets[index].push(target);
+        return;
     }
-    out
+
+    let index = patterns.len();
+    pattern_indices.insert(pattern.clone(), index);
+    patterns.push(pattern);
+    targets.push(vec![target]);
 }
 
 #[cfg(test)]
@@ -205,5 +262,25 @@ mod tests {
         let report = scan_file(&path, &mapping()).unwrap();
         assert!(report.passed());
         assert!(report.protocol_leaks.is_empty());
+    }
+
+    #[test]
+    fn finds_overlapping_protocol_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("app.bin");
+        std::fs::write(&path, b"session-updated").unwrap();
+
+        let mut mapping = mapping();
+        mapping.strings.insert("session".into(), "Q7m2x".into());
+        let report = scan_file(&path, &mapping).unwrap();
+
+        assert!(report
+            .protocol_leaks
+            .iter()
+            .any(|hit| hit.value == "session" && hit.offset == 0));
+        assert!(report
+            .protocol_leaks
+            .iter()
+            .any(|hit| hit.value == "session-updated" && hit.offset == 0));
     }
 }
