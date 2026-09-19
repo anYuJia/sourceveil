@@ -49,7 +49,20 @@ const IGNORED_DIRS: &[&str] = &[
 ];
 
 /// Individual files skipped anywhere in the tree.
-const IGNORED_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+///
+/// Git worktrees use a `.git` *file* pointing at the repository's worktree
+/// metadata instead of a `.git` directory.  Copying that pointer makes the
+/// generated workspace depend on the source checkout and leaves a broken Git
+/// link as soon as the temporary worktree is removed.
+const IGNORED_FILES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".jj",
+    ".svn",
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct CopyStats {
@@ -324,6 +337,26 @@ mod tests {
         assert!(out.copied.contains(Path::new("Cargo.lock")));
         assert!(out.copied.contains(Path::new("src/main.rs")));
         assert_eq!(out.stats.files_copied, 4);
+    }
+
+    #[test]
+    fn skips_git_worktree_pointer_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("in");
+        let output = tmp.path().join("out");
+
+        write(
+            &input.join(".git"),
+            "gitdir: /repo/.git/worktrees/example\n",
+        );
+        write(&input.join("src/main.rs"), "fn main() {}");
+
+        let out = copy_workspace(&input, &output, &[]).unwrap();
+
+        assert!(!output.join(".git").exists());
+        assert!(output.join("src/main.rs").is_file());
+        assert!(!out.copied.contains(Path::new(".git")));
+        assert_eq!(out.stats.files_copied, 1);
     }
 
     #[test]
