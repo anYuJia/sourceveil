@@ -38,6 +38,8 @@ toml = "0.8"
 cargo_metadata = "0.23"
 walkdir = "2"
 globset = "0.4"
+aho-corasick = "1"
+cssparser = "0.37"
 
 # --- hashing / entropy ---
 sha2 = "0.10"
@@ -61,6 +63,7 @@ ra_ap_proc_macro_api = "0.0.352"
 ra_ap_project_model = "0.0.352"
 ra_ap_syntax = "0.0.352"
 ra_ap_vfs = "0.0.352"
+rustc_parse_format = { package = "ra-ap-rustc_parse_format", version = "0.166" }
 
 [profile.release]
 lto = "thin"

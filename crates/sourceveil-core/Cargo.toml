@@ -17,6 +17,8 @@ toml.workspace = true
 cargo_metadata.workspace = true
 walkdir.workspace = true
 globset.workspace = true
+aho-corasick.workspace = true
+cssparser.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 getrandom.workspace = true
@@ -37,6 +39,7 @@ ra_ap_proc_macro_api.workspace = true
 ra_ap_project_model.workspace = true
 ra_ap_syntax.workspace = true
 ra_ap_vfs.workspace = true
+rustc_parse_format.workspace = true
 
 # Constrains a transitive dependency, not used directly.
 #
