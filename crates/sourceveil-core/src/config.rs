@@ -133,6 +133,10 @@ pub struct Strings {
     /// User-visible copy. Protected only when explicitly asked for.
     pub ui: Option<bool>,
     pub endpoints: Option<bool>,
+    /// Protect runtime strings in TypeScript/JavaScript source as well as
+    /// Rust. Compile-time module specifiers, protocol names and structural
+    /// attributes remain fail-closed; UI/runtime text is decoded on demand.
+    pub frontend: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

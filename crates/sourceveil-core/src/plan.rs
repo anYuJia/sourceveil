@@ -75,6 +75,7 @@ pub struct StringsPlan {
     pub internal: bool,
     pub ui: bool,
     pub endpoints: bool,
+    pub frontend: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,6 +230,7 @@ impl Plan {
             internal: s.internal.unwrap_or(balanced),
             ui: s.ui.unwrap_or(false),
             endpoints: s.endpoints.unwrap_or(false),
+            frontend: s.frontend.unwrap_or(profile == Profile::Aggressive),
         };
         if strings.enabled && (strings.logs || strings.errors) {
             unsupported.push(

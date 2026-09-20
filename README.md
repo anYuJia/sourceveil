@@ -48,7 +48,7 @@ V1, at the prototype stage the design calls for. What is implemented:
 | Tauri event rename (Rust + TypeScript) | done |
 | serde-safe field / enum-variant rename | done; wire names and Rust paths in documented serde metadata are preserved |
 | proc-macro attribute contracts | `thiserror` named format captures follow field renames |
-| runtime Rust string protection | done for safe runtime expressions and proven format-macro literal fragments; compile-time/opaque macro contexts are kept |
+| runtime Rust string protection | done for safe runtime expressions and proven format-macro literal fragments; compile-time/opaque literals are re-spelled as equivalent Unicode escapes |
 | TypeScript semantic private-binding rename | done — OXC scope-aware; properties/JSON keys/imports/exports are kept |
 | module file rename | done (transactional file/dir moves; enabled by `aggressive`) |
 | dependency boundary policy | done (external, private-obfuscate, obfuscate, wrapper) |
@@ -531,16 +531,20 @@ those macros, `vec!`, and `dbg!` are protected too. The pass also finds nested
 formatting macros inside proven expression containers such as `vec!` and
 `serde_json::json!`. Shadowed macros and unknown macro DSLs fail closed.
 
-Protection is deliberately not applied to attributes, opaque macro token
-trees, const/static initialisers, patterns, ABI strings, const functions or
-`no_std` crates. These are reported as retained unsafe occurrences. Importantly,
-one retained occurrence no longer prevents safe runtime occurrences with the
-same value from being encoded.
+Runtime decoder blocks are deliberately not inserted into attributes, opaque
+macro token trees, const/static initialisers, patterns, ABI strings, const
+functions or `no_std` crates. Those compile-time literals are re-spelled after
+the semantic transaction as equivalent `\u{...}` escapes, preserving the
+decoded value for the compiler/proc-macro while removing the readable spelling
+from source. They remain conservative (unmapped) because the decoded value can
+still exist in the compiled artifact. One retained compile-time occurrence no
+longer prevents safe runtime occurrences with the same value from being
+encoded.
 
 Tauri command/event and serde wire strings remain owned by their dedicated
 cross-language passes. A runtime occurrence with the same spelling is still
 encoded, but the value is recorded in `mapping.strings` only when no retained
-Rust/frontend/config/protocol/dependency collision is known. Values shorter
+Rust/config/protocol/dependency collision is known. Values shorter
 than four bytes and generic values selected solely by `all` (for example
 `"navigate"`) are protected but intentionally omitted from the global mapping:
 a raw final binary can independently contain those bytes in toolchain or
@@ -549,6 +553,18 @@ library artifacts are checked too; the latter catches values reconstructed
 from numeric byte tables (for example a compression dictionary) that never
 appear verbatim in source. Source/binary leak scans can therefore treat every
 mapped plaintext as fatal evidence.
+
+When a workspace has a TypeScript/React frontend, set `[strings] frontend = true`
+to apply the same runtime protection to JS, JSX, TS and TSX under the detected
+frontend source directory. The pass covers ordinary expressions, template
+literal quasis, JSX text/attributes, object keys and nested closure expressions;
+each edited file receives a local UTF-8 decoder, so no frontend runtime package
+or import is required. `aggressive` enables this option by default. Module
+specifiers, TypeScript literal types, import attributes, and values used as
+protocol/type discriminants are retained when replacing them would break the
+module graph, wire contract or TypeScript narrowing. Frontend mappings are kept
+in the separate `frontend_strings` section of `mapping.json` and are never
+treated as Rust/protocol leak-scan needles.
 
 The encoding is obfuscation, not a secret store: the client ships both encoded
 bytes and a decoder. The goal is to remove the static `strings -> XREF`

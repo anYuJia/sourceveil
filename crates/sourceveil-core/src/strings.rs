@@ -6,8 +6,9 @@
 //! candidate; the narrower classes remain available for balanced builds.
 //! Format placeholders stay in a compile-time literal and each visible text
 //! piece becomes a generated named argument whose value is decoded at runtime.
-//! Other macro token trees and compile-time contexts (attributes, const/static
-//! initialisers, patterns, ABI strings and const fn bodies) are left alone.
+//! Opaque macro token trees and compile-time contexts (attributes, const/static
+//! initialisers, patterns, ABI strings and const fn bodies) are re-spelled as
+//! equivalent Unicode escapes because those positions cannot call a decoder.
 //!
 //! Rewrite eligibility and global plaintext proof are deliberately separate.
 //! Every safe occurrence is transformed even when the same spelling must stay
@@ -256,6 +257,7 @@ pub fn run(
                 continue;
             };
             let value = lit.value();
+            let safe = !forbidden_runtime_context(token.syntax(), &shadowed_format_macros);
             let range = token.syntax().text_range();
             let id = LiteralId {
                 file: path.clone(),
@@ -273,8 +275,6 @@ pub fn run(
             }
             let start = u32::from(range.start());
             let end = u32::from(range.end());
-            let safe = !forbidden_runtime_context(token.syntax(), &shadowed_format_macros);
-
             by_value.entry(value).or_default().push(Occurrence {
                 file: path.clone(),
                 source: source.clone(),
@@ -329,8 +329,10 @@ pub fn run(
         }
     }
 
-    // An unsafe occurrence remains plaintext, but no longer pins independent
-    // safe occurrences of the same value.
+    // An unsafe occurrence remains compile-time (and therefore cannot use the
+    // runtime decoder), but it is re-spelled as Unicode escapes above. Keep it
+    // out of the runtime edit graph and out of strict mapping promises: the
+    // decoded value still exists in the compiled artifact.
     let unsafe_values = by_value
         .iter()
         .filter(|(_, occurrences)| occurrences.iter().any(|occurrence| !occurrence.safe))
@@ -533,6 +535,108 @@ pub fn run(
     }
 
     Ok(out)
+}
+
+/// Re-spell literals that cannot be replaced by the runtime decoder after all
+/// transactional edits have landed. This second, output-side pass is needed
+/// because semantic/serde passes may replace an entire attribute containing a
+/// literal; trying to edit that inner token in the shared pre-apply plan would
+/// correctly report an overlap. Unicode escapes preserve the decoded value,
+/// so proc-macros and compiler grammar receive exactly the same input.
+pub fn escape_compile_time_literals_workspace(root: &Path) -> Result<usize> {
+    let mut changed = 0usize;
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !matches!(
+                    entry.file_name().to_str(),
+                    Some("target" | "node_modules" | ".git" | ".obfuscator")
+                )
+        })
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "rs")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let source = std::fs::read_to_string(path)?;
+        let parsed = ast::SourceFile::parse(&source, ra_ap_syntax::Edition::Edition2024).tree();
+        let parsed_files = vec![(path.to_path_buf(), parsed.clone(), source.clone())];
+        let shadowed = collect_shadowed_format_macros(&parsed_files);
+        let safe_templates = discover_format_templates(&parsed, path, &source, &shadowed)
+            .into_iter()
+            .filter_map(|(template, safe)| safe.then_some(template.id))
+            .collect::<BTreeSet<_>>();
+        let mut indels = Vec::new();
+
+        for token in parsed
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::String::cast)
+        {
+            let Ok(literal) = syn::parse_str::<syn::LitStr>(token.text()) else {
+                continue;
+            };
+            let value = literal.value();
+            if value.is_empty()
+                || safe_templates.contains(&LiteralId {
+                    file: path.to_path_buf(),
+                    start: u32::from(token.syntax().text_range().start()),
+                    end: u32::from(token.syntax().text_range().end()),
+                })
+                || !forbidden_runtime_context(token.syntax(), &shadowed)
+            {
+                continue;
+            }
+            let replacement = escaped_literal(&value);
+            if replacement != token.text() {
+                indels.push(replace(
+                    u32::from(token.syntax().text_range().start()),
+                    u32::from(token.syntax().text_range().end()),
+                    replacement,
+                ));
+            }
+        }
+
+        for token in parsed
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == SyntaxKind::CHAR)
+        {
+            let Ok(literal) = syn::parse_str::<syn::LitChar>(token.text()) else {
+                continue;
+            };
+            let value = literal.value();
+            if value.is_ascii() {
+                continue;
+            }
+            indels.push(replace(
+                u32::from(token.text_range().start()),
+                u32::from(token.text_range().end()),
+                format!("'\\u{{{:x}}}'", value as u32),
+            ));
+        }
+
+        if indels.is_empty() {
+            continue;
+        }
+        indels.sort_by_key(|edit| std::cmp::Reverse(edit.delete.start()));
+        let rewritten = crate::edits::apply_indels(&source, &indels)?;
+        std::fs::write(path, rewritten)?;
+        changed += indels.len();
+    }
+    Ok(changed)
 }
 
 fn copied_non_rust_texts(req: &StringRequest<'_>) -> Vec<String> {
@@ -1415,6 +1519,22 @@ fn classify(value: &str, plan: &StringsPlan) -> Option<&'static str> {
     (has_alpha && (has_semantic_separator || protocol_style)).then_some("internal")
 }
 
+/// Emit a normal Rust string literal whose decoded value is exactly `value`,
+/// while spelling every code point as an escape. This is valid in attributes,
+/// format/serde macro inputs, patterns, and other compile-time positions where
+/// a runtime block would be rejected. Escaping every code point (rather than
+/// only non-ASCII characters) also keeps compile-time English literals from
+/// remaining as an easy plaintext signature.
+fn escaped_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 7 + 2);
+    out.push('"');
+    for character in value.chars() {
+        out.push_str(&format!("\\u{{{:x}}}", character as u32));
+    }
+    out.push('"');
+    out
+}
+
 /// Contexts where replacing a literal expression with a runtime block would
 /// change whether the source is const-evaluable, pattern syntax, ABI syntax, or
 /// macro/attribute input.
@@ -1465,7 +1585,13 @@ fn forbidden_ancestors(
 
         if kind == "TOKEN_TREE" {
             if let Some((shadowed, mode)) = transparent_macros {
-                let outer = node.parent().and_then(ast::MacroCall::cast);
+                // rust-analyzer may wrap a macro token tree in one or more
+                // transparent TOKEN_TREE nodes (notably for a format! call
+                // nested in a return/argument expression). Walk the whole
+                // wrapper chain before looking for the owning macro call;
+                // otherwise safe runtime literals one level inside format!
+                // are conservatively misclassified as opaque.
+                let outer = node.ancestors().find_map(ast::MacroCall::cast);
                 if let Some(outer) = outer.filter(|outer| match mode {
                     MacroTransparency::NestedFormat => transparent_runtime_macro(outer, shadowed),
                     MacroTransparency::OrdinaryExpression => {
@@ -2027,6 +2153,21 @@ fn f() { let _ = format!("Cookie 无效: {}"); }
     }
 
     #[test]
+    fn nested_format_argument_is_runtime_context() {
+        let source = r#"fn f(error: u32) { let _ = format!("API 错误: {}", error.to_string().unwrap_or("未知错误")); }"#;
+        let parsed =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        let token = parsed
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::String::cast)
+            .find(|token| token.value().is_ok_and(|value| value == "未知错误"))
+            .expect("nested argument literal");
+        assert!(!forbidden_runtime_context(token.syntax(), &HashSet::new()));
+    }
+
+    #[test]
     fn format_looking_tokens_inside_an_opaque_macro_are_kept() {
         let source = r#"
 macro_rules! opaque { ($($token:tt)*) => { () } }
@@ -2051,6 +2192,14 @@ fn f(error: u32) { opaque!(format!("Cookie 无效: {}", error)); }
         assert!(!expression.contains(value));
         assert!(expression.contains("OnceLock"));
         assert!(expression.contains("black_box"));
+    }
+
+    #[test]
+    fn compile_time_literal_uses_equivalent_escaped_value() {
+        let escaped = escaped_literal("网络错误: {field}");
+        assert!(!escaped.contains("网络错误"));
+        let parsed = syn::parse_str::<syn::LitStr>(&escaped).unwrap();
+        assert_eq!(parsed.value(), "网络错误: {field}");
     }
 
     #[test]

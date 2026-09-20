@@ -20,7 +20,7 @@ use ra_ap_syntax::{
     Edition, SourceFile, SyntaxElement, SyntaxKind, SyntaxNode, TextRange,
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
@@ -226,7 +226,12 @@ pub fn run(
             .into_iter()
             .filter(|c| matches!(c.kind, ItemKind::Local | ItemKind::Param))
             .collect();
-        let index = BindingIndex::new(&parsed.tree, &candidates, &possible_constants);
+        let index = BindingIndex::new(
+            &parsed.tree,
+            &candidates,
+            &possible_constants,
+            &select.calls,
+        );
         for candidate in &candidates {
             if !candidate.kind.enabled_in(&plan.rename) {
                 continue;
@@ -439,7 +444,12 @@ impl SelectIndex {
                             .is_some()
                     })
                     .collect();
-                let index = BindingIndex::new(&expanded.tree, &candidates, possible_constants);
+                let index = BindingIndex::new(
+                    &expanded.tree,
+                    &candidates,
+                    possible_constants,
+                    &HashSet::new(),
+                );
 
                 for candidate in &candidates {
                     let Some(definition) =
@@ -942,7 +952,12 @@ fn select_local_ranges(
                         .is_some()
             })
             .collect();
-        let index = BindingIndex::new(&expanded.tree, &candidates, possible_constants);
+        let index = BindingIndex::new(
+            &expanded.tree,
+            &candidates,
+            possible_constants,
+            &HashSet::new(),
+        );
         for candidate in &candidates {
             if !index
                 .bindings
@@ -1499,8 +1514,23 @@ struct Binding {
     owner: TextRange,
     function: Option<TextRange>,
 }
+
+#[derive(Clone)]
+struct BindingToken {
+    text: String,
+    range: TextRange,
+    path_expr: bool,
+    shorthand: Option<TextRange>,
+    function: Option<TextRange>,
+    resolved: Option<TextRange>,
+}
+
 struct BindingIndex {
     bindings: Vec<Binding>,
+    by_name: HashMap<String, Vec<usize>>,
+    by_definition: HashMap<TextRange, usize>,
+    tokens_by_name: HashMap<String, Vec<BindingToken>>,
+    opaque_bindings: HashSet<TextRange>,
 }
 
 impl BindingIndex {
@@ -1508,6 +1538,7 @@ impl BindingIndex {
         tree: &ast::SourceFile,
         candidates: &[Candidate],
         possible_constants: &HashSet<String>,
+        supported_macro_calls: &HashSet<TextRange>,
     ) -> Self {
         let mut bindings = Vec::new();
         for pat in tree.syntax().descendants().filter_map(ast::IdentPat::cast) {
@@ -1534,20 +1565,109 @@ impl BindingIndex {
                 function: enclosing_function(pat.syntax()),
             });
         }
-        Self { bindings }
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_definition = HashMap::new();
+        for (index, binding) in bindings.iter().enumerate() {
+            by_name.entry(binding.name.clone()).or_default().push(index);
+            by_definition.insert(binding.definition, index);
+        }
+        let mut tokens_by_name: HashMap<String, Vec<BindingToken>> = HashMap::new();
+        for token in tree
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == SyntaxKind::IDENT)
+        {
+            let range = token.text_range();
+            let parent = token.parent().unwrap();
+            let record = parent.ancestors().find(|node| {
+                matches!(
+                    node.kind(),
+                    SyntaxKind::RECORD_EXPR_FIELD | SyntaxKind::RECORD_PAT_FIELD
+                )
+            });
+            let shorthand = record.as_ref().and_then(|node| {
+                (!node
+                    .children_with_tokens()
+                    .any(|element| element.kind() == SyntaxKind::COLON))
+                .then_some(node.text_range())
+            });
+            let path_expr = parent
+                .ancestors()
+                .find_map(ast::PathExpr::cast)
+                .is_some_and(|expression| expression.syntax().text_range() == range);
+            tokens_by_name
+                .entry(token.text().to_string())
+                .or_default()
+                .push(BindingToken {
+                    text: token.text().to_string(),
+                    range,
+                    path_expr,
+                    shorthand,
+                    function: enclosing_function(&parent),
+                    resolved: None,
+                });
+        }
+        let mut index = Self {
+            bindings,
+            by_name,
+            by_definition,
+            tokens_by_name,
+            opaque_bindings: HashSet::new(),
+        };
+        index.resolve_token_bindings();
+        index.opaque_bindings = index.compute_opaque_bindings(tree, supported_macro_calls);
+        index
     }
-    fn resolve(&self, name: &str, at: TextSize, function: Option<TextRange>) -> Option<TextRange> {
-        self.bindings
+
+    fn resolve_token_bindings(&mut self) {
+        let tokens: Vec<(String, TextSize, Option<TextRange>)> = self
+            .tokens_by_name
+            .values()
+            .flatten()
+            .map(|token| (token.text.clone(), token.range.start(), token.function))
+            .collect();
+        let mut resolved = HashMap::new();
+        for (name, at, function) in tokens {
+            resolved.insert(
+                (name.clone(), at, function),
+                self.resolve_by_name_at(&name, at, function),
+            );
+        }
+        for token in self.tokens_by_name.values_mut().flatten() {
+            token.resolved = resolved
+                .get(&(token.text.clone(), token.range.start(), token.function))
+                .copied()
+                .flatten();
+        }
+    }
+
+    fn resolve_by_name_at(
+        &self,
+        name: &str,
+        at: TextSize,
+        function: Option<TextRange>,
+    ) -> Option<TextRange> {
+        self.by_name
+            .get(name)?
             .iter()
-            .filter(|b| b.name == name && b.visible.contains(at) && b.function == function)
-            .max_by_key(|b| {
+            .copied()
+            .filter_map(|index| {
+                let binding = &self.bindings[index];
+                (binding.visible.contains(at) && binding.function == function).then_some(binding)
+            })
+            .max_by_key(|binding| {
                 (
-                    b.visible.start(),
-                    std::cmp::Reverse(b.visible.len()),
-                    std::cmp::Reverse(b.definition.start()),
+                    binding.visible.start(),
+                    std::cmp::Reverse(binding.visible.len()),
+                    std::cmp::Reverse(binding.definition.start()),
                 )
             })
-            .map(|b| b.definition)
+            .map(|binding| binding.definition)
+    }
+
+    fn resolve(&self, name: &str, at: TextSize, function: Option<TextRange>) -> Option<TextRange> {
+        self.resolve_by_name_at(name, at, function)
     }
     fn opaque_reference(
         &self,
@@ -1555,60 +1675,82 @@ impl BindingIndex {
         tree: &ast::SourceFile,
         supported_macro_calls: &HashSet<TextRange>,
     ) -> bool {
-        if !self.bindings.iter().any(|b| b.definition == c.name_range) {
-            return true;
-        }
-        // macro_rules! bodies may capture a lexical binding at definition time.
+        let _ = (tree, supported_macro_calls);
+        !self.by_definition.contains_key(&c.name_range)
+            || self.opaque_bindings.contains(&c.name_range)
+    }
+
+    /// Resolve macro-body references once per syntax tree instead of walking
+    /// every macro for every local/parameter candidate.
+    fn compute_opaque_bindings(
+        &self,
+        tree: &ast::SourceFile,
+        supported_macro_calls: &HashSet<TextRange>,
+    ) -> HashSet<TextRange> {
+        let mut opaque = HashSet::new();
         for definition in tree
             .syntax()
             .descendants()
             .filter_map(ast::MacroRules::cast)
         {
-            if self.resolve(
-                &c.name,
-                definition.syntax().text_range().start(),
-                enclosing_function(definition.syntax()),
-            ) == Some(c.name_range)
-                && definition
-                    .syntax()
-                    .descendants_with_tokens()
-                    .filter_map(|t| t.into_token())
-                    .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == c.name)
+            let at = definition.syntax().text_range().start();
+            let function = enclosing_function(definition.syntax());
+            for token in definition
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|element| element.into_token())
+                .filter(|token| token.kind() == SyntaxKind::IDENT)
             {
-                return true;
+                if let Some(binding) = self.resolve(token.text(), at, function) {
+                    opaque.insert(binding);
+                }
             }
         }
         for call in tree.syntax().descendants().filter_map(ast::MacroCall::cast) {
-            if supported_macro_calls.contains(&call.syntax().text_range()) {
+            let call_range = call.syntax().text_range();
+            if supported_macro_calls.contains(&call_range) {
                 continue;
             }
             let Some(tt) = call.token_tree() else {
                 continue;
             };
-            let at = call.syntax().text_range().start();
-            if self.resolve(&c.name, at, enclosing_function(call.syntax())) != Some(c.name_range) {
+            let at = call_range.start();
+            let function = enclosing_function(call.syntax());
+            let bindings_at_call: HashMap<String, TextRange> = self
+                .by_name
+                .keys()
+                .filter_map(|name| {
+                    self.resolve(name, at, function)
+                        .map(|binding| (name.clone(), binding))
+                })
+                .collect();
+            if bindings_at_call.is_empty() {
                 continue;
             }
             for token in tt
                 .syntax()
                 .descendants_with_tokens()
-                .filter_map(|t| t.into_token())
+                .filter_map(|element| element.into_token())
             {
-                if token.kind() == SyntaxKind::IDENT && token.text() == c.name {
-                    return true;
+                if token.kind() == SyntaxKind::IDENT {
+                    if let Some(binding) = bindings_at_call.get(token.text()) {
+                        opaque.insert(*binding);
+                    }
                 }
                 if let Some(lit) = ast::String::cast(token) {
-                    if format_names(&lit).is_ok_and(|refs| {
-                        refs.iter()
-                            .any(|(name, _)| name == c.name.trim_start_matches("r#"))
-                    }) {
-                        return true;
+                    if let Ok(refs) = format_names(&lit) {
+                        for (name, _) in refs {
+                            if let Some(binding) = bindings_at_call.get(name.as_str()) {
+                                opaque.insert(*binding);
+                            }
+                        }
                     }
                 }
             }
         }
-        false
+        opaque
     }
+
     fn edits(
         &self,
         c: &Candidate,
@@ -1630,58 +1772,40 @@ impl BindingIndex {
             return vec![];
         }
         let mut edits = Vec::new();
-        for token in expanded
-            .tree
-            .syntax()
-            .descendants_with_tokens()
-            .filter_map(|t| t.into_token())
-            .filter(|t| {
-                t.kind() == SyntaxKind::IDENT
-                    && (t.text() == c.name
-                        || renamed_spellings
-                            .get(c.name.trim_start_matches("r#"))
-                            .is_some_and(|names| names.contains(t.text())))
-            })
+        let renamed = renamed_spellings.get(c.name.trim_start_matches("r#"));
+        let mut token_names = vec![c.name.clone()];
+        if let Some(names) = renamed {
+            token_names.extend(names.iter().filter(|name| *name != &c.name).cloned());
+        }
+        let mut seen = HashSet::new();
+        for token in token_names
+            .iter()
+            .filter_map(|name| self.tokens_by_name.get(name))
+            .flatten()
+            .filter(|token| seen.insert(token.range))
         {
-            let range = token.text_range();
-            let parent = token.parent().unwrap();
-            let any_definition = self.bindings.iter().any(|b| b.definition == range);
-            let definition = self.bindings.iter().any(|b| {
-                b.definition == range && b.owner == binding.owner && b.name == binding.name
+            let range = token.range;
+            let any_definition = self.by_definition.contains_key(&range);
+            let definition = self.by_definition.get(&range).is_some_and(|index| {
+                let candidate = &self.bindings[*index];
+                candidate.owner == binding.owner && candidate.name == binding.name
             });
-            let record = parent.ancestors().find(|node| {
-                matches!(
-                    node.kind(),
-                    SyntaxKind::RECORD_EXPR_FIELD | SyntaxKind::RECORD_PAT_FIELD
-                )
+            let shorthand = token.shorthand.is_some();
+            let renamed_shorthand = shorthand && token.text != c.name && renamed.is_some();
+            let resolved = token.resolved.or_else(|| {
+                renamed_shorthand
+                    .then(|| self.resolve(&c.name, range.start(), token.function))
+                    .flatten()
             });
-            let shorthand = record.as_ref().is_some_and(|node| {
-                !node
-                    .children_with_tokens()
-                    .any(|element| element.kind() == SyntaxKind::COLON)
-            });
-            let renamed_shorthand = shorthand
-                && token.text() != c.name
-                && renamed_spellings
-                    .get(c.name.trim_start_matches("r#"))
-                    .is_some_and(|names| names.contains(token.text()));
-            let reference = parent
-                .ancestors()
-                .find_map(ast::PathExpr::cast)
-                .is_some_and(|expr| {
-                    expr.syntax().text_range() == range
-                        && self.resolve(&c.name, range.start(), enclosing_function(expr.syntax()))
-                            == Some(c.name_range)
-                })
+            let reference = (token.path_expr && resolved == Some(c.name_range))
                 || ((shorthand || renamed_shorthand)
                     && !any_definition
-                    && self.resolve(&c.name, range.start(), enclosing_function(&parent))
-                        == Some(c.name_range));
+                    && resolved == Some(c.name_range));
             if !(definition || reference) || expanded.labels.contains(&range) {
                 continue;
             }
-            if let Some(record) = record.filter(|_| shorthand) {
-                let start = record.text_range().start();
+            if let Some(record) = token.shorthand.filter(|_| shorthand) {
+                let start = record.start();
                 edits.push(Indel {
                     delete: TextRange::empty(start),
                     // A preceding semantic field rename can already have
@@ -1689,7 +1813,7 @@ impl BindingIndex {
                     // `hidden_field`. Preserve that current field spelling
                     // on the left and rename only the lexical value/pattern
                     // binding on the right.
-                    insert: format!("{}: ", token.text()),
+                    insert: format!("{}: ", token.text),
                 });
             }
             edits.push(Indel {

@@ -39,6 +39,12 @@ pub struct Mapping {
     /// Original string literal -> replacement, for the string pass.
     #[serde(default)]
     pub strings: BTreeMap<String, String>,
+    /// Frontend runtime string literal -> decoder identity. Kept separate
+    /// from [`strings`] so source leak scans only enforce the Rust/protocol
+    /// namespace; frontend bundles may legitimately retain structural copies
+    /// in assets or generated metadata.
+    #[serde(default)]
+    pub frontend_strings: BTreeMap<String, String>,
 }
 
 impl Default for Mapping {
@@ -59,6 +65,7 @@ impl Mapping {
             commands: BTreeMap::new(),
             events: BTreeMap::new(),
             strings: BTreeMap::new(),
+            frontend_strings: BTreeMap::new(),
         }
     }
 
@@ -113,6 +120,7 @@ impl Mapping {
             && self.commands.is_empty()
             && self.events.is_empty()
             && self.strings.is_empty()
+            && self.frontend_strings.is_empty()
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
@@ -187,6 +195,8 @@ mod tests {
         m.frontend_symbols
             .insert("frontend::src/app.ts::load@12".into(), "m7q2x".into());
         m.commands.insert("get_profile".into(), "m8q2x".into());
+        m.frontend_strings
+            .insert("开始下载".into(), "frontend-decoded:1234".into());
         m.write(&path).unwrap();
 
         let back = Mapping::read(&path).unwrap();
@@ -197,6 +207,7 @@ mod tests {
             "m7q2x"
         );
         assert_eq!(back.commands["get_profile"], "m8q2x");
+        assert_eq!(back.frontend_strings["开始下载"], "frontend-decoded:1234");
     }
 
     #[test]

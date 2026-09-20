@@ -817,12 +817,15 @@ fn all_mode_protects_runtime_strings_without_changing_behaviour() {
         );
     }
 
-    // Compile-time values cannot become runtime decoder expressions.
+    // Compile-time values cannot become runtime decoder expressions. They are
+    // now re-spelled as equivalent Unicode escapes after the transaction, so
+    // the source carries no plaintext while the mapping remains conservative.
     let kept = "compile-time-protocol";
     assert!(
-        source.contains(kept),
-        "{kept:?} lives in a compile-time context and must be kept"
+        !source.contains(kept),
+        "{kept:?} must not remain as compile-time plaintext"
     );
+    assert!(source.contains("\\u{63}\\u{6f}\\u{6d}"));
     assert!(
         mapping(&out)["strings"].get(kept).is_none(),
         "a kept plaintext must not be advertised as protected"
@@ -1124,10 +1127,14 @@ fn balanced_renames_supported_serde_members_without_changing_wire_bytes() {
         "\"type\"",
     ] {
         assert!(
-            model.contains(wire),
-            "wire contract {wire} disappeared from transformed source"
+            !model.contains(wire),
+            "wire contract {wire} remained as plaintext in transformed source"
         );
     }
+    assert!(
+        model.contains("\\u{75}\\u{73}\\u{65}\\u{72}"),
+        "wire contracts should be represented by equivalent escaped literals"
+    );
 
     assert_eq!(
         skipped_count(&out, "serde-unsupported"),
@@ -1418,6 +1425,104 @@ verify = false
             .as_u64()
             .unwrap_or(0),
         0
+    );
+}
+
+#[test]
+fn frontend_string_protection_covers_jsx_templates_and_defaults() {
+    let tmp = TempDir::new().expect("temp dir");
+    let input = tmp.path().join("input");
+    std::fs::create_dir_all(input.join("frontend/src")).expect("frontend source");
+    std::fs::write(
+        input.join("Cargo.toml"),
+        "[package]\nname = 'frontend_string_fixture'\nversion = '0.1.0'\nedition = '2024'\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(input.join("src")).unwrap();
+    std::fs::write(input.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        input.join("frontend/src/view.tsx"),
+        r#"type Mode = "replace" | "append";
+interface Props { title?: string }
+export function View({ title = "默认标题" }: Props) {
+  const mode: Mode = "replace";
+  const text = `前缀 ${"嵌套"}`;
+  return <button title="提示" data-label="标签">{title}{text}{mode}</button>;
+}
+"#,
+    )
+    .unwrap();
+
+    let config = tmp.path().join("obfuscator.toml");
+    std::fs::write(
+        &config,
+        r#"version = 1
+profile = "safe"
+[project]
+frontend_root = "frontend"
+frontend_source = "src"
+[rename]
+functions = false
+types = false
+traits = false
+enums = false
+consts = false
+statics = false
+modules = false
+fields = false
+[strings]
+enabled = true
+all = false
+frontend = true
+[comments]
+strip = true
+[tauri]
+commands = false
+events = false
+[build]
+verify = false
+"#,
+    )
+    .unwrap();
+
+    let output = tmp.path().join("generated");
+    let result = Command::new(binary())
+        .args(["transform", "--input"])
+        .arg(&input)
+        .args(["--output"])
+        .arg(&output)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--seed", "101", "--no-verify"])
+        .output()
+        .expect("spawning cargo-obfuscator");
+    assert_succeeded(&result);
+
+    let transformed = read(&output, "frontend/src/view.tsx");
+    assert!(!transformed.contains("默认标题"));
+    assert!(!transformed.contains("前缀"));
+    assert!(!transformed.contains("嵌套"));
+    assert!(!transformed.contains("提示"));
+    assert!(!transformed.contains("标签"));
+    assert!(transformed.contains("__sv_decode_"));
+    assert!(transformed.contains(r#"type Mode = "replace" | "append""#));
+
+    let parsed_mapping = mapping(&output);
+    assert!(
+        parsed_mapping["frontend_strings"]
+            .as_object()
+            .unwrap()
+            .len()
+            >= 5
+    );
+    let report_json = report(&output);
+    let frontend_report = &report_json["frontend"];
+    assert_eq!(report_json["files"]["frontend_scanned"].as_u64(), Some(1));
+    assert!(
+        frontend_report["string_occurrences_protected"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 5
     );
 }
 

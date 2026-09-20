@@ -320,6 +320,16 @@ pub struct FrontendStats {
     pub files_edited: usize,
     pub edits_applied: usize,
     pub kept_by_reason: BTreeMap<String, usize>,
+    /// Runtime string literals protected in frontend source. Kept separate
+    /// from Rust string counts because JSX/TS has different safe contexts.
+    #[serde(default)]
+    pub string_values_discovered: usize,
+    #[serde(default)]
+    pub string_occurrences_discovered: usize,
+    #[serde(default)]
+    pub string_occurrences_protected: usize,
+    #[serde(default)]
+    pub string_files_edited: usize,
 }
 
 /// What dependency-boundary handling generated for this build.
@@ -532,16 +542,36 @@ impl Report {
             let _ = writeln!(w, "  kept edit conflict:         {}", s.kept_conflict);
         }
 
-        if self.frontend.symbols_discovered > 0 {
+        if self.frontend.symbols_discovered > 0 || self.frontend.string_occurrences_discovered > 0 {
             let _ = writeln!(w);
             let f = &self.frontend;
-            let _ = writeln!(w, "Frontend files scanned:      {}", f.files_scanned);
-            let _ = writeln!(w, "Frontend symbols discovered: {}", f.symbols_discovered);
-            let _ = writeln!(w, "Frontend symbols renamed:    {}", f.symbols_renamed);
-            let _ = writeln!(w, "Frontend files edited:       {}", f.files_edited);
-            let _ = writeln!(w, "Frontend text edits applied: {}", f.edits_applied);
-            for (reason, count) in &f.kept_by_reason {
-                let _ = writeln!(w, "  {reason:<28} {count}");
+            if f.symbols_discovered > 0 {
+                let _ = writeln!(w, "Frontend files scanned:      {}", f.files_scanned);
+                let _ = writeln!(w, "Frontend symbols discovered: {}", f.symbols_discovered);
+                let _ = writeln!(w, "Frontend symbols renamed:    {}", f.symbols_renamed);
+                let _ = writeln!(w, "Frontend files edited:       {}", f.files_edited);
+                let _ = writeln!(w, "Frontend text edits applied: {}", f.edits_applied);
+                for (reason, count) in &f.kept_by_reason {
+                    let _ = writeln!(w, "  {reason:<28} {count}");
+                }
+            }
+            if f.string_occurrences_discovered > 0 {
+                let _ = writeln!(
+                    w,
+                    "Frontend string values:      {}",
+                    f.string_values_discovered
+                );
+                let _ = writeln!(
+                    w,
+                    "Frontend string occurrences: {}",
+                    f.string_occurrences_discovered
+                );
+                let _ = writeln!(
+                    w,
+                    "Frontend strings protected:  {}",
+                    f.string_occurrences_protected
+                );
+                let _ = writeln!(w, "Frontend string files:       {}", f.string_files_edited);
             }
         }
 

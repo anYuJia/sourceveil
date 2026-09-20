@@ -373,6 +373,33 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
             };
             mapping.strings.extend(outcome.mapping);
             report.warnings.extend(outcome.warnings);
+
+            if plan.strings.frontend {
+                if let Some(source_root) = layout.frontend_source.as_deref() {
+                    let request = crate::frontend::strings::StringRequest {
+                        input_root: &layout.root,
+                        source_root,
+                        copied: &copy.copied,
+                        plan: &plan.strings,
+                        seed: seed.seed,
+                        reserved_protocol_values: &protocol_values,
+                    };
+                    let outcome = crate::frontend::strings::run(&request, &mut edits)
+                        .context("running the frontend string protection pass")?;
+                    report.files.frontend_scanned =
+                        report.files.frontend_scanned.max(outcome.files_scanned);
+                    frontend_stats.string_values_discovered = outcome.values_discovered;
+                    frontend_stats.string_occurrences_discovered = outcome.occurrences_discovered;
+                    frontend_stats.string_occurrences_protected = outcome.occurrences_protected;
+                    frontend_stats.string_files_edited = outcome.files_edited;
+                    mapping.frontend_strings.extend(outcome.mapping);
+                    report.warnings.extend(outcome.warnings);
+                } else {
+                    report.warnings.push(
+                        "frontend string protection requested but no frontend source directory was found".into(),
+                    );
+                }
+            }
         }
 
         if plan.frontend.rename_private_identifiers {
@@ -385,7 +412,19 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
                 let outcome = frontend_rename::run(&request, &mut names, &mut edits)
                     .context("running the frontend semantic rename pass")?;
 
+                let string_values_discovered = frontend_stats.string_values_discovered;
+                let string_occurrences_discovered = frontend_stats.string_occurrences_discovered;
+                let string_occurrences_protected = frontend_stats.string_occurrences_protected;
+                let string_files_edited = frontend_stats.string_files_edited;
+                report.files.frontend_scanned = report
+                    .files
+                    .frontend_scanned
+                    .max(outcome.stats.files_scanned);
                 frontend_stats = outcome.stats;
+                frontend_stats.string_values_discovered = string_values_discovered;
+                frontend_stats.string_occurrences_discovered = string_occurrences_discovered;
+                frontend_stats.string_occurrences_protected = string_occurrences_protected;
+                frontend_stats.string_files_edited = string_files_edited;
                 mapping
                     .frontend_symbols
                     .extend(outcome.mapping.frontend_symbols);
@@ -456,6 +495,20 @@ pub fn transform(req: &TransformRequest) -> Result<TransformOutcome> {
         for skipped in outcome.skipped {
             report.skip(skipped);
         }
+    }
+
+    // Compile-time Rust literals cannot call the runtime decoder. Re-spell
+    // those remaining attribute/macro/pattern values after every semantic and
+    // binding edit has landed, so a larger scheduled attribute edit cannot
+    // conflict with an inner literal edit. The decoded values are unchanged.
+    let compile_time_literals =
+        crate::strings::escape_compile_time_literals_workspace(&output_root)
+            .context("escaping compile-time Rust literals")?;
+    if compile_time_literals > 0 {
+        report.warnings.push(format!(
+            "re-spelled {} compile-time Rust literal(s) as Unicode escapes",
+            compile_time_literals
+        ));
     }
 
     // Keep directives and macro references must be read before comments vanish.

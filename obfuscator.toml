@@ -77,6 +77,11 @@ errors = false
 internal = false
 ui = false
 endpoints = false
+# Protect runtime strings in frontend/src (JS/JSX/TS/TSX). This is enabled by
+# default by the `aggressive` profile; set explicitly when using another
+# profile. Module specifiers, type literals and protocol discriminants are
+# retained when changing them would alter compilation or the wire contract.
+frontend = false
 
 [comments]
 # Run after semantic renames. Removes source/doc comments from supported
