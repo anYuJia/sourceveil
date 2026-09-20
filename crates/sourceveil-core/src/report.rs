@@ -294,7 +294,13 @@ pub struct StringStats {
     pub values_discovered: usize,
     pub occurrences_discovered: usize,
     pub values_protected: usize,
+    #[serde(default)]
+    pub values_mapped: usize,
+    #[serde(default)]
+    pub values_protected_unmapped: usize,
     pub occurrences_protected: usize,
+    #[serde(default)]
+    pub occurrences_kept_unsafe: usize,
     pub kept_unsafe_context: usize,
     #[serde(default)]
     pub kept_external_collision: usize,
@@ -497,15 +503,30 @@ impl Report {
             let s = &self.strings;
             let _ = writeln!(w, "String values discovered:    {}", s.values_discovered);
             let _ = writeln!(w, "String values protected:     {}", s.values_protected);
+            let _ = writeln!(w, "  globally mapped:            {}", s.values_mapped);
+            let _ = writeln!(
+                w,
+                "  protected but unmapped:      {}",
+                s.values_protected_unmapped
+            );
             let _ = writeln!(
                 w,
                 "String occurrences protected: {}",
                 s.occurrences_protected
             );
-            let _ = writeln!(w, "  kept unsafe context:        {}", s.kept_unsafe_context);
             let _ = writeln!(
                 w,
-                "  kept plaintext collision:    {}",
+                "  unsafe occurrences retained: {}",
+                s.occurrences_kept_unsafe
+            );
+            let _ = writeln!(
+                w,
+                "  values with unsafe context:   {}",
+                s.kept_unsafe_context
+            );
+            let _ = writeln!(
+                w,
+                "  values with text collision:   {}",
                 s.kept_external_collision
             );
             let _ = writeln!(w, "  kept edit conflict:         {}", s.kept_conflict);

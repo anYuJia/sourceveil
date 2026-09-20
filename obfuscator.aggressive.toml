@@ -10,6 +10,7 @@ name_len_max = 16
 
 [strings]
 enabled = true
+all = true
 internal = true
 ui = true
 endpoints = true

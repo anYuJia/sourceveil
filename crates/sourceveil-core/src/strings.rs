@@ -1,18 +1,19 @@
 //! Runtime string-literal protection.
 //!
-//! This pass is intentionally narrower than "encrypt every string". It
-//! rewrites ordinary runtime Rust string expressions whose type can remain
-//! \`&'static str\`, plus the literal text pieces of structurally proven
-//! formatting macros. Format placeholders stay in a compile-time literal and
-//! each visible text piece becomes a generated named argument whose value is
-//! decoded at runtime. Other macro token trees and compile-time contexts
-//! (attributes, const/static initialisers, patterns, ABI strings and const fn
-//! bodies) are left alone.
+//! This pass rewrites selected runtime Rust string expressions whose type can
+//! remain \`&'static str\`, plus the literal text pieces of structurally proven
+//! formatting macros. With `strings.all`, every non-empty runtime literal is a
+//! candidate; the narrower classes remain available for balanced builds.
+//! Format placeholders stay in a compile-time literal and each visible text
+//! piece becomes a generated named argument whose value is decoded at runtime.
+//! Other macro token trees and compile-time contexts (attributes, const/static
+//! initialisers, patterns, ABI strings and const fn bodies) are left alone.
 //!
-//! A protected value is transformed only when *every* occurrence selected for
-//! protection is safe. That makes the mapping honest: once a value appears in
-//! \`mapping.strings\`, source/binary leak scans may require the original
-//! plaintext to be gone.
+//! Rewrite eligibility and global plaintext proof are deliberately separate.
+//! Every safe occurrence is transformed even when the same spelling must stay
+//! in a compile-time context, copied asset, protocol, or dependency. A value is
+//! entered into `mapping.strings` only when no retained collision is known, so
+//! source/binary leak scans may still treat every mapped plaintext as fatal.
 //!
 //! The runtime representation uses a per-occurrence HMAC-derived seed and a
 //! tiny xorshift64* stream. This is obfuscation, not cryptographic secrecy: the
@@ -36,6 +37,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 const STREAM_MULTIPLIER: u64 = 0x2545_F491_4F6C_DD1D;
+/// Raw-byte leak scans are not meaningful for one-to-three-byte strings: a
+/// match is overwhelmingly likely to be incidental machine code or metadata.
+/// Those literals are still protected, but are not advertised in the strict
+/// global mapping.
+const MIN_VERIFIABLE_PLAINTEXT_LEN: usize = 4;
 
 #[derive(Debug, Clone, Default)]
 pub struct StringOutcome {
@@ -43,7 +49,14 @@ pub struct StringOutcome {
     pub values_discovered: usize,
     pub occurrences_discovered: usize,
     pub values_protected: usize,
+    /// Protected values for which the pass can promise that no known retained
+    /// plaintext remains. This is also the number eligible for the mapping.
+    pub values_mapped: usize,
+    /// Values whose safe occurrences were protected but whose plaintext is
+    /// retained or may collide elsewhere, so they are intentionally unmapped.
+    pub values_protected_unmapped: usize,
     pub occurrences_protected: usize,
+    pub occurrences_kept_unsafe: usize,
     pub kept_unsafe_context: usize,
     pub kept_external_collision: usize,
     pub kept_conflict: usize,
@@ -214,9 +227,7 @@ pub fn run(
                 let FormatPart::Literal { fragment, value } = part else {
                     continue;
                 };
-                if classify(value.as_str(), req.plan).is_none()
-                    || collides_with_reserved_protocol(value.as_str(), req.reserved_protocol_values)
-                {
+                if classify(value.as_str(), req.plan).is_none() {
                     continue;
                 }
                 by_value.entry(value.clone()).or_default().push(Occurrence {
@@ -260,16 +271,9 @@ pub fn run(
             if classify(&value, req.plan).is_none() {
                 continue;
             }
-            // A retained wire value such as `Audio132K` also retains `132K`
-            // as raw bytes. The final binary scanner intentionally searches
-            // substrings, so exact equality is not a sufficient reservation.
-            if collides_with_reserved_protocol(&value, req.reserved_protocol_values) {
-                continue;
-            }
-
             let start = u32::from(range.start());
             let end = u32::from(range.end());
-            let safe = !forbidden_context(token.syntax());
+            let safe = !forbidden_runtime_context(token.syntax(), &shadowed_format_macros);
 
             by_value.entry(value).or_default().push(Occurrence {
                 file: path.clone(),
@@ -285,36 +289,67 @@ pub fn run(
     out.values_discovered = by_value.len();
     out.occurrences_discovered = by_value.values().map(Vec::len).sum();
 
-    // The mapping is a promise that a protected plaintext vanished from the
-    // generated tree. A value may be a safe runtime literal in Rust and still
-    // be required verbatim by Cargo metadata, a Tauri config, or frontend
-    // source. Reserve those cross-file collisions before staging any edit;
-    // otherwise source/binary verification would correctly reject a mapping
-    // that could never be satisfied.
-    let copied_texts = copied_non_rust_texts(req);
-    by_value.retain(|value, _| {
-        let collision = copied_texts.iter().any(|text| text.contains(value));
-        if collision {
-            out.kept_external_collision += 1;
-        }
-        !collision
-    });
+    // Rewriting and proof are separate decisions. Safe runtime occurrences are
+    // always rewritten. The proof set below only decides whether the value may
+    // be advertised in mapping.strings as globally absent plaintext.
+    let mut proof_blocked = BTreeSet::new();
+    let mut external_collisions = BTreeSet::new();
 
-    // One unsafe occurrence keeps this plaintext globally. Do this before the
-    // literal collision proof so an exact compile-time occurrence can never be
-    // mistaken for a transformable owner.
+    // A retained wire value such as `Audio132K` also retains `132K` as raw
+    // bytes. This prevents a strict mapping promise, but must not prevent a
+    // separate runtime occurrence from being encoded.
+    let mut mapping_plan = req.plan.clone();
+    mapping_plan.all = false;
+    for value in by_value.keys() {
+        // `all` deliberately admits generic words such as "navigate" and
+        // "document". Those are worth removing from application source, but
+        // raw final binaries may independently contain them in the toolchain,
+        // platform libraries, or dependency metadata. Keep strict mapping
+        // membership limited to the explicit semantic classes; otherwise one
+        // incidental substring would turn a successful protection pass into a
+        // false binary-leak failure.
+        let generic_all_value = req.plan.all && classify(value, &mapping_plan).is_none();
+        if value.len() < MIN_VERIFIABLE_PLAINTEXT_LEN || generic_all_value {
+            proof_blocked.insert(value.clone());
+        }
+        if collides_with_reserved_protocol(value, req.reserved_protocol_values) {
+            proof_blocked.insert(value.clone());
+            external_collisions.insert(value.clone());
+        }
+    }
+
+    // A value may also be required verbatim by Cargo/Tauri configuration or
+    // frontend source. Keep transforming its Rust runtime sites, but withhold
+    // it from the strict mapping.
+    let copied_texts = copied_non_rust_texts(req);
+    for value in by_value.keys() {
+        if copied_texts.iter().any(|text| text.contains(value)) {
+            proof_blocked.insert(value.clone());
+            external_collisions.insert(value.clone());
+        }
+    }
+
+    // An unsafe occurrence remains plaintext, but no longer pins independent
+    // safe occurrences of the same value.
     let unsafe_values = by_value
         .iter()
         .filter(|(_, occurrences)| occurrences.iter().any(|occurrence| !occurrence.safe))
         .map(|(value, _)| value.clone())
-        .collect::<Vec<_>>();
-    for value in unsafe_values {
-        if let Some(occurrences) = by_value.remove(&value) {
-            out.kept_unsafe_context += 1;
+        .collect::<BTreeSet<_>>();
+    out.kept_unsafe_context = unsafe_values.len();
+    out.occurrences_kept_unsafe = by_value
+        .values()
+        .flatten()
+        .filter(|occurrence| !occurrence.safe)
+        .count();
+    proof_blocked.extend(unsafe_values);
+
+    for (value, occurrences) in &by_value {
+        if occurrences.iter().any(|occurrence| !occurrence.safe) {
             tracing::debug!(
                 value = %value,
                 occurrences = occurrences.len(),
-                "keeping string because at least one occurrence is compile-time/ambiguous"
+                "protecting safe string occurrences while retaining compile-time/ambiguous sites"
             );
         }
     }
@@ -329,10 +364,10 @@ pub fn run(
             has_rust_literal_collision(value, occurrences, &rust_literals, &format_templates)
         })
         .map(|(value, _)| value.clone())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
     for value in rust_collisions {
-        by_value.remove(&value);
-        out.kept_external_collision += 1;
+        proof_blocked.insert(value.clone());
+        external_collisions.insert(value);
     }
 
     // Registry/git/external path dependencies are intentionally not copied or
@@ -341,16 +376,24 @@ pub fn run(
     // artifact. Scan their raw source bytes before promising that a plaintext
     // is absent. This intentionally prefers a conservative keep over a mapping
     // entry that the final raw-byte scanner cannot verify.
-    let candidate_values = by_value.keys().cloned().collect::<BTreeSet<_>>();
+    let candidate_values = by_value
+        .keys()
+        .filter(|value| !proof_blocked.contains(*value))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let dependency_collisions =
         external_dependency_plaintext_collisions(req.graph, req.input_root, &candidate_values)?;
-    by_value.retain(|value, _| {
-        let collision = dependency_collisions.contains(value);
-        if collision {
-            out.kept_external_collision += 1;
-        }
-        !collision
-    });
+    proof_blocked.extend(dependency_collisions.iter().cloned());
+    external_collisions.extend(dependency_collisions);
+    out.kept_external_collision = external_collisions.len();
+
+    // Only safe occurrences participate in edit transactions. Values that
+    // exist exclusively in compile-time/opaque contexts remain discovered and
+    // reported, but naturally have no rewrite component.
+    for occurrences in by_value.values_mut() {
+        occurrences.retain(|occurrence| occurrence.safe);
+    }
+    by_value.retain(|_, occurrences| !occurrences.is_empty());
 
     // rust-analyzer's file iteration order is an implementation detail. Sort
     // before assigning ordinals so identical inputs produce the same
@@ -461,8 +504,13 @@ pub fn run(
                 out.files_edited
                     .extend(contributions_by_file.keys().cloned());
                 for value in component {
-                    out.mapping
-                        .insert(value, "runtime-xorshift64star".to_string());
+                    if proof_blocked.contains(&value) {
+                        out.values_protected_unmapped += 1;
+                    } else {
+                        out.values_mapped += 1;
+                        out.mapping
+                            .insert(value, "runtime-xorshift64star".to_string());
+                    }
                 }
             }
             Err(error) => {
@@ -543,7 +591,25 @@ fn collect_shadowed_format_macros(
                         .map(|name| name.text().to_string())
                 });
             if imported.as_deref().is_some_and(is_known_runtime_macro_name) {
-                shadowed.insert(imported.expect("the imported name was checked"));
+                let imported = imported.expect("the imported name was checked");
+                // These macros have a documented format-string grammar. An
+                // explicit import from `anyhow` proves their identity just as
+                // a `std::format!` qualification would. A local macro_rules!
+                // definition was collected above and still wins.
+                let trusted_anyhow_import =
+                    matches!(imported.as_str(), "anyhow" | "bail" | "ensure")
+                        && import
+                            .syntax()
+                            .ancestors()
+                            .find_map(ast::Use::cast)
+                            .is_some_and(|item| {
+                                let compact = item.syntax().text().to_string().replace(' ', "");
+                                compact.starts_with("useanyhow::")
+                                    || compact.starts_with("pubuseanyhow::")
+                            });
+                if !trusted_anyhow_import {
+                    shadowed.insert(imported);
+                }
             }
         }
     }
@@ -562,6 +628,19 @@ fn is_supported_unqualified_format_macro(name: &str) -> bool {
             | "eprintln"
             | "write"
             | "writeln"
+            | "panic"
+            | "todo"
+            | "unreachable"
+            | "unimplemented"
+            | "assert"
+            | "debug_assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "anyhow"
+            | "bail"
+            | "ensure"
     )
 }
 
@@ -579,13 +658,26 @@ fn format_macro_argument_path(path: &str, shadowed: &HashSet<String>) -> Option<
 
     let standard = match name {
         "format" | "format_args" | "format_args_nl" | "print" | "println" | "eprint"
-        | "eprintln" => Some(0),
+        | "eprintln" | "panic" | "todo" | "unreachable" | "unimplemented" => Some(0),
         "write" | "writeln" => Some(1),
+        "assert" | "debug_assert" => Some(1),
+        "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne" => Some(2),
         _ => None,
     };
     if let Some(index) = standard {
         let proven_path = (parts.len() == 1 && !shadowed.contains(name))
             || (parts.len() == 2 && matches!(parts[0], "std" | "core" | "alloc"));
+        return proven_path.then_some((index, false));
+    }
+
+    let anyhow_index = match name {
+        "anyhow" | "bail" => Some(0),
+        "ensure" => Some(1),
+        _ => None,
+    };
+    if let Some(index) = anyhow_index {
+        let proven_path = (parts.len() == 1 && !shadowed.contains(name))
+            || (parts.len() == 2 && parts[0] == "anyhow");
         return proven_path.then_some((index, false));
     }
 
@@ -951,7 +1043,7 @@ fn has_rust_literal_collision(
 ) -> bool {
     let ordinary_sites = occurrences
         .iter()
-        .filter(|occurrence| matches!(occurrence.kind, OccurrenceKind::Ordinary))
+        .filter(|occurrence| occurrence.safe && matches!(occurrence.kind, OccurrenceKind::Ordinary))
         .map(|occurrence| LiteralId {
             file: occurrence.file.clone(),
             start: occurrence.start,
@@ -960,6 +1052,7 @@ fn has_rust_literal_collision(
         .collect::<BTreeSet<_>>();
     let format_sites = occurrences
         .iter()
+        .filter(|occurrence| occurrence.safe)
         .filter_map(|occurrence| match &occurrence.kind {
             OccurrenceKind::Format { template, fragment } => Some((template.clone(), *fragment)),
             OccurrenceKind::Ordinary => None,
@@ -1278,9 +1371,16 @@ fn relative_file_identity(root: &Path, file: &Path) -> String {
 
 /// Which configured class owns this value.
 ///
-/// The default balanced profile only enables \`internal\`, and this deliberately
-/// recognises machine-like semantic strings rather than every piece of copy.
+/// `all` selects every non-empty runtime value. The default balanced profile
+/// only enables `internal`, which deliberately recognises machine-like
+/// semantic strings rather than every piece of copy.
 fn classify(value: &str, plan: &StringsPlan) -> Option<&'static str> {
+    if value.is_empty() {
+        return None;
+    }
+    if plan.all {
+        return Some("all");
+    }
     if value.len() < 4 || value.len() > 1024 || value.contains('\0') {
         return None;
     }
@@ -1318,8 +1418,24 @@ fn classify(value: &str, plan: &StringsPlan) -> Option<&'static str> {
 /// Contexts where replacing a literal expression with a runtime block would
 /// change whether the source is const-evaluable, pattern syntax, ABI syntax, or
 /// macro/attribute input.
+#[cfg(test)]
 fn forbidden_context(token: &ra_ap_syntax::SyntaxToken) -> bool {
     forbidden_ancestors(token.parent(), None)
+}
+
+/// Ordinary literals inside a small set of proven expression-oriented macros
+/// retain normal Rust expression grammar. This covers formatting arguments,
+/// assertions, `anyhow` errors, `vec!` elements and `dbg!` arguments without
+/// guessing at arbitrary macro DSLs such as `serde_json::json!` object keys or
+/// `matches!` patterns.
+fn forbidden_runtime_context(
+    token: &ra_ap_syntax::SyntaxToken,
+    shadowed: &HashSet<String>,
+) -> bool {
+    forbidden_ancestors(
+        token.parent(),
+        Some((shadowed, MacroTransparency::OrdinaryExpression)),
+    )
 }
 
 /// A supported format literal necessarily lives in its own `TOKEN_TREE`.
@@ -1328,22 +1444,34 @@ fn forbidden_context(token: &ra_ap_syntax::SyntaxToken) -> bool {
 /// runtime decoder. A small set of proven expression-container macros may
 /// surround it; their input grammar accepts the rewritten inner macro call.
 fn forbidden_format_context(call: &ast::MacroCall, shadowed: &HashSet<String>) -> bool {
-    forbidden_ancestors(call.syntax().parent(), Some(shadowed))
+    forbidden_ancestors(
+        call.syntax().parent(),
+        Some((shadowed, MacroTransparency::NestedFormat)),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MacroTransparency {
+    NestedFormat,
+    OrdinaryExpression,
 }
 
 fn forbidden_ancestors(
     mut current: Option<ra_ap_syntax::SyntaxNode>,
-    transparent_macros: Option<&HashSet<String>>,
+    transparent_macros: Option<(&HashSet<String>, MacroTransparency)>,
 ) -> bool {
     while let Some(node) = current {
         let kind = format!("{:?}", node.kind());
 
         if kind == "TOKEN_TREE" {
-            if let Some(shadowed) = transparent_macros {
+            if let Some((shadowed, mode)) = transparent_macros {
                 let outer = node.parent().and_then(ast::MacroCall::cast);
-                if let Some(outer) =
-                    outer.filter(|outer| transparent_runtime_macro(outer, shadowed))
-                {
+                if let Some(outer) = outer.filter(|outer| match mode {
+                    MacroTransparency::NestedFormat => transparent_runtime_macro(outer, shadowed),
+                    MacroTransparency::OrdinaryExpression => {
+                        transparent_expression_macro(outer, shadowed)
+                    }
+                }) {
                     current = outer.syntax().parent();
                     continue;
                 }
@@ -1398,6 +1526,30 @@ fn transparent_runtime_macro(call: &ast::MacroCall, shadowed: &HashSet<String>) 
         return false;
     };
     transparent_runtime_macro_path(&path.syntax().text().to_string(), shadowed)
+}
+
+fn transparent_expression_macro(call: &ast::MacroCall, shadowed: &HashSet<String>) -> bool {
+    let Some(path) = call.path() else {
+        return false;
+    };
+    transparent_expression_macro_path(&path.syntax().text().to_string(), shadowed)
+}
+
+fn transparent_expression_macro_path(path: &str, shadowed: &HashSet<String>) -> bool {
+    if format_macro_argument_path(path, shadowed).is_some() {
+        return true;
+    }
+    let compact = path.replace(' ', "");
+    let parts = compact
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(name) = parts.last().copied() else {
+        return false;
+    };
+    matches!(name, "vec" | "dbg")
+        && ((parts.len() == 1 && !shadowed.contains(name))
+            || (parts.len() == 2 && matches!(parts[0], "std" | "core" | "alloc")))
 }
 
 fn transparent_runtime_macro_path(path: &str, shadowed: &HashSet<String>) -> bool {
@@ -1608,6 +1760,64 @@ mod tests {
         ));
     }
 
+    fn forbidden_runtime_for(source: &str, value: &str) -> bool {
+        let file =
+            ra_ap_syntax::SourceFile::parse(source, ra_ap_syntax::Edition::Edition2021).tree();
+        file.syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::String::cast)
+            .find_map(|token| {
+                let literal = syn::parse_str::<syn::LitStr>(token.text()).ok()?;
+                (literal.value() == value)
+                    .then(|| forbidden_runtime_context(token.syntax(), &HashSet::new()))
+            })
+            .unwrap_or_else(|| panic!("string literal {value:?} not found in {source:?}"))
+    }
+
+    #[test]
+    fn proven_macro_expression_arguments_are_runtime_contexts() {
+        for (source, value) in [
+            (
+                r#"fn f() { println!("{}", "print-value"); }"#,
+                "print-value",
+            ),
+            (
+                r#"fn f() { let _ = vec!["vector-value"]; }"#,
+                "vector-value",
+            ),
+            (
+                r#"fn f() { assert_eq!("left-value", "right-value"); }"#,
+                "right-value",
+            ),
+            (
+                r#"fn f() { let _ = anyhow!("error text: {}", "detail-value"); }"#,
+                "detail-value",
+            ),
+        ] {
+            assert!(
+                !forbidden_runtime_for(source, value),
+                "proven expression argument was kept: {source}"
+            );
+        }
+
+        for (source, value) in [
+            (
+                r#"fn f(v: &str) { let _ = matches!(v, "pattern-value"); }"#,
+                "pattern-value",
+            ),
+            (
+                r#"fn f() { let _ = serde_json::json!({ "wire-key": 1 }); }"#,
+                "wire-key",
+            ),
+        ] {
+            assert!(
+                forbidden_runtime_for(source, value),
+                "macro DSL literal was incorrectly treated as an expression: {source}"
+            );
+        }
+    }
+
     #[test]
     fn no_std_detection_reads_inner_ast_attributes() {
         for source in [
@@ -1636,6 +1846,25 @@ mod tests {
         assert_eq!(classify("Connected", &plan), None);
         assert_eq!(classify("Cancel download", &plan), None);
         assert_eq!(classify("确定", &plan), None);
+    }
+
+    #[test]
+    fn all_classification_includes_plain_short_raw_and_nul_strings() {
+        let mut plan = balanced_strings();
+        plan.all = true;
+        for value in [
+            "document",
+            "navigate",
+            "Accept",
+            "text/html,application/xhtml+xml",
+            r#"webid=(\d+)"#,
+            "0",
+            "\0",
+            &"x".repeat(2048),
+        ] {
+            assert_eq!(classify(value, &plan), Some("all"), "missed {value:?}");
+        }
+        assert_eq!(classify("", &plan), None);
     }
 
     #[test]
@@ -1728,6 +1957,23 @@ mod tests {
         }
         assert!(rewritten.contains("OnceLock"));
         assert!(rewritten.contains("__sv_fmt_"));
+    }
+
+    #[test]
+    fn anyhow_and_assert_message_literals_are_format_templates() {
+        for source in [
+            r#"fn f(error: u32) { let _ = anyhow!("Request failed: {}", error); }"#,
+            r#"fn f(ok: bool, error: u32) { assert!(ok, "Request failed: {}", error); }"#,
+            r#"fn f(left: u32, right: u32) { assert_eq!(left, right, "Mismatch: {left}"); }"#,
+        ] {
+            let template = one_format_template(source)
+                .unwrap_or_else(|| panic!("format template not recognised: {source}"));
+            assert!(template.parts.iter().any(|part| matches!(
+                part,
+                FormatPart::Literal { value, .. }
+                    if value == "Request failed: " || value == "Mismatch: "
+            )));
+        }
     }
 
     #[test]

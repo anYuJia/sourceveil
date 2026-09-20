@@ -119,6 +119,10 @@ pub struct Rename {
 #[serde(deny_unknown_fields)]
 pub struct Strings {
     pub enabled: Option<bool>,
+    /// Protect every non-empty runtime string literal that can be replaced by
+    /// a lazily decoded `&'static str`. The aggressive profile enables this by
+    /// default. Compile-time and opaque macro contexts remain untouched.
+    pub all: Option<bool>,
     /// `log::*`, `tracing::*`, `println!`-family arguments.
     pub logs: Option<bool>,
     /// Arguments to error constructors.

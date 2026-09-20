@@ -67,9 +67,11 @@ name_len_max = 9
 
 [strings]
 # Runtime Rust string protection. `balanced` enables the pass and internal
-# machine-like literals by default. Compile-time, macro, pattern and ABI
+# machine-like literals by default. `aggressive` enables `all`, which selects
+# every non-empty runtime literal. Compile-time, opaque macro, pattern and ABI
 # contexts remain untouched.
 enabled = false
+all = false
 logs = false
 errors = false
 internal = false

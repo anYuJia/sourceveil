@@ -716,7 +716,7 @@ fn transform_strings_from(input: &Path, seed: &str) -> (TempDir, PathBuf) {
     let config = tmp.path().join("obfuscator.toml");
     std::fs::write(
         &config,
-        "version = 1\nprofile = \"balanced\"\n\n[strings]\nui = true\n",
+        "version = 1\nprofile = \"balanced\"\n\n[strings]\nall = true\nui = true\n",
     )
     .expect("writing balanced config");
 
@@ -757,7 +757,7 @@ fn protected_payloads(root: &Path) -> Vec<String> {
 }
 
 #[test]
-fn balanced_protects_runtime_strings_without_changing_behaviour() {
+fn all_mode_protects_runtime_strings_without_changing_behaviour() {
     let original = run_crate(&string_fixture());
     let (_tmp, out) = transform_strings("20240917");
 
@@ -779,7 +779,34 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
         );
     }
 
-    for protected in ["Cookie 无效: ", "indexed ", " named ", "raw {label} "] {
+    for protected in [
+        "document",
+        "navigate",
+        "Accept",
+        "text/html,application/xhtml+xml",
+        r#"webid=(\d+)"#,
+        "0",
+    ] {
+        assert!(
+            !source.contains(&format!("\"{protected}\""))
+                && !source.contains(&format!("r#\"{protected}\"#")),
+            "all mode left runtime plaintext {protected:?} in generated Rust"
+        );
+    }
+    for generic in ["document", "navigate", "Accept"] {
+        assert!(
+            mapping(&out)["strings"].get(generic).is_none(),
+            "generic all-mode value {generic:?} must not make an unreliable global binary promise"
+        );
+    }
+
+    for protected in [
+        "Cookie 无效: ",
+        "indexed ",
+        " named ",
+        "raw {label} ",
+        "Request failed: ",
+    ] {
         assert!(
             !source.contains(protected),
             "format literal fragment {protected:?} remains in generated source"
@@ -790,32 +817,33 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
         );
     }
 
-    // These are deliberately outside the safe runtime subset.
-    for kept in ["compile-time-protocol", "macro-protocol-name"] {
+    // Compile-time values cannot become runtime decoder expressions.
+    let kept = "compile-time-protocol";
+    assert!(
+        source.contains(kept),
+        "{kept:?} lives in a compile-time context and must be kept"
+    );
+    assert!(
+        mapping(&out)["strings"].get(kept).is_none(),
+        "a kept plaintext must not be advertised as protected"
+    );
+    for protected in ["macro-protocol-name", "mixed-protocol"] {
         assert!(
-            source.contains(kept),
-            "{kept:?} lives in a compile-time/macro context and must be kept"
-        );
-        assert!(
-            mapping(&out)["strings"].get(kept).is_none(),
-            "a kept plaintext must not be advertised as protected"
+            !source.contains(protected),
+            "proven formatting-macro expression {protected:?} stayed plaintext"
         );
     }
     assert!(
-        source.contains("mixed-protocol"),
-        "a value with one macro occurrence must be kept everywhere"
+        mapping(&out)["strings"].get("mixed-protocol").is_some(),
+        "fully protected macro/runtime value is missing from the strict mapping"
     );
     assert!(
-        mapping(&out)["strings"].get("mixed-protocol").is_none(),
-        "a mixed safe/unsafe value must not be advertised as protected"
-    );
-    assert!(
-        source.contains("nested-protocol"),
-        "the larger diagnostic still requires the nested plaintext"
+        !source.contains("nested-protocol"),
+        "all mode should protect both the direct value and its larger format fragment"
     );
     assert!(
         mapping(&out)["strings"].get("nested-protocol").is_none(),
-        "a value nested inside another literal must not be advertised as protected"
+        "the conservative substring proof must not overclaim an unmapped value"
     );
 
     let string_report = &report(&out)["strings"];
@@ -824,8 +852,15 @@ fn balanced_protects_runtime_strings_without_changing_behaviour() {
         "report did not count protected values: {string_report}"
     );
     assert!(
-        string_report["kept_unsafe_context"].as_u64().unwrap_or(0) >= 2,
-        "report did not expose compile-time/macro keeps: {string_report}"
+        string_report["values_protected_unmapped"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 3,
+        "report did not separate protected generic values from the strict mapping: {string_report}"
+    );
+    assert!(
+        string_report["kept_unsafe_context"].as_u64().unwrap_or(0) >= 1,
+        "report did not expose compile-time keeps: {string_report}"
     );
     assert!(
         string_report["kept_external_collision"]

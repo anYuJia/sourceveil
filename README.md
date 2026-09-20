@@ -167,10 +167,10 @@ they are changed as one transaction, and any doubt keeps the command whole:
 | a name that also appears as a Rust string outside a recognised context | kept |
 | original bytes also occur in a retained source/dependency substring | kept and reported; a raw final-binary scan could not prove provenance |
 
-Tauri command argument names are also treated as wire-format keys. They are
-reserved from ordinary string protection because the command macro may embed
-those bytes in generated dispatch code even when the same spelling is also used
-as an HTTP/query key elsewhere.
+Tauri command argument names are also treated as wire-format keys. The command
+macro may embed those bytes in generated dispatch code, so they cannot receive
+a global plaintext-absence promise. Independent safe runtime occurrences with
+the same spelling (for example an HTTP/query key) are still protected.
 
 The `generate_handler!` list is parsed by hand, because rust-analyzer's
 reference search does not reach inside a macro token tree. Only the spans of the
@@ -511,35 +511,44 @@ git push origin v0.1.0
 
 Under `balanced`, machine-like internal literals such as
 `"license-check"`, `"device-validation"` and `"HOLE_PUNCH_REQUEST"` are
-removed from Rust's static plaintext tables when they occur in an ordinary
-runtime expression. Each occurrence gets a build-specific HMAC-derived stream
-seed and encoded bytes; the generated expression lazily decodes once into a
-block-local `OnceLock<String>` and still evaluates to `&'static str`.
+selected by default. `[strings] all = true` selects every non-empty runtime
+literal, including plain words, HTTP header names and values, MIME strings,
+short values and raw regex literals; `aggressive` enables this mode by default.
+Each safe occurrence is removed from Rust's static plaintext tables and gets a
+build-specific HMAC-derived stream seed and encoded bytes. The generated
+expression lazily decodes once into a block-local `OnceLock<String>` and still
+evaluates to `&'static str`.
 
 Format strings are handled without violating Rust's compile-time-literal rule.
-For proven standard formatting macros (`format!`, `format_args!`, the
-`print!`/`write!` families, and explicitly qualified `log::...!` macros), each
-selected literal text fragment becomes a generated named argument that decodes
-at runtime. The original placeholders and their formatting specifications stay
-in the literal unchanged, including explicit positions, named captures,
-dynamic width/precision and escaped braces. The pass also finds these macros
-inside proven expression containers such as `vec!` and `serde_json::json!`.
-Shadowed macros and unknown macro DSLs fail closed.
+For proven formatting macros (`format!`, `format_args!`, the
+`print!`/`write!`, panic/assert, `anyhow!`/`bail!`/`ensure!` families, and
+explicitly qualified `log::...!` macros), each selected literal text fragment
+becomes a generated named argument that decodes at runtime. The original
+placeholders and their formatting specifications stay in the literal
+unchanged, including explicit positions, named captures, dynamic
+width/precision and escaped braces. Ordinary string expression arguments in
+those macros, `vec!`, and `dbg!` are protected too. The pass also finds nested
+formatting macros inside proven expression containers such as `vec!` and
+`serde_json::json!`. Shadowed macros and unknown macro DSLs fail closed.
 
 Protection is deliberately not applied to attributes, opaque macro token
 trees, const/static initialisers, patterns, ABI strings, const functions or
-`no_std` crates.
-Tauri command/event strings remain owned by their dedicated cross-language
-passes. A value is recorded in `mapping.strings` only if every selected
-occurrence can be transformed as one transaction and it is not a substring of
-another retained Rust/frontend/config literal. That conservative substring
-check matters because the final binary scanner operates on raw bytes, not
-source-level literal boundaries. Resolved dependency sources and compiled
-dependency library artifacts are checked too; the latter catches values
-reconstructed from numeric byte tables (for example a compression dictionary)
-that never appear verbatim in source. Source/binary leak scans can therefore
-treat the original plaintext as fatal evidence without a known same-project or
-linked-dependency collision.
+`no_std` crates. These are reported as retained unsafe occurrences. Importantly,
+one retained occurrence no longer prevents safe runtime occurrences with the
+same value from being encoded.
+
+Tauri command/event and serde wire strings remain owned by their dedicated
+cross-language passes. A runtime occurrence with the same spelling is still
+encoded, but the value is recorded in `mapping.strings` only when no retained
+Rust/frontend/config/protocol/dependency collision is known. Values shorter
+than four bytes and generic values selected solely by `all` (for example
+`"navigate"`) are protected but intentionally omitted from the global mapping:
+a raw final binary can independently contain those bytes in toolchain or
+platform-library data. Resolved dependency sources and compiled dependency
+library artifacts are checked too; the latter catches values reconstructed
+from numeric byte tables (for example a compression dictionary) that never
+appear verbatim in source. Source/binary leak scans can therefore treat every
+mapped plaintext as fatal evidence.
 
 The encoding is obfuscation, not a secret store: the client ships both encoded
 bytes and a decoder. The goal is to remove the static `strings -> XREF`

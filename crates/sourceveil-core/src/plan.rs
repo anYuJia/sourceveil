@@ -69,6 +69,7 @@ impl RenamePlan {
 #[derive(Debug, Clone, Default)]
 pub struct StringsPlan {
     pub enabled: bool,
+    pub all: bool,
     pub logs: bool,
     pub errors: bool,
     pub internal: bool,
@@ -222,6 +223,7 @@ impl Plan {
         let strings_enabled = s.enabled.unwrap_or(balanced);
         let strings = StringsPlan {
             enabled: strings_enabled,
+            all: s.all.unwrap_or(profile == Profile::Aggressive),
             logs: s.logs.unwrap_or(false),
             errors: s.errors.unwrap_or(false),
             internal: s.internal.unwrap_or(balanced),
@@ -378,7 +380,18 @@ mod tests {
         let p = plan("profile = \"balanced\"");
         assert!(p.rename.fields);
         assert!(p.strings.internal);
+        assert!(!p.strings.all);
         assert!(p.frontend.rename_private_identifiers);
+    }
+
+    #[test]
+    fn aggressive_profile_protects_all_runtime_strings() {
+        let p = plan("profile = \"aggressive\"");
+        assert!(p.strings.enabled);
+        assert!(p.strings.all);
+
+        let p = plan("profile = \"aggressive\"\n[strings]\nall = false\n");
+        assert!(!p.strings.all, "an explicit value must beat the profile");
     }
 
     #[test]
